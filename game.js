@@ -39,18 +39,25 @@ const CAR = {
   length: 46,
   width: 24,
   wheelBase: 30, // distance between front and rear axle
-  maxSteer: 0.6, // radians, at a standstill
-  steerSpeedRef: 140, // px/s; steering authority halves around this speed
-  maxAngularVel: 3.2, // rad/s safety cap
-  chassisResponse: 11, // how fast heading catches up to the steered direction
+  track: 18, // distance between the front-left/front-right tire centers (for Ackermann geometry)
+  maxSteer: 0.6, // radians, the effective single-front-wheel ("bicycle model") steering lock
   enginePower: 340, // forward acceleration, px/s^2 -- kept gentle for parking-scale control
   brakePower: 1150, // deceleration when braking while moving forward
   reversePower: 200,
   dragCoeff: 0.62, // proportional drag
   rollResist: 55, // constant rolling resistance, px/s^2
-  maxLateralAccel: 720, // tire grip limit -> higher = less drift
   maxSpeed: 360,
   maxReverseSpeed: 120,
+  // Per-axle tire model: lateral force = -stiffness * slipAngle, clamped to
+  // the axle's max grip. Rear grip is set a little below front on purpose --
+  // push a turn too hard and the *rear* breaks loose first (oversteer/drift)
+  // rather than the front just plowing straight (understeer).
+  corneringStiffnessFront: 4200,
+  corneringStiffnessRear: 3800,
+  maxGripFront: 620,
+  maxGripRear: 560,
+  lowSpeedGripRef: 40, // px/s; lateral grip fades in below this speed so an at-rest car doesn't jitter
+  maxAngularVel: 8, // rad/s hard numerical safety cap, not a gameplay tuning knob
   spinTorqueScale: 220, // divides collision torque (r x dv) into an angularVel change -- lower = more dramatic spin from hits
   maxCollisionSpin: 9, // rad/s safety clamp on angularVel after any single collision impulse
 };
@@ -60,6 +67,9 @@ CAR.wallRadius = Math.hypot(CAR.length, CAR.width) / 2;
 // like parallel parking, where a single fat circle would be too sloppy).
 CAR.capsuleOffset = (CAR.length - CAR.width) / 2;
 CAR.capsuleRadius = CAR.width / 2;
+// Yaw moment of inertia of a uniform rectangular plate about its center
+// (mass normalized to 1, so tire forces below are directly accelerations).
+CAR.inertia = (CAR.length * CAR.length + CAR.width * CAR.width) / 12;
 
 function createCar(x, y, angle, color, input) {
   return {
@@ -85,6 +95,40 @@ function readInput(car) {
   return { throttle, steer };
 }
 
+// Splits a single "effective front wheel" steering angle (the one the
+// dynamics below actually use) into the two distinct road-wheel angles a
+// real front axle would have, via Ackermann geometry: both wheels' axes
+// extend to a common point on the rear-axle line, so the inside wheel (the
+// one on the side being turned toward) carves a tighter arc than the
+// outside one. This only affects what's drawn -- the dynamics use a single
+// effective wheel, same as the standard "bicycle model" they're built on.
+function ackermannWheelAngles(centerSteer, wheelBase, track) {
+  if (Math.abs(centerSteer) < 1e-4) return { left: 0, right: 0 };
+  const sign = Math.sign(centerSteer);
+  const turnRadius = wheelBase / Math.tan(Math.abs(centerSteer));
+  const halfTrack = track / 2;
+  const innerRadius = Math.max(turnRadius - halfTrack, 0.5);
+  const outerRadius = turnRadius + halfTrack;
+  const innerMag = Math.atan(wheelBase / innerRadius);
+  const outerMag = Math.atan(wheelBase / outerRadius);
+  // steer > 0 turns the car toward its own right side, making the right
+  // wheel the inner one (see the world-space derivation in capsuleOffsets'
+  // sibling geometry above: local -halfTrack is "left", +halfTrack "right").
+  const leftMag = sign > 0 ? outerMag : innerMag;
+  const rightMag = sign > 0 ? innerMag : outerMag;
+  return { left: sign * leftMag, right: sign * rightMag };
+}
+
+// Two-axle dynamic bicycle model: front and rear tires each get a slip
+// angle (the angle between where the tire is pointed and where it's
+// actually moving) which produces a lateral force via a linear
+// cornering-stiffness curve, clamped to that axle's max grip. Both forces
+// act at their axle's offset from the center of mass, producing not just
+// linear acceleration but real torque (r x F) -- so, unlike a kinematic
+// model, turning rate emerges from the tires' actual grip limit rather than
+// needing an artificial speed-based steering-authority taper to stay
+// sane (a full-lock turn at speed naturally understeers/drifts once the
+// tires saturate, instead of demanding an unrealistic turn rate).
 function stepCar(car, dt) {
   const { throttle, steer } = readInput(car);
   const p = CAR;
@@ -95,25 +139,53 @@ function stepCar(car, dt) {
   const forwardSpeed = car.vel.x * forward.x + car.vel.y * forward.y;
   const speed = Math.hypot(car.vel.x, car.vel.y);
 
-  // Steering: front wheels turn, heading rate follows a simple bicycle model
-  // and eases toward that target (simulates chassis/suspension response).
-  // Effective steering authority tapers off with speed, since real tires
-  // can't generate enough lateral grip to hit the kinematic turn rate a full
-  // lock implies once a car is moving fast (otherwise a full-lock turn at
-  // top speed asks for 600+ deg/s of rotation, which reads as a spin-out).
-  const speedSteerFactor = 1 / (1 + Math.abs(forwardSpeed) / p.steerSpeedRef);
-  const steerAngle = steer * p.maxSteer * speedSteerFactor;
+  // Physics reacts to raw input instantly; steerVisual is a cosmetic lag
+  // (used only by drawCar, via ackermannWheelAngles) so the wheels animate
+  // smoothly instead of snapping.
+  const steerAngle = steer * p.maxSteer;
   car.steerVisual += (steerAngle - car.steerVisual) * Math.min(1, 14 * dt);
 
-  const desiredAngularVel = clamp(
-    (forwardSpeed / p.wheelBase) * Math.tan(steerAngle),
-    -p.maxAngularVel,
-    p.maxAngularVel
+  const halfWB = p.wheelBase / 2;
+  const rFront = { x: forward.x * halfWB, y: forward.y * halfWB };
+  const rRear = { x: -forward.x * halfWB, y: -forward.y * halfWB };
+
+  // Ground velocity at each axle: v_point = v_cg + angularVel * perp(r).
+  const vFront = { x: car.vel.x - car.angularVel * rFront.y, y: car.vel.y + car.angularVel * rFront.x };
+  const vRear = { x: car.vel.x - car.angularVel * rRear.y, y: car.vel.y + car.angularVel * rRear.x };
+
+  const frontWheelAngle = car.angle + steerAngle;
+  const frontForward = { x: Math.cos(frontWheelAngle), y: Math.sin(frontWheelAngle) };
+  const frontRight = { x: -frontForward.y, y: frontForward.x };
+
+  const slipFront = Math.atan2(
+    vFront.x * frontRight.x + vFront.y * frontRight.y,
+    vFront.x * frontForward.x + vFront.y * frontForward.y
   );
-  car.angularVel += (desiredAngularVel - car.angularVel) * Math.min(1, p.chassisResponse * dt);
+  const slipRear = Math.atan2(
+    vRear.x * right.x + vRear.y * right.y,
+    vRear.x * forward.x + vRear.y * forward.y
+  );
+
+  const gripFade = Math.min(speed / p.lowSpeedGripRef, 1);
+  const lateralFront = clamp(-p.corneringStiffnessFront * slipFront, -p.maxGripFront, p.maxGripFront) * gripFade;
+  const lateralRear = clamp(-p.corneringStiffnessRear * slipRear, -p.maxGripRear, p.maxGripRear) * gripFade;
+
+  const forceFront = { x: frontRight.x * lateralFront, y: frontRight.y * lateralFront };
+  const forceRear = { x: right.x * lateralRear, y: right.y * lateralRear };
+
+  const torque =
+    (rFront.x * forceFront.y - rFront.y * forceFront.x) +
+    (rRear.x * forceRear.y - rRear.y * forceRear.x);
+  car.angularVel = clamp(car.angularVel + (torque / p.inertia) * dt, -p.maxAngularVel, p.maxAngularVel);
   car.angle += car.angularVel * dt;
 
-  // Engine / brake / reverse along the car's forward axis.
+  car.vel.x += (forceFront.x + forceRear.x) * dt;
+  car.vel.y += (forceFront.y + forceRear.y) * dt;
+
+  // Engine / brake / reverse along the car's forward axis. Rear-wheel drive:
+  // a force purely along the heading, applied at the rear axle (which sits
+  // on that same heading line), produces zero torque either way, so it's
+  // simplest to just add it straight to the CG.
   let longAccel = 0;
   if (throttle > 0) {
     longAccel = p.enginePower;
@@ -131,15 +203,8 @@ function stepCar(car, dt) {
     car.vel.y -= (car.vel.y / speed) * p.rollResist * dt;
   }
 
-  // Tire grip: lateral velocity only bleeds off up to the grip limit, so a
-  // sharp turn taken too fast leaves residual sideways speed -> drift.
-  const lateralSpeed = car.vel.x * right.x + car.vel.y * right.y;
-  const maxCorrection = p.maxLateralAccel * dt;
-  const correction = clamp(lateralSpeed, -maxCorrection, maxCorrection);
-  car.vel.x -= right.x * correction;
-  car.vel.y -= right.y * correction;
-
-  // Clamp forward/reverse top speed along the heading.
+  // Clamp forward/reverse top speed along the heading only -- lateral
+  // (drift) speed is left alone, it's already grip-limited above.
   const fwdAfter = car.vel.x * forward.x + car.vel.y * forward.y;
   const latAfter = car.vel.x * right.x + car.vel.y * right.y;
   const fwdClamped = clamp(fwdAfter, -p.maxReverseSpeed, p.maxSpeed);
@@ -415,42 +480,77 @@ function updateCoinRace() {
   }
 }
 
-// A little celebration burst -- radiating sparks plus an expanding ring --
-// fired at the moment a parking attempt is confirmed successful. Purely
-// cosmetic: never touches physics or game state.
+// A proper celebration fireworks burst, fired at the moment a parking
+// attempt is confirmed successful. Purely cosmetic: never touches physics
+// or game state. Layers: a bright flash core, a shower of round sparks plus
+// faster streaking ones, two shockwave rings at different speeds, and a
+// delayed secondary "pop" (via the invisible "delayedBurst" marker below)
+// for the classic multi-stage firework read rather than one flat burst.
 function spawnFirework(x, y, color) {
-  const sparkColors = [color, "#ffd54f", "#ffffff"];
-  const count = 26;
+  const sparkColors = [color, "#ffd54f", "#ffffff", "#ff9d5c"];
+  const count = 42;
   for (let i = 0; i < count; i++) {
-    const angle = (i / count) * Math.PI * 2 + (Math.random() - 0.5) * 0.3;
-    const speed = 90 + Math.random() * 130;
+    const angle = (i / count) * Math.PI * 2 + (Math.random() - 0.5) * 0.35;
+    const speed = 100 + Math.random() * 190;
+    const streak = Math.random() < 0.35;
+    particles.push({
+      type: streak ? "streak" : "spark",
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      size: streak ? 1.4 + Math.random() * 1.2 : 1.8 + Math.random() * 2.6,
+      color: sparkColors[Math.floor(Math.random() * sparkColors.length)],
+      life: 0,
+      maxLife: 0.4 + Math.random() * 0.5,
+    });
+  }
+  particles.push({ type: "flash", x, y, radius: 16, life: 0, maxLife: 0.16 });
+  particles.push({ type: "ring", x, y, radius: 4, growSpeed: 260, color, life: 0, maxLife: 0.4 });
+  particles.push({ type: "ring", x, y, radius: 2, growSpeed: 150, color: "#ffd54f", life: 0, maxLife: 0.55 });
+  particles.push({ type: "delayedBurst", x, y, color, life: 0, maxLife: 0.16 + Math.random() * 0.08 });
+}
+
+// A smaller, quicker secondary pop -- what a "delayedBurst" marker turns
+// into once its short timer runs out, at a slight offset from the original.
+function spawnSecondaryPop(x, y, color) {
+  const sparkColors = [color, "#ffd54f", "#ffffff"];
+  const count = 16;
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 50 + Math.random() * 90;
     particles.push({
       type: "spark",
       x, y,
       vx: Math.cos(angle) * speed,
       vy: Math.sin(angle) * speed,
-      size: 1.8 + Math.random() * 2.2,
+      size: 1.4 + Math.random() * 1.8,
       color: sparkColors[Math.floor(Math.random() * sparkColors.length)],
       life: 0,
-      maxLife: 0.45 + Math.random() * 0.35,
+      maxLife: 0.3 + Math.random() * 0.3,
     });
   }
-  particles.push({ type: "ring", x, y, radius: 4, growSpeed: 220, color, life: 0, maxLife: 0.35 });
 }
 
 function updateParticles(dt) {
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i];
     p.life += dt;
-    if (p.life >= p.maxLife) { particles.splice(i, 1); continue; }
-    if (p.type === "spark") {
+    if (p.life >= p.maxLife) {
+      if (p.type === "delayedBurst") {
+        spawnSecondaryPop(p.x + (Math.random() - 0.5) * 24, p.y + (Math.random() - 0.5) * 24, p.color);
+      }
+      particles.splice(i, 1);
+      continue;
+    }
+    if (p.type === "spark" || p.type === "streak") {
       p.vx *= 1 - 2.2 * dt;
       p.vy *= 1 - 2.2 * dt;
       p.x += p.vx * dt;
       p.y += p.vy * dt;
-    } else {
+    } else if (p.type === "ring") {
       p.radius += p.growSpeed * dt;
     }
+    // "flash" and "delayedBurst" hold position and just decay via life/maxLife.
   }
 }
 
@@ -653,9 +753,12 @@ function drawCar(car) {
   ctx.translate(car.pos.x, car.pos.y);
   ctx.rotate(car.angle);
 
-  // wheels (drawn first, so the body sits on top)
-  drawWheel(halfWB, -halfTrack, car.steerVisual);
-  drawWheel(halfWB, halfTrack, car.steerVisual);
+  // wheels (drawn first, so the body sits on top) -- the two front wheels
+  // get distinct Ackermann angles, so the inner one visibly turns sharper
+  // than the outer one during a turn, same as a real front axle.
+  const wheelAngles = ackermannWheelAngles(car.steerVisual, CAR.wheelBase, CAR.track);
+  drawWheel(halfWB, -halfTrack, wheelAngles.left);
+  drawWheel(halfWB, halfTrack, wheelAngles.right);
   drawWheel(-halfWB, -halfTrack, 0);
   drawWheel(-halfWB, halfTrack, 0);
 
@@ -711,16 +814,40 @@ function drawParticles() {
       ctx.beginPath();
       ctx.arc(p.x, p.y, p.size * (1 - t * 0.4), 0, Math.PI * 2);
       ctx.fill();
-    } else {
+    } else if (p.type === "streak") {
+      ctx.globalAlpha = 1 - t;
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth = p.size;
+      ctx.lineCap = "round";
+      const speed = Math.hypot(p.vx, p.vy);
+      const len = Math.min(speed * 0.045, 16);
+      const dx = speed > 0.01 ? (p.vx / speed) * len : 0;
+      const dy = speed > 0.01 ? (p.vy / speed) * len : 0;
+      ctx.beginPath();
+      ctx.moveTo(p.x - dx, p.y - dy);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+    } else if (p.type === "ring") {
       ctx.globalAlpha = (1 - t) * 0.8;
       ctx.strokeStyle = p.color;
       ctx.lineWidth = 2;
       ctx.beginPath();
       ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
       ctx.stroke();
+    } else if (p.type === "flash") {
+      ctx.globalAlpha = (1 - t) * 0.9;
+      const grad = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.radius);
+      grad.addColorStop(0, "rgba(255,255,255,1)");
+      grad.addColorStop(1, "rgba(255,255,255,0)");
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+      ctx.fill();
     }
+    // "delayedBurst" is an invisible timer -- nothing to draw.
   }
   ctx.globalAlpha = 1;
+  ctx.lineCap = "butt";
 }
 
 function render() {
