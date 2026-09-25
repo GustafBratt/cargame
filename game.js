@@ -314,15 +314,8 @@ function resetCars() {
   particles.length = 0;
 }
 
-function setupWorld() {
-  car1 = createCar(W * 0.35, H * 0.5, -Math.PI / 2, "#4fc3ff", {
-    up: "w", down: "s", left: "a", right: "d",
-  });
-  car2 = createCar(W * 0.65, H * 0.5, Math.PI / 2, "#ffa64f", {
-    up: "i", down: "k", left: "j", right: "l",
-  });
-
-  crates = [];
+function buildCrates() {
+  const crates = [];
   const cols = 4, rows = 3;
   for (let i = 0; i < cols; i++) {
     for (let j = 0; j < rows; j++) {
@@ -333,7 +326,18 @@ function setupWorld() {
       });
     }
   }
+  return crates;
+}
 
+function setupWorld() {
+  car1 = createCar(W * 0.35, H * 0.5, -Math.PI / 2, "#4fc3ff", {
+    up: "w", down: "s", left: "a", right: "d",
+  });
+  car2 = createCar(W * 0.65, H * 0.5, Math.PI / 2, "#ffa64f", {
+    up: "i", down: "k", left: "j", right: "l",
+  });
+
+  crates = buildCrates();
   street = buildStreet();
 
   car1.score = 0; car1.gameState = "seekCoin";
@@ -450,12 +454,31 @@ function updateParticles(dt) {
 }
 
 setupWorld();
+
+// Crates/street are laid out relative to W/H at build time; left stale after
+// a resize, street.curbY (and therefore the coin's spawn range, the curb
+// collision limit, and the drawn sidewalk position) would drift away from
+// the actual canvas size -- most visibly, coins could spawn below the new
+// canvas bottom on a resize that shrinks the window. Rebuild both (and
+// re-clamp the active coin) once resizing settles; debounced so a window
+// drag doesn't reshuffle the parked-car colors on every intermediate frame.
+let rebuildTimer = null;
 window.addEventListener("resize", () => {
-  // Keep cars within the new bounds instead of re-placing the whole world.
-  car1.pos.x = clamp(car1.pos.x, CAR.wallRadius, W - CAR.wallRadius);
-  car1.pos.y = clamp(car1.pos.y, CAR.wallRadius, street.curbY - CAR.wallRadius);
-  car2.pos.x = clamp(car2.pos.x, CAR.wallRadius, W - CAR.wallRadius);
-  car2.pos.y = clamp(car2.pos.y, CAR.wallRadius, street.curbY - CAR.wallRadius);
+  clearTimeout(rebuildTimer);
+  rebuildTimer = setTimeout(() => {
+    crates = buildCrates();
+    street = buildStreet();
+
+    car1.pos.x = clamp(car1.pos.x, CAR.wallRadius, W - CAR.wallRadius);
+    car1.pos.y = clamp(car1.pos.y, CAR.wallRadius, street.curbY - CAR.wallRadius);
+    car2.pos.x = clamp(car2.pos.x, CAR.wallRadius, W - CAR.wallRadius);
+    car2.pos.y = clamp(car2.pos.y, CAR.wallRadius, street.curbY - CAR.wallRadius);
+
+    if (coin) {
+      coin.x = clamp(coin.x, 40, W - 40);
+      coin.y = clamp(coin.y, 40, street.curbY - 40);
+    }
+  }, 200);
 });
 
 // ---------------------------------------------------------------------------
