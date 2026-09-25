@@ -52,10 +52,17 @@ const CAR = {
   // the axle's max grip. Rear grip is set a little below front on purpose --
   // push a turn too hard and the *rear* breaks loose first (oversteer/drift)
   // rather than the front just plowing straight (understeer).
-  corneringStiffnessFront: 4200,
-  corneringStiffnessRear: 3800,
-  maxGripFront: 620,
-  maxGripRear: 560,
+  // Stiffness is kept low relative to maxSteer on purpose: at the old, much
+  // higher stiffness, even a small steering input reached full saturation
+  // (maxGrip) almost instantly -- there was no gentle/proportional region,
+  // so any "quick touch" landed the same maximum torque as holding full
+  // lock, and it read as the steering being wildly oversensitive. Keeping
+  // saturation a real turn away means a brief tap produces a proportionally
+  // small nudge instead of an instant full-torque snap.
+  corneringStiffnessFront: 1500,
+  corneringStiffnessRear: 1350,
+  maxGripFront: 480,
+  maxGripRear: 430,
   lowSpeedGripRef: 40, // px/s; lateral grip fades in below this speed so an at-rest car doesn't jitter
   maxAngularVel: 8, // rad/s hard numerical safety cap, not a gameplay tuning knob
   spinTorqueScale: 220, // divides collision torque (r x dv) into an angularVel change -- lower = more dramatic spin from hits
@@ -77,7 +84,7 @@ function createCar(x, y, angle, color, input) {
     vel: { x: 0, y: 0 },
     angle,
     angularVel: 0,
-    steerVisual: 0,
+    steerCurrent: 0, // the actual, rate-limited steering-rack angle (see stepCar)
     color,
     input, // { up, down, left, right } key names
     startPos: { x, y },
@@ -139,11 +146,24 @@ function stepCar(car, dt) {
   const forwardSpeed = car.vel.x * forward.x + car.vel.y * forward.y;
   const speed = Math.hypot(car.vel.x, car.vel.y);
 
-  // Physics reacts to raw input instantly; steerVisual is a cosmetic lag
-  // (used only by drawCar, via ackermannWheelAngles) so the wheels animate
-  // smoothly instead of snapping.
-  const steerAngle = steer * p.maxSteer;
-  car.steerVisual += (steerAngle - car.steerVisual) * Math.min(1, 14 * dt);
+  // The steering rack can't snap to full lock instantly -- car.steerCurrent
+  // rate-limits how fast it chases the raw input target, same as a real
+  // steering system takes a moment to wind to full lock. This is what makes
+  // a brief tap produce a small, proportional nudge instead of instantly
+  // commanding the same torque as holding full lock (previously the physics
+  // used the raw target angle directly, with only the *rendering* lagging
+  // behind it for visual smoothness, so even a one-frame tap snapped the
+  // front tire to a large slip angle and read as wildly oversensitive).
+  // The ramp is deliberately asymmetric: winding UP toward a bigger angle is
+  // slow (that's what tames a quick tap), but winding back DOWN toward
+  // center is fast -- otherwise releasing the key doesn't stop the turn
+  // right away, it leaves a decaying "tail" of steering angle that keeps
+  // adding rotation after release and ends up producing *more* total turn
+  // from a quick tap than an instant on/instant off response would.
+  const steerTarget = steer * p.maxSteer;
+  const steerRate = Math.abs(steerTarget) > Math.abs(car.steerCurrent) ? 6 : 30;
+  car.steerCurrent += (steerTarget - car.steerCurrent) * Math.min(1, steerRate * dt);
+  const steerAngle = car.steerCurrent;
 
   const halfWB = p.wheelBase / 2;
   const rFront = { x: forward.x * halfWB, y: forward.y * halfWB };
@@ -756,7 +776,7 @@ function drawCar(car) {
   // wheels (drawn first, so the body sits on top) -- the two front wheels
   // get distinct Ackermann angles, so the inner one visibly turns sharper
   // than the outer one during a turn, same as a real front axle.
-  const wheelAngles = ackermannWheelAngles(car.steerVisual, CAR.wheelBase, CAR.track);
+  const wheelAngles = ackermannWheelAngles(car.steerCurrent, CAR.wheelBase, CAR.track);
   drawWheel(halfWB, -halfTrack, wheelAngles.left);
   drawWheel(halfWB, halfTrack, wheelAngles.right);
   drawWheel(-halfWB, -halfTrack, 0);
