@@ -356,9 +356,10 @@ function setupWorld() {
 
 const COIN_RADIUS = 9;
 const PICKUP_DIST = CAR.capsuleRadius + COIN_RADIUS + 4;
-const PARK_SPEED_LIMIT = 12; // px/s, "stopped" for parking-detection purposes
-const PARK_Y_TOLERANCE = 14;
-const PARK_ANGLE_TOLERANCE = 0.35; // radians (~20deg), either direction along the curb
+const PARK_SPEED_LIMIT = 7; // px/s, "stopped" for parking-detection purposes
+const PARK_Y_TOLERANCE = 8;
+const PARK_ANGLE_TOLERANCE = 0.2; // radians (~11.5deg), either direction along the curb
+const PARK_X_MARGIN = 5; // px inset from the spot's painted edges the center must clear
 
 function randomCoinPos() {
   for (let attempt = 0; attempt < 30; attempt++) {
@@ -386,7 +387,7 @@ function isParked(car) {
 
   if (Math.abs(car.pos.y - street.carCenterY) > PARK_Y_TOLERANCE) return false;
 
-  return street.parkingSpots.some((spot) => car.pos.x > spot.x0 + 2 && car.pos.x < spot.x1 - 2);
+  return street.parkingSpots.some((spot) => car.pos.x > spot.x0 + PARK_X_MARGIN && car.pos.x < spot.x1 - PARK_X_MARGIN);
 }
 
 // A single shared coin is always on the map. Only a car currently in
