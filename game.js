@@ -39,20 +39,44 @@ const CAR = {
   length: 46,
   width: 24,
   wheelBase: 30, // distance between front and rear axle
-  maxSteer: 0.6, // radians, at a standstill
-  steerSpeedRef: 140, // px/s; steering authority halves around this speed
-  maxAngularVel: 3.2, // rad/s safety cap
-  chassisResponse: 11, // how fast heading catches up to the steered direction
+  track: 18, // distance between the front-left/front-right tire centers (for Ackermann geometry)
+  maxSteer: 0.38, // radians, the effective single-front-wheel ("bicycle model") steering lock -- kinematic min radius = wheelBase/tan(maxSteer)
   enginePower: 340, // forward acceleration, px/s^2 -- kept gentle for parking-scale control
   brakePower: 1150, // deceleration when braking while moving forward
   reversePower: 200,
   dragCoeff: 0.62, // proportional drag
   rollResist: 55, // constant rolling resistance, px/s^2
-  maxLateralAccel: 720, // tire grip limit -> higher = less drift
   maxSpeed: 360,
   maxReverseSpeed: 120,
+  // Per-axle tire model: lateral force = -stiffness * slipAngle, clamped to
+  // the axle's max grip. Rear grip is set a little below front on purpose --
+  // push a turn too hard and the *rear* breaks loose first (oversteer/drift)
+  // rather than the front just plowing straight (understeer).
+  // Stiffness is kept low relative to maxSteer on purpose: at the old, much
+  // higher stiffness, even a small steering input reached full saturation
+  // (maxGrip) almost instantly -- there was no gentle/proportional region,
+  // so any "quick touch" landed the same maximum torque as holding full
+  // lock, and it read as the steering being wildly oversensitive. Keeping
+  // saturation a real turn away means a brief tap produces a proportionally
+  // small nudge instead of an instant full-torque snap.
+  corneringStiffnessFront: 1500,
+  corneringStiffnessRear: 1350,
+  maxGripFront: 480,
+  maxGripRear: 430,
+  lowSpeedGripRef: 40, // px/s; lateral grip fades in below this speed so an at-rest car doesn't jitter
+  maxAngularVel: 8, // rad/s hard numerical safety cap, not a gameplay tuning knob
   spinTorqueScale: 220, // divides collision torque (r x dv) into an angularVel change -- lower = more dramatic spin from hits
   maxCollisionSpin: 9, // rad/s safety clamp on angularVel after any single collision impulse
+  // Coefficient of restitution for capsule-circle collisions (see
+  // resolveCircles): 0 = fully inelastic (stick together), 1 = fully
+  // elastic (for equal masses head-on, ALL of the striking object's kinetic
+  // energy transfers to the one it hit). Car-vs-car is kept high on purpose
+  // -- ramming a stationary car should visibly send it flying, not just
+  // nudge it -- while car-vs-obstacle (crates, parked cars) stays lower/more
+  // damped, since those aren't meant to go rocketing off.
+  carCollisionRestitution: 0.85,
+  obstacleCollisionRestitution: 0.5,
+  wallBounce: 0.75, // fraction of incoming speed reflected back off the arena walls
 };
 CAR.wallRadius = Math.hypot(CAR.length, CAR.width) / 2;
 // Collision shape: a "capsule" made of two circles along the centerline,
@@ -60,6 +84,9 @@ CAR.wallRadius = Math.hypot(CAR.length, CAR.width) / 2;
 // like parallel parking, where a single fat circle would be too sloppy).
 CAR.capsuleOffset = (CAR.length - CAR.width) / 2;
 CAR.capsuleRadius = CAR.width / 2;
+// Yaw moment of inertia of a uniform rectangular plate about its center
+// (mass normalized to 1, so tire forces below are directly accelerations).
+CAR.inertia = (CAR.length * CAR.length + CAR.width * CAR.width) / 12;
 
 function createCar(x, y, angle, color, input) {
   return {
@@ -67,7 +94,7 @@ function createCar(x, y, angle, color, input) {
     vel: { x: 0, y: 0 },
     angle,
     angularVel: 0,
-    steerVisual: 0,
+    steerCurrent: 0, // the actual, rate-limited steering-rack angle (see stepCar)
     color,
     input, // { up, down, left, right } key names
     startPos: { x, y },
@@ -85,6 +112,40 @@ function readInput(car) {
   return { throttle, steer };
 }
 
+// Splits a single "effective front wheel" steering angle (the one the
+// dynamics below actually use) into the two distinct road-wheel angles a
+// real front axle would have, via Ackermann geometry: both wheels' axes
+// extend to a common point on the rear-axle line, so the inside wheel (the
+// one on the side being turned toward) carves a tighter arc than the
+// outside one. This only affects what's drawn -- the dynamics use a single
+// effective wheel, same as the standard "bicycle model" they're built on.
+function ackermannWheelAngles(centerSteer, wheelBase, track) {
+  if (Math.abs(centerSteer) < 1e-4) return { left: 0, right: 0 };
+  const sign = Math.sign(centerSteer);
+  const turnRadius = wheelBase / Math.tan(Math.abs(centerSteer));
+  const halfTrack = track / 2;
+  const innerRadius = Math.max(turnRadius - halfTrack, 0.5);
+  const outerRadius = turnRadius + halfTrack;
+  const innerMag = Math.atan(wheelBase / innerRadius);
+  const outerMag = Math.atan(wheelBase / outerRadius);
+  // steer > 0 turns the car toward its own right side, making the right
+  // wheel the inner one (see the world-space derivation in capsuleOffsets'
+  // sibling geometry above: local -halfTrack is "left", +halfTrack "right").
+  const leftMag = sign > 0 ? outerMag : innerMag;
+  const rightMag = sign > 0 ? innerMag : outerMag;
+  return { left: sign * leftMag, right: sign * rightMag };
+}
+
+// Two-axle dynamic bicycle model: front and rear tires each get a slip
+// angle (the angle between where the tire is pointed and where it's
+// actually moving) which produces a lateral force via a linear
+// cornering-stiffness curve, clamped to that axle's max grip. Both forces
+// act at their axle's offset from the center of mass, producing not just
+// linear acceleration but real torque (r x F) -- so, unlike a kinematic
+// model, turning rate emerges from the tires' actual grip limit rather than
+// needing an artificial speed-based steering-authority taper to stay
+// sane (a full-lock turn at speed naturally understeers/drifts once the
+// tires saturate, instead of demanding an unrealistic turn rate).
 function stepCar(car, dt) {
   const { throttle, steer } = readInput(car);
   const p = CAR;
@@ -95,25 +156,66 @@ function stepCar(car, dt) {
   const forwardSpeed = car.vel.x * forward.x + car.vel.y * forward.y;
   const speed = Math.hypot(car.vel.x, car.vel.y);
 
-  // Steering: front wheels turn, heading rate follows a simple bicycle model
-  // and eases toward that target (simulates chassis/suspension response).
-  // Effective steering authority tapers off with speed, since real tires
-  // can't generate enough lateral grip to hit the kinematic turn rate a full
-  // lock implies once a car is moving fast (otherwise a full-lock turn at
-  // top speed asks for 600+ deg/s of rotation, which reads as a spin-out).
-  const speedSteerFactor = 1 / (1 + Math.abs(forwardSpeed) / p.steerSpeedRef);
-  const steerAngle = steer * p.maxSteer * speedSteerFactor;
-  car.steerVisual += (steerAngle - car.steerVisual) * Math.min(1, 14 * dt);
+  // The steering rack can't snap to full lock instantly -- car.steerCurrent
+  // rate-limits how fast it chases the raw input target, same as a real
+  // steering system takes a moment to wind to full lock. This is what makes
+  // a brief tap produce a small, proportional nudge instead of instantly
+  // commanding the same torque as holding full lock (previously the physics
+  // used the raw target angle directly, with only the *rendering* lagging
+  // behind it for visual smoothness, so even a one-frame tap snapped the
+  // front tire to a large slip angle and read as wildly oversensitive).
+  // The ramp is deliberately asymmetric: winding UP toward a bigger angle is
+  // slow (that's what tames a quick tap), but winding back DOWN toward
+  // center is fast -- otherwise releasing the key doesn't stop the turn
+  // right away, it leaves a decaying "tail" of steering angle that keeps
+  // adding rotation after release and ends up producing *more* total turn
+  // from a quick tap than an instant on/instant off response would.
+  const steerTarget = steer * p.maxSteer;
+  const steerRate = Math.abs(steerTarget) > Math.abs(car.steerCurrent) ? 6 : 30;
+  car.steerCurrent += (steerTarget - car.steerCurrent) * Math.min(1, steerRate * dt);
+  const steerAngle = car.steerCurrent;
 
-  const desiredAngularVel = clamp(
-    (forwardSpeed / p.wheelBase) * Math.tan(steerAngle),
-    -p.maxAngularVel,
-    p.maxAngularVel
+  const halfWB = p.wheelBase / 2;
+  const rFront = { x: forward.x * halfWB, y: forward.y * halfWB };
+  const rRear = { x: -forward.x * halfWB, y: -forward.y * halfWB };
+
+  // Ground velocity at each axle: v_point = v_cg + angularVel * perp(r).
+  const vFront = { x: car.vel.x - car.angularVel * rFront.y, y: car.vel.y + car.angularVel * rFront.x };
+  const vRear = { x: car.vel.x - car.angularVel * rRear.y, y: car.vel.y + car.angularVel * rRear.x };
+
+  const frontWheelAngle = car.angle + steerAngle;
+  const frontForward = { x: Math.cos(frontWheelAngle), y: Math.sin(frontWheelAngle) };
+  const frontRight = { x: -frontForward.y, y: frontForward.x };
+
+  const slipFront = Math.atan2(
+    vFront.x * frontRight.x + vFront.y * frontRight.y,
+    vFront.x * frontForward.x + vFront.y * frontForward.y
   );
-  car.angularVel += (desiredAngularVel - car.angularVel) * Math.min(1, p.chassisResponse * dt);
+  const slipRear = Math.atan2(
+    vRear.x * right.x + vRear.y * right.y,
+    vRear.x * forward.x + vRear.y * forward.y
+  );
+
+  const gripFade = Math.min(speed / p.lowSpeedGripRef, 1);
+  const lateralFront = clamp(-p.corneringStiffnessFront * slipFront, -p.maxGripFront, p.maxGripFront) * gripFade;
+  const lateralRear = clamp(-p.corneringStiffnessRear * slipRear, -p.maxGripRear, p.maxGripRear) * gripFade;
+
+  const forceFront = { x: frontRight.x * lateralFront, y: frontRight.y * lateralFront };
+  const forceRear = { x: right.x * lateralRear, y: right.y * lateralRear };
+
+  const torque =
+    (rFront.x * forceFront.y - rFront.y * forceFront.x) +
+    (rRear.x * forceRear.y - rRear.y * forceRear.x);
+  car.angularVel = clamp(car.angularVel + (torque / p.inertia) * dt, -p.maxAngularVel, p.maxAngularVel);
   car.angle += car.angularVel * dt;
 
-  // Engine / brake / reverse along the car's forward axis.
+  car.vel.x += (forceFront.x + forceRear.x) * dt;
+  car.vel.y += (forceFront.y + forceRear.y) * dt;
+
+  // Engine / brake / reverse along the car's forward axis. Rear-wheel drive:
+  // a force purely along the heading, applied at the rear axle (which sits
+  // on that same heading line), produces zero torque either way, so it's
+  // simplest to just add it straight to the CG.
   let longAccel = 0;
   if (throttle > 0) {
     longAccel = p.enginePower;
@@ -131,15 +233,8 @@ function stepCar(car, dt) {
     car.vel.y -= (car.vel.y / speed) * p.rollResist * dt;
   }
 
-  // Tire grip: lateral velocity only bleeds off up to the grip limit, so a
-  // sharp turn taken too fast leaves residual sideways speed -> drift.
-  const lateralSpeed = car.vel.x * right.x + car.vel.y * right.y;
-  const maxCorrection = p.maxLateralAccel * dt;
-  const correction = clamp(lateralSpeed, -maxCorrection, maxCorrection);
-  car.vel.x -= right.x * correction;
-  car.vel.y -= right.y * correction;
-
-  // Clamp forward/reverse top speed along the heading.
+  // Clamp forward/reverse top speed along the heading only -- lateral
+  // (drift) speed is left alone, it's already grip-limited above.
   const fwdAfter = car.vel.x * forward.x + car.vel.y * forward.y;
   const latAfter = car.vel.x * right.x + car.vel.y * right.y;
   const fwdClamped = clamp(fwdAfter, -p.maxReverseSpeed, p.maxSpeed);
@@ -152,27 +247,28 @@ function stepCar(car, dt) {
 
 function resolveWalls(car) {
   const r = CAR.wallRadius;
+  const b = CAR.wallBounce;
   if (car.pos.x - r < 0) {
     car.pos.x = r;
-    car.vel.x = Math.abs(car.vel.x) * 0.4;
+    car.vel.x = Math.abs(car.vel.x) * b;
     car.angularVel *= 0.5;
   } else if (car.pos.x + r > W) {
     car.pos.x = W - r;
-    car.vel.x = -Math.abs(car.vel.x) * 0.4;
+    car.vel.x = -Math.abs(car.vel.x) * b;
     car.angularVel *= 0.5;
   }
   if (car.pos.y - r < 0) {
     car.pos.y = r;
-    car.vel.y = Math.abs(car.vel.y) * 0.4;
+    car.vel.y = Math.abs(car.vel.y) * b;
     car.angularVel *= 0.5;
   } else if (car.pos.y + r > H) {
     car.pos.y = H - r;
-    car.vel.y = -Math.abs(car.vel.y) * 0.4;
+    car.vel.y = -Math.abs(car.vel.y) * b;
     car.angularVel *= 0.5;
   }
 }
 
-function resolveCircles(aPos, aVel, aR, bPos, bVel, bR, bStatic) {
+function resolveCircles(aPos, aVel, aR, bPos, bVel, bR, bStatic, restitution) {
   const dx = bPos.x - aPos.x;
   const dy = bPos.y - aPos.y;
   const dist = Math.hypot(dx, dy) || 0.001;
@@ -190,7 +286,6 @@ function resolveCircles(aPos, aVel, aR, bPos, bVel, bR, bStatic) {
   const velAlongNormal = rvx * nx + rvy * ny;
   if (velAlongNormal > 0) return;
 
-  const restitution = 0.5;
   const impulse = (-(1 + restitution) * velAlongNormal) / (bStatic ? 1 : 2);
   aVel.x -= impulse * nx; aVel.y -= impulse * ny;
   if (!bStatic) { bVel.x += impulse * nx; bVel.y += impulse * ny; }
@@ -235,7 +330,7 @@ function resolveCarVsStaticCircle(car, obstaclePos, obstacleR) {
     const c = { x: car.pos.x + r.x, y: car.pos.y + r.y };
     const posBefore = { x: c.x, y: c.y };
     const velBefore = { x: car.vel.x, y: car.vel.y };
-    resolveCircles(c, car.vel, CAR.capsuleRadius, obstaclePos, null, obstacleR, true);
+    resolveCircles(c, car.vel, CAR.capsuleRadius, obstaclePos, null, obstacleR, true, CAR.obstacleCollisionRestitution);
     car.pos.x += c.x - posBefore.x;
     car.pos.y += c.y - posBefore.y;
     applyCollisionSpin(car, r, velBefore);
@@ -249,7 +344,7 @@ function resolveCarVsCar(carA, carB) {
       const b = { x: carB.pos.x + rB.x, y: carB.pos.y + rB.y };
       const posBeforeA = { x: a.x, y: a.y }, posBeforeB = { x: b.x, y: b.y };
       const velBeforeA = { x: carA.vel.x, y: carA.vel.y }, velBeforeB = { x: carB.vel.x, y: carB.vel.y };
-      resolveCircles(a, carA.vel, CAR.capsuleRadius, b, carB.vel, CAR.capsuleRadius, false);
+      resolveCircles(a, carA.vel, CAR.capsuleRadius, b, carB.vel, CAR.capsuleRadius, false, CAR.carCollisionRestitution);
       carA.pos.x += a.x - posBeforeA.x; carA.pos.y += a.y - posBeforeA.y;
       carB.pos.x += b.x - posBeforeB.x; carB.pos.y += b.y - posBeforeB.y;
       applyCollisionSpin(carA, rA, velBeforeA);
@@ -415,42 +510,77 @@ function updateCoinRace() {
   }
 }
 
-// A little celebration burst -- radiating sparks plus an expanding ring --
-// fired at the moment a parking attempt is confirmed successful. Purely
-// cosmetic: never touches physics or game state.
+// A proper celebration fireworks burst, fired at the moment a parking
+// attempt is confirmed successful. Purely cosmetic: never touches physics
+// or game state. Layers: a bright flash core, a shower of round sparks plus
+// faster streaking ones, two shockwave rings at different speeds, and a
+// delayed secondary "pop" (via the invisible "delayedBurst" marker below)
+// for the classic multi-stage firework read rather than one flat burst.
 function spawnFirework(x, y, color) {
-  const sparkColors = [color, "#ffd54f", "#ffffff"];
-  const count = 26;
+  const sparkColors = [color, "#ffd54f", "#ffffff", "#ff9d5c"];
+  const count = 42;
   for (let i = 0; i < count; i++) {
-    const angle = (i / count) * Math.PI * 2 + (Math.random() - 0.5) * 0.3;
-    const speed = 90 + Math.random() * 130;
+    const angle = (i / count) * Math.PI * 2 + (Math.random() - 0.5) * 0.35;
+    const speed = 100 + Math.random() * 190;
+    const streak = Math.random() < 0.35;
+    particles.push({
+      type: streak ? "streak" : "spark",
+      x, y,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed,
+      size: streak ? 1.4 + Math.random() * 1.2 : 1.8 + Math.random() * 2.6,
+      color: sparkColors[Math.floor(Math.random() * sparkColors.length)],
+      life: 0,
+      maxLife: 0.4 + Math.random() * 0.5,
+    });
+  }
+  particles.push({ type: "flash", x, y, radius: 16, life: 0, maxLife: 0.16 });
+  particles.push({ type: "ring", x, y, radius: 4, growSpeed: 260, color, life: 0, maxLife: 0.4 });
+  particles.push({ type: "ring", x, y, radius: 2, growSpeed: 150, color: "#ffd54f", life: 0, maxLife: 0.55 });
+  particles.push({ type: "delayedBurst", x, y, color, life: 0, maxLife: 0.16 + Math.random() * 0.08 });
+}
+
+// A smaller, quicker secondary pop -- what a "delayedBurst" marker turns
+// into once its short timer runs out, at a slight offset from the original.
+function spawnSecondaryPop(x, y, color) {
+  const sparkColors = [color, "#ffd54f", "#ffffff"];
+  const count = 16;
+  for (let i = 0; i < count; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 50 + Math.random() * 90;
     particles.push({
       type: "spark",
       x, y,
       vx: Math.cos(angle) * speed,
       vy: Math.sin(angle) * speed,
-      size: 1.8 + Math.random() * 2.2,
+      size: 1.4 + Math.random() * 1.8,
       color: sparkColors[Math.floor(Math.random() * sparkColors.length)],
       life: 0,
-      maxLife: 0.45 + Math.random() * 0.35,
+      maxLife: 0.3 + Math.random() * 0.3,
     });
   }
-  particles.push({ type: "ring", x, y, radius: 4, growSpeed: 220, color, life: 0, maxLife: 0.35 });
 }
 
 function updateParticles(dt) {
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i];
     p.life += dt;
-    if (p.life >= p.maxLife) { particles.splice(i, 1); continue; }
-    if (p.type === "spark") {
+    if (p.life >= p.maxLife) {
+      if (p.type === "delayedBurst") {
+        spawnSecondaryPop(p.x + (Math.random() - 0.5) * 24, p.y + (Math.random() - 0.5) * 24, p.color);
+      }
+      particles.splice(i, 1);
+      continue;
+    }
+    if (p.type === "spark" || p.type === "streak") {
       p.vx *= 1 - 2.2 * dt;
       p.vy *= 1 - 2.2 * dt;
       p.x += p.vx * dt;
       p.y += p.vy * dt;
-    } else {
+    } else if (p.type === "ring") {
       p.radius += p.growSpeed * dt;
     }
+    // "flash" and "delayedBurst" hold position and just decay via life/maxLife.
   }
 }
 
@@ -653,9 +783,12 @@ function drawCar(car) {
   ctx.translate(car.pos.x, car.pos.y);
   ctx.rotate(car.angle);
 
-  // wheels (drawn first, so the body sits on top)
-  drawWheel(halfWB, -halfTrack, car.steerVisual);
-  drawWheel(halfWB, halfTrack, car.steerVisual);
+  // wheels (drawn first, so the body sits on top) -- the two front wheels
+  // get distinct Ackermann angles, so the inner one visibly turns sharper
+  // than the outer one during a turn, same as a real front axle.
+  const wheelAngles = ackermannWheelAngles(car.steerCurrent, CAR.wheelBase, CAR.track);
+  drawWheel(halfWB, -halfTrack, wheelAngles.left);
+  drawWheel(halfWB, halfTrack, wheelAngles.right);
   drawWheel(-halfWB, -halfTrack, 0);
   drawWheel(-halfWB, halfTrack, 0);
 
@@ -711,16 +844,40 @@ function drawParticles() {
       ctx.beginPath();
       ctx.arc(p.x, p.y, p.size * (1 - t * 0.4), 0, Math.PI * 2);
       ctx.fill();
-    } else {
+    } else if (p.type === "streak") {
+      ctx.globalAlpha = 1 - t;
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth = p.size;
+      ctx.lineCap = "round";
+      const speed = Math.hypot(p.vx, p.vy);
+      const len = Math.min(speed * 0.045, 16);
+      const dx = speed > 0.01 ? (p.vx / speed) * len : 0;
+      const dy = speed > 0.01 ? (p.vy / speed) * len : 0;
+      ctx.beginPath();
+      ctx.moveTo(p.x - dx, p.y - dy);
+      ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+    } else if (p.type === "ring") {
       ctx.globalAlpha = (1 - t) * 0.8;
       ctx.strokeStyle = p.color;
       ctx.lineWidth = 2;
       ctx.beginPath();
       ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
       ctx.stroke();
+    } else if (p.type === "flash") {
+      ctx.globalAlpha = (1 - t) * 0.9;
+      const grad = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.radius);
+      grad.addColorStop(0, "rgba(255,255,255,1)");
+      grad.addColorStop(1, "rgba(255,255,255,0)");
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+      ctx.fill();
     }
+    // "delayedBurst" is an invisible timer -- nothing to draw.
   }
   ctx.globalAlpha = 1;
+  ctx.lineCap = "butt";
 }
 
 function render() {
