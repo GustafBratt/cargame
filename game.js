@@ -67,6 +67,16 @@ const CAR = {
   maxAngularVel: 8, // rad/s hard numerical safety cap, not a gameplay tuning knob
   spinTorqueScale: 220, // divides collision torque (r x dv) into an angularVel change -- lower = more dramatic spin from hits
   maxCollisionSpin: 9, // rad/s safety clamp on angularVel after any single collision impulse
+  // Coefficient of restitution for capsule-circle collisions (see
+  // resolveCircles): 0 = fully inelastic (stick together), 1 = fully
+  // elastic (for equal masses head-on, ALL of the striking object's kinetic
+  // energy transfers to the one it hit). Car-vs-car is kept high on purpose
+  // -- ramming a stationary car should visibly send it flying, not just
+  // nudge it -- while car-vs-obstacle (crates, parked cars) stays lower/more
+  // damped, since those aren't meant to go rocketing off.
+  carCollisionRestitution: 0.85,
+  obstacleCollisionRestitution: 0.5,
+  wallBounce: 0.75, // fraction of incoming speed reflected back off the arena walls
 };
 CAR.wallRadius = Math.hypot(CAR.length, CAR.width) / 2;
 // Collision shape: a "capsule" made of two circles along the centerline,
@@ -237,27 +247,28 @@ function stepCar(car, dt) {
 
 function resolveWalls(car) {
   const r = CAR.wallRadius;
+  const b = CAR.wallBounce;
   if (car.pos.x - r < 0) {
     car.pos.x = r;
-    car.vel.x = Math.abs(car.vel.x) * 0.4;
+    car.vel.x = Math.abs(car.vel.x) * b;
     car.angularVel *= 0.5;
   } else if (car.pos.x + r > W) {
     car.pos.x = W - r;
-    car.vel.x = -Math.abs(car.vel.x) * 0.4;
+    car.vel.x = -Math.abs(car.vel.x) * b;
     car.angularVel *= 0.5;
   }
   if (car.pos.y - r < 0) {
     car.pos.y = r;
-    car.vel.y = Math.abs(car.vel.y) * 0.4;
+    car.vel.y = Math.abs(car.vel.y) * b;
     car.angularVel *= 0.5;
   } else if (car.pos.y + r > H) {
     car.pos.y = H - r;
-    car.vel.y = -Math.abs(car.vel.y) * 0.4;
+    car.vel.y = -Math.abs(car.vel.y) * b;
     car.angularVel *= 0.5;
   }
 }
 
-function resolveCircles(aPos, aVel, aR, bPos, bVel, bR, bStatic) {
+function resolveCircles(aPos, aVel, aR, bPos, bVel, bR, bStatic, restitution) {
   const dx = bPos.x - aPos.x;
   const dy = bPos.y - aPos.y;
   const dist = Math.hypot(dx, dy) || 0.001;
@@ -275,7 +286,6 @@ function resolveCircles(aPos, aVel, aR, bPos, bVel, bR, bStatic) {
   const velAlongNormal = rvx * nx + rvy * ny;
   if (velAlongNormal > 0) return;
 
-  const restitution = 0.5;
   const impulse = (-(1 + restitution) * velAlongNormal) / (bStatic ? 1 : 2);
   aVel.x -= impulse * nx; aVel.y -= impulse * ny;
   if (!bStatic) { bVel.x += impulse * nx; bVel.y += impulse * ny; }
@@ -320,7 +330,7 @@ function resolveCarVsStaticCircle(car, obstaclePos, obstacleR) {
     const c = { x: car.pos.x + r.x, y: car.pos.y + r.y };
     const posBefore = { x: c.x, y: c.y };
     const velBefore = { x: car.vel.x, y: car.vel.y };
-    resolveCircles(c, car.vel, CAR.capsuleRadius, obstaclePos, null, obstacleR, true);
+    resolveCircles(c, car.vel, CAR.capsuleRadius, obstaclePos, null, obstacleR, true, CAR.obstacleCollisionRestitution);
     car.pos.x += c.x - posBefore.x;
     car.pos.y += c.y - posBefore.y;
     applyCollisionSpin(car, r, velBefore);
@@ -334,7 +344,7 @@ function resolveCarVsCar(carA, carB) {
       const b = { x: carB.pos.x + rB.x, y: carB.pos.y + rB.y };
       const posBeforeA = { x: a.x, y: a.y }, posBeforeB = { x: b.x, y: b.y };
       const velBeforeA = { x: carA.vel.x, y: carA.vel.y }, velBeforeB = { x: carB.vel.x, y: carB.vel.y };
-      resolveCircles(a, carA.vel, CAR.capsuleRadius, b, carB.vel, CAR.capsuleRadius, false);
+      resolveCircles(a, carA.vel, CAR.capsuleRadius, b, carB.vel, CAR.capsuleRadius, false, CAR.carCollisionRestitution);
       carA.pos.x += a.x - posBeforeA.x; carA.pos.y += a.y - posBeforeA.y;
       carB.pos.x += b.x - posBeforeB.x; carB.pos.y += b.y - posBeforeB.y;
       applyCollisionSpin(carA, rA, velBeforeA);
