@@ -40,7 +40,7 @@ const CAR = {
   width: 24,
   wheelBase: 30, // distance between front and rear axle
   track: 18, // distance between the front-left/front-right tire centers (for Ackermann geometry)
-  maxSteer: 0.6, // radians, the effective single-front-wheel ("bicycle model") steering lock
+  maxSteer: 0.38, // radians, the effective single-front-wheel ("bicycle model") steering lock -- kinematic min radius = wheelBase/tan(maxSteer)
   enginePower: 340, // forward acceleration, px/s^2 -- kept gentle for parking-scale control
   brakePower: 1150, // deceleration when braking while moving forward
   reversePower: 200,
