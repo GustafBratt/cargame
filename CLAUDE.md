@@ -132,13 +132,25 @@ All audio is **synthesized with the Web Audio API**, with no audio files, matchi
 
 **Collisions:**
 - **Library:** 12 recipes in `COLLISION_RECIPES`, 4 per tier (light, medium, heavy). They're rendered once into AudioBuffers via `OfflineAudioContext` when audio unlocks, then peak-normalized. Loudness therefore comes only from the tier volume and impact speed, not from how a recipe happened to sum.
-- **They must sound HEAVY:** a car weighs a ton. The first version was called "banging two pencils together". Measuring it (energy split into sub <90 Hz / body 120–500 Hz / click >2 kHz, plus how long each sound stays within 20 dB of its peak) showed the problem was *character*, not a lack of bass: sounds were short (0.1–0.45s), tonal (clean falling sines read as wood blocks) and dry. The first fix overcorrected into sub-bass (up to 95% below 90 Hz). That's inaudible on laptop speakers, and after peak normalization it made the audible part *quieter*.
-- **The current recipe:**
-  - energy lives in the **body band**: noisy `sfxWhump` rumbles (band-limited, high-passed at 90 Hz), thumps starting around 110–150 Hz, and low sheet metal (80–200 Hz) that rings long and bends down
-  - `renderSfx` puts every sound through a **70 Hz highpass, then tanh saturation** (`COLLISION_FX[tier].drive`, which adds harmonics so the low end still reads on small speakers), **then a synthetic room reverb** (`roomIR`, wet amount `COLLISION_FX[tier].room`) for size
-  - measured audible length: light ~0.2–0.3s, medium ~0.4–0.6s, heavy ~0.8–1.1s; light and medium are 72–97% body, heavy about half body and half sub
-
-  Re-measure the same way after retuning rather than going by ear alone. Don't reintroduce short, clean pitched "bonk"-style tones.
+- **They're CARTOON FOLEY: weighty but playful.** This is the third design; the comment at the top of the collision library records the history:
+  1. **Short pitched clicks:** "like banging two pencils together".
+  2. **Realistic and heavy** (rumble, ringing sheet metal, room reverb): weighty but "the wrong vibe", the only realistic thing in a cartoon world with cartoony event sounds. Real recordings would clash the same way. Movie crash audio was suggested, but it's copyrighted, so it isn't an option.
+  3. **Now:** every hit has a chunky low `sfxBoomf` (a noisy whump plus a thump, scaled by `size`) so nothing reads as pencils. On top go classic cartoon elements:
+     - `sfxBoing` (a spring with vibrato and a slow ringing decay)
+     - `sfxClatter` (pots and pans)
+     - `sfxHubcap` (a lid wobbling to rest with speeding-up tremolo)
+     - `sfxSlide` (slide whistle)
+     - clangs via `sfxMetal`
+- **Tiers:**
+  - light: bonk, boing, donk, squeak
+  - medium: clang, sproing, clatter, kerthunk
+  - heavy: kaboom, hubcap, junkpile, sproing-crash
+- **Signal chain:** `renderSfx` puts every sound through a 70 Hz highpass (sub rumble is inaudible on laptop speakers and only eats headroom after peak normalization), then mild tanh saturation (`COLLISION_FX[tier].drive`), then a *small* synthetic room tail (`roomIR`, wet amount `COLLISION_FX[tier].room`). Cartoons are drier than pass 2.
+- **Measure, don't eyeball.** Split energy into sub <90 Hz, body 120–500 Hz, mid 500 Hz–2 kHz and click >2 kHz, time how long each sound stays within 20 dB of its peak, and check that it ends silent. Things these measurements caught:
+  - The boomf initially drowned the cartoon layer, making light hits audible for only ~0.1s.
+  - envGain's fast decay (−20 dB a quarter of the way in) killed spring "boings", hence `sfxBoing`'s own slower decay.
+  - Render windows shorter than a sound's tail chopped it off, causing a click.
+- **Current measured audible length:** light ~0.2–0.4s, medium ~0.4–0.7s, heavy ~1–1.4s. Every sound keeps real low weight (sub+body ≥ ~30%).
 - **Playback:** `collisionSound(speed, x, car)` is called from every collision site: `resolveCarVsStaticCircle`, `resolveCarVsCar` (once per pair, not per car) and `boundaryHit` (walls and curb). It picks a tier from `HIT_TIERS` by closing speed, plays a random buffer from that tier with ±10% pitch and a volume ramp within the tier, and pans by x.
 - **When a contact makes a sound:**
   - *Any car:* an impact at `HIT_SOUND_MIN` (45 px/s) or harder always sounds.
