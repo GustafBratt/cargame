@@ -22,7 +22,7 @@ resize();
 // Keys are stored lowercased (e.key.toLowerCase()), so arrows are "arrowup" etc.
 // preventDefault on these also stops the arrow keys from scrolling the page.
 const CONTROL_KEYS = new Set([
-  "w", "a", "s", "d", "i", "j", "k", "l", "r",
+  "w", "a", "s", "d", "i", "j", "k", "l",
   "arrowup", "arrowdown", "arrowleft", "arrowright",
 ]);
 const keys = new Set();
@@ -31,7 +31,6 @@ window.addEventListener("keydown", (e) => {
   const k = e.key.toLowerCase();
   if (CONTROL_KEYS.has(k)) e.preventDefault();
   keys.add(k);
-  if (k === "r") resetCars();
 });
 window.addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
 window.addEventListener("blur", () => keys.clear());
@@ -114,8 +113,6 @@ function createCar(x, y, angle, color, input) {
     dents: [], // car-local {x, y, r}, drawn by drawCar
     color,
     input, // { up, down, left, right }, each an array of key names (any one of them works)
-    startPos: { x, y },
-    startAngle: angle,
   };
 }
 
@@ -128,6 +125,7 @@ function readInput(car) {
   const held = (names) => (names.some((k) => keys.has(k)) ? 1 : 0);
   const throttle = held(car.input.up) - held(car.input.down);
   const steer = held(car.input.right) - held(car.input.left);
+  if (throttle || steer) car.hasDriven = true; // drops the key hint from this player's HUD
   return { throttle, steer };
 }
 
@@ -491,6 +489,7 @@ function emitSmoke(car, dt) {
 let car1, car2, crates, street;
 let npcs = []; // AI traffic cars, see updateTraffic
 let npcSpawnTimer = 0;
+let gameTime = 0; // seconds of simulation since setupWorld, see updateHint
 let particles = []; // cosmetic-only firework sparks/rings, see spawnFirework
 
 const PARKED_COLORS = ["#6b7280", "#7c6b52", "#59695a", "#69596c", "#54606b", "#7a5c53"];
@@ -538,21 +537,6 @@ function buildStreet() {
   return { curbY, carCenterY, centerlineY, npcLaneY, parkedCars, parkingSpots, garage };
 }
 
-function resetCars() {
-  car1.pos.x = car1.startPos.x; car1.pos.y = car1.startPos.y;
-  car1.angle = car1.startAngle; car1.vel.x = 0; car1.vel.y = 0; car1.angularVel = 0;
-  car2.pos.x = car2.startPos.x; car2.pos.y = car2.startPos.y;
-  car2.angle = car2.startAngle; car2.vel.x = 0; car2.vel.y = 0; car2.angularVel = 0;
-
-  car1.score = 0; car1.gameState = "seekCoin";
-  car2.score = 0; car2.gameState = "seekCoin";
-  repairCar(car1);
-  repairCar(car2);
-  spawnCoin();
-  particles.length = 0;
-  resetTraffic();
-}
-
 function buildCrates() {
   const crates = [];
   const cols = 4, rows = 3;
@@ -581,9 +565,12 @@ function setupWorld() {
 
   car1.score = 0; car1.gameState = "seekCoin";
   car2.score = 0; car2.gameState = "seekCoin";
+  car1.label = "P1"; car1.keyHint = "WASD"; car1.hasDriven = false;
+  car2.label = "P2"; car2.keyHint = "IJKL / Arrows"; car2.hasDriven = false;
   spawnCoin();
   particles.length = 0;
   resetTraffic();
+  gameTime = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -644,10 +631,17 @@ function isParked(car) {
 
 const GARAGE_SPEED_LIMIT = 15; // px/s -- come to a stop; driving through doesn't charge you
 const REPAIR_COST = 1;
+const GARAGE_HINT_DAMAGE = 0.3; // at this much damage the garage pad starts pulsing in the player's color
 
 function onGaragePad(car) {
   const g = street.garage;
   return car.pos.x > g.x0 && car.pos.x < g.x1 && car.pos.y > g.padY0 && car.pos.y < g.curbY;
+}
+
+// Stopped on the pad, damaged, but broke -- drawGarage flashes the pad red.
+function garageDenied(car) {
+  return car.damage > 0 && car.score < REPAIR_COST && onGaragePad(car) &&
+    Math.hypot(car.vel.x, car.vel.y) <= GARAGE_SPEED_LIMIT;
 }
 
 function updateGarage() {
@@ -979,6 +973,7 @@ function resolveCurb(car) {
 }
 
 function update(dt) {
+  gameTime += dt;
   updateTraffic(dt);
 
   const movers = [car1, car2, ...npcs];
@@ -1056,6 +1051,38 @@ function drawStreet() {
     ctx.fillRect(spot.x1 - 1.5, curbY - 2, 3, 16);
     ctx.fillText("P", (spot.x0 + spot.x1) / 2, curbY - 22);
   }
+}
+
+// The in-world "now go park" cue (there's no status text): while a player is
+// in "mustPark", every open spot pulses in that player's color. With both
+// players waiting to park, the two pulses run half a cycle apart, so the
+// spots alternate between their colors.
+function drawParkingTargets() {
+  const waiting = [car1, car2].filter((c) => c.gameState === "mustPark");
+  const y0 = street.carCenterY - CAR.width / 2 - 5;
+  const h = street.curbY - 1 - y0;
+  drawTargetPulse(waiting, street.parkingSpots.map((s) => ({ x: s.x0, y: y0, w: s.x1 - s.x0, h })));
+}
+
+// The shared "go here" cue: each rect pulses (tinted fill + outline) in the
+// color of every car in `cars`. With two cars, their pulses run half a cycle
+// apart so the colors alternate. Used for the parking spots and the garage.
+function drawTargetPulse(cars, rects) {
+  if (!cars.length) return;
+  const now = performance.now() / 1000;
+  cars.forEach((car, i) => {
+    const pulse = 0.5 + 0.5 * Math.sin(now * 5 + i * Math.PI); // 0..1
+    ctx.fillStyle = car.color;
+    ctx.strokeStyle = car.color;
+    ctx.lineWidth = 2;
+    for (const r of rects) {
+      ctx.globalAlpha = 0.08 + 0.22 * pulse;
+      ctx.fillRect(r.x, r.y, r.w, r.h);
+      ctx.globalAlpha = 0.35 + 0.55 * pulse;
+      ctx.strokeRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
+    }
+  });
+  ctx.globalAlpha = 1;
 }
 
 function drawCoin(coin) {
@@ -1188,19 +1215,38 @@ function drawGarage() {
   const g = street.garage;
   const w = g.x1 - g.x0;
 
-  // service pad on the road: hazard-striped border around a darker slab
+  // service pad on the road: hazard-striped border around a darker slab. No
+  // text anywhere on the garage -- the wrench + coin on the pad says "repairs
+  // cost a coin", and the border flashes red at a damaged player who's
+  // stopped on it without one.
+  const denied = garageDenied(car1) || garageDenied(car2);
+  const flashOn = denied && Math.floor(performance.now() / 180) % 2 === 0;
   ctx.fillStyle = "rgba(20,22,28,0.55)";
   ctx.fillRect(g.x0, g.padY0, w, g.curbY - g.padY0);
+  // Badly damaged players see the pad pulse in their color -- same "go here"
+  // cue as the parking spots. Grown a few px past the pad so the pulsing
+  // outline frames the hazard border instead of hiding underneath it.
+  const busted = [car1, car2].filter((c) => c.damage >= GARAGE_HINT_DAMAGE);
+  const m = 4;
+  drawTargetPulse(busted, [{ x: g.x0 - m, y: g.padY0 - m, w: w + 2 * m, h: g.curbY - g.padY0 + m }]);
   ctx.save();
-  ctx.strokeStyle = "#e0b43a";
+  ctx.strokeStyle = flashOn ? "#ff4b3e" : "#e0b43a";
   ctx.lineWidth = 3;
   ctx.setLineDash([10, 7]);
   ctx.strokeRect(g.x0 + 1.5, g.padY0 + 1.5, w - 3, g.curbY - g.padY0 - 3);
   ctx.restore();
-  ctx.fillStyle = "rgba(224,180,58,0.85)";
-  ctx.font = "bold 11px system-ui, sans-serif";
-  ctx.textAlign = "center";
-  ctx.fillText(`REPAIR · ${REPAIR_COST} COIN`, (g.x0 + g.x1) / 2, g.padY0 + 16);
+
+  const cx = (g.x0 + g.x1) / 2, cy = (g.padY0 + g.curbY) / 2;
+  ctx.globalAlpha = 0.9;
+  drawWrench(cx - 11, cy, flashOn ? "#ff4b3e" : "#c9ccd3");
+  ctx.fillStyle = "#ffd54f";
+  ctx.strokeStyle = "#b8860b";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(cx + 13, cy, 7, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.globalAlpha = 1;
 
   // building on the sidewalk, roll-up door facing the pad
   const by0 = g.curbY + 4;
@@ -1222,10 +1268,21 @@ function drawGarage() {
     ctx.lineTo(g.x1 - doorInset, y);
   }
   ctx.stroke();
+}
 
-  ctx.fillStyle = "#f1e3c8";
-  ctx.font = "bold 13px system-ui, sans-serif";
-  ctx.fillText("GARAGE", (g.x0 + g.x1) / 2, Math.min(by0 + doorH + 18, g.bottomY - 6));
+// A simple open-end wrench, ~24px long, centered on (x, y), tilted 45deg.
+function drawWrench(x, y, color) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(-Math.PI / 4);
+  ctx.fillStyle = color;
+  ctx.fillRect(-11, -2.5, 16, 5); // handle
+  ctx.strokeStyle = color; // head: a thick "C", open to the right for the jaw
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.arc(8, 0, 4.5, Math.PI * 0.3, Math.PI * 1.7);
+  ctx.stroke();
+  ctx.restore();
 }
 
 function roundedRect(x, y, w, h, r) {
@@ -1238,22 +1295,29 @@ function roundedRect(x, y, w, h, r) {
   ctx.closePath();
 }
 
-const speedEl1 = document.getElementById("p1-speed");
-const speedEl2 = document.getElementById("p2-speed");
+// The HUD is deliberately minimal: each player's badge is just their label
+// and coin count. The key hint shows only until that player first drives,
+// and the bottom hint line fades out after HINT_SECONDS or the first coin
+// pickup. Game state is shown in the world instead (drawParkingTargets, the
+// garage pad flash) -- keep it that way rather than adding status text back.
+const titleEl1 = document.getElementById("p1-title");
+const titleEl2 = document.getElementById("p2-title");
 const scoreEl1 = document.getElementById("p1-score");
 const scoreEl2 = document.getElementById("p2-score");
-const statusEl1 = document.getElementById("p1-status");
-const statusEl2 = document.getElementById("p2-status");
+const hintEl = document.getElementById("hint");
+const HINT_SECONDS = 10;
 
-function statusText(car) {
-  if (car.damage > 0 && car.score < REPAIR_COST && onGaragePad(car)) return `Repairs cost ${REPAIR_COST} coin!`;
-  return car.gameState === "mustPark" ? "Now parallel park!" : "Race for the coin!";
+function updateHud(car, titleEl, scoreEl) {
+  const title = car.hasDriven ? car.label : `${car.label} — ${car.keyHint}`;
+  if (titleEl.textContent !== title) titleEl.textContent = title;
+  const score = String(car.score);
+  if (scoreEl.textContent !== score) scoreEl.textContent = score;
 }
 
-function updateHud(car, speedEl, scoreEl, statusEl) {
-  speedEl.textContent = `${Math.round(Math.hypot(car.vel.x, car.vel.y) * 0.22)} mph`;
-  scoreEl.textContent = `Coins: ${car.score}`;
-  statusEl.textContent = statusText(car);
+function updateHint() {
+  if (hintEl.classList.contains("faded")) return;
+  const anyPickup = [car1, car2].some((c) => c.score > 0 || c.gameState === "mustPark");
+  if (gameTime > HINT_SECONDS || anyPickup) hintEl.classList.add("faded");
 }
 
 function drawParticles() {
@@ -1310,6 +1374,7 @@ function drawParticles() {
 function render() {
   drawGrid();
   drawStreet();
+  drawParkingTargets();
   drawGarage();
   for (const c of crates) drawCrate(c);
   for (const pc of street.parkedCars) drawCar(pc);
@@ -1319,8 +1384,9 @@ function render() {
   drawCar(car2);
   drawParticles();
 
-  updateHud(car1, speedEl1, scoreEl1, statusEl1);
-  updateHud(car2, speedEl2, scoreEl2, statusEl2);
+  updateHud(car1, titleEl1, scoreEl1);
+  updateHud(car2, titleEl2, scoreEl2);
+  updateHint();
 }
 
 // ---------------------------------------------------------------------------

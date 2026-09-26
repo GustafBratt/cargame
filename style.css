@@ -24,43 +24,42 @@ canvas {
   font-variant-numeric: tabular-nums;
 }
 
+/* Each player's HUD is a small badge: "P1" (plus key hint until they first
+   drive) and a coin count, in the player's color. */
 .hud-panel {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   background: rgba(0, 0, 0, 0.35);
   border-radius: 8px;
-  padding: 6px 12px;
-  min-width: 110px;
-}
-
-.hud-p2 {
-  text-align: right;
+  padding: 5px 10px;
 }
 
 .hud-title {
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 700;
   letter-spacing: 0.04em;
-  opacity: 0.75;
 }
 
-.hud-p1 .hud-title { color: #6fd0ff; }
-.hud-p2 .hud-title { color: #ffb15c; }
-
-#p1-speed, #p2-speed {
-  font-size: 18px;
+.hud-coins {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 16px;
   font-weight: 700;
 }
 
-.hud-score {
-  font-size: 13px;
-  font-weight: 600;
-  color: #ffd54f;
-  margin-top: 2px;
-}
+.hud-p1 { color: #6fd0ff; }
+.hud-p2 { color: #ffb15c; }
 
-.hud-status {
-  font-size: 11px;
-  opacity: 0.7;
-  margin-top: 1px;
+/* Matches the in-game coin (drawCoin): gold face, dark-gold rim. */
+.coin-icon {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #ffd54f;
+  border: 2px solid #b8860b;
+  box-sizing: border-box;
 }
 
 .hint {
@@ -71,4 +70,9 @@ canvas {
   font-size: 12px;
   opacity: 0.55;
   pointer-events: none;
+  transition: opacity 1.5s ease;
+}
+
+.hint.faded {
+  opacity: 0;
 }
