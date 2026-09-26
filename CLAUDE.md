@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single-page, no-build, top-down 2-player car sandbox. Vanilla HTML/CSS/JS, rendered on a `<canvas>` with `requestAnimationFrame`. Cars are rectangles with visible wheels (front wheels turn with steering); Player 1 drives with WASD, Player 2 with IJKL or the arrow keys. There's a grid of static crates to bump into, a curbside street with parked cars and two marked practice spots for parallel parking, and the two players collide with each other too. AI traffic drives across the street lane above the centerline. Hard hits dent cars, make them smoke, and slow them down; a garage in the bottom-right corner repairs a car for 1 coin. Purely cosmetic pedestrians stroll the sidewalk and stop to stare at crashes and honks.
+A single-page, no-build, top-down 2-player car sandbox. Vanilla HTML/CSS/JS, rendered on a `<canvas>` with `requestAnimationFrame`. Cars are rectangles with visible wheels (front wheels turn with steering); Player 1 drives with WASD, Player 2 with IJKL or the arrow keys. There's a grid of static crates to bump into, a curbside street with parked cars and two marked practice spots for parallel parking, and the two players collide with each other too. AI traffic drives across the street lane above the centerline. Hard hits dent cars, make them smoke, and slow them down; a garage in the bottom-right corner repairs a car for 1 coin. Purely cosmetic pedestrians stroll the sidewalk and stop to stare at crashes and honks. Each player has an Autopilot button that hands their car to a deliberately bad AI driver.
 
 There is no framework, no package.json, and no build/bundle step — the browser loads `index.html`, `style.css`, and `game.js` directly.
 
@@ -108,6 +108,19 @@ Without these, a car knocked off the road can wait forever behind a player who i
 There's only one traffic lane, so `spawnNpc` gives a new car the same direction as any traffic already on screen, and picks a random direction only when the road is empty. This prevents head-on meetings.
 
 `resetTraffic` runs from `setupWorld`. It sets the spawn timer to 0, so the first car rolls in immediately on start; only later spawns follow the random schedule. On resize, NPCs are shifted by the change in `npcLaneY` so they stay in the lane.
+
+### Autopilot (`updateAutopilot`)
+
+Each HUD badge has an **Autopilot** button (`#p1-auto`/`#p2-auto`) that calls `toggleAutopilot(car)`. While `car.autopilot` is set, `readInput` returns `car.ap.drive` (filled each step by `updateAutopilot`, called from `update` before `stepCar`) instead of reading keys. The AI therefore drives through the same physics, collisions, damage, coin race and garage as a human. Traffic uses `car.drive` and autopilot uses `car.autopilot`; keep them separate, because code like `npcGotRammed` treats `car.drive` as "is an NPC". The button swallows `mousedown` so it never takes focus (Space/Enter would toggle it mid-game), and a click also unlocks audio.
+
+It plays the game **badly on purpose** (the brief: "not very good drivers, they smash into things"):
+- **Goals** (`apPickGoal`): the garage once `damage >= ap.garageAt` (rolled 0.35–0.7) and it can pay; parking when `mustPark`; otherwise the coin. While chasing coins it gets bored now and then (Poisson, `AP_HARASS_MEAN`) and **harasses traffic** for 5–10s: it rams an on-screen NPC, backs off and rams it again (`apHarass`).
+- **Driving** (`apDriveTo`): too fast (cruise rolled 170–250 px/s), a steering wobble scaled by `ap.sloppy`, and late braking (`ap.lateBraking` overestimates the brakes). It swerves around crates and parked cars ahead only if it notices them: each obstacle is rolled against `AP_BLIND_CHANCE` (0.4) and re-rolled every `AP_SEEN_RESET`. Wedged cars back out at opposite lock (`apCheckStuck`), and a target close behind gets a clumsy reverse-and-swing turn.
+- **Spot choice** (`apChooseSpot`): uniform random over the spots, except that 45% of the time it goes for the spot the other autopilot is already heading to, so they fight over it.
+- **Parallel parking** (`apPark`): a scripted S-curve in phases: `approach` → `line` (creep along a line `p.gap` out from the parked row) → `swing` (reverse at full lock) → `counter` (opposite lock until straight) → `settle` (shuffle forward/back, steering toward straight, until straight and centered) → `wait`. If that didn't count as parked, it does `pullout` and a new attempt, maybe at another spot. A misaligned arrival at the entry point takes a `detour` loop instead of flip-flopping between phases. `AP_PARK_TIMEOUT` restarts a stalled attempt. `p.rush` (usually ~1, sometimes up to 3.5) makes it floor the reverse and overshoot into the curb.
+- **Parking geometry was measured, not derived.** Reversing at full lock, the car's *center* first swings outward before it comes in, so a circle model of the center is wrong (the first version used one and overshot every time). The swing→counter switch is measured on the **rear axle** (`apRearY`), which really follows the arc. Switching once it has covered `AP_PARK_SWITCH` (0.4) of the gap gives sideways travel ≈ gap and backward travel ≈ `AP_PARK_TRAVEL` (50) + gap at parking speed (28 px/s). Re-measure if steering or grip constants change.
+
+Headless measurements (both players on autopilot, traffic on, 5-minute runs): each car parks ~5–10 times, both spots get used, about half the parks succeed first try and the rest take 2–4 attempts (up to ~85s), with occasional garage visits and 1–3 harassment sprees. Solo from random starts, 40 of 40 runs parked within 90s.
 
 ### Pedestrians (purely cosmetic easter egg)
 
@@ -213,7 +226,7 @@ Volumes were balanced by *measured* peak level. Approximate peaks: light bump 0.
 ### HUD and on-screen text: keep it minimal
 
 On-screen text was deliberately cut down after feedback that the game felt like an airport full of signs. The rule: **show game state in the world, not as text**.
-- **Players' HUD:** each player gets a small badge with their label and coin count (`updateHud`). The key hint ("P1 — WASD") shows only until that player first drives (`car.hasDriven`, set in `readInput`).
+- **Players' HUD:** each player gets a small badge with their label and coin count (`updateHud`). The key hint ("P1 — WASD") shows only until that player first drives (`car.hasDriven`, set in `readInput`). The badge also holds the Autopilot toggle, filled in the player's color while on (`.auto-btn.on`, synced in `updateHud`).
 - **Bottom hint line:** the only instructions. It fades out (`updateHint`, CSS `.hint.faded`) after `HINT_SECONDS` of `gameTime` or at the first coin pickup.
 - **In-world cues instead of status text:**
   - A player who must park sees every open P spot pulse in their color (`drawParkingTargets`).
@@ -228,4 +241,4 @@ Before adding a new text label or HUD line, look for an in-world way to show the
 
 ### Input
 
-A single global `Set` (`keys`) tracks currently-held keys via `keydown`/`keyup` listeners; `readInput(car)` reads throttle/steer from each car's own key bindings (`car.input`, where each direction is an array of key names so a player can have alternate keys, like P2's IJKL + arrows). Keys are stored lowercased (`"arrowup"`, not `"ArrowUp"`); any new binding also needs adding to `CONTROL_KEYS` so it gets `preventDefault()` (for arrows, that's what stops the page from scrolling). Key handling calls `preventDefault()` only for the specific keys the game uses, so it doesn't swallow other browser shortcuts.
+A single global `Set` (`keys`) tracks currently-held keys via `keydown`/`keyup` listeners; `readInput(car)` (unless the car is traffic or on autopilot, see above) reads throttle/steer from each car's own key bindings (`car.input`, where each direction is an array of key names so a player can have alternate keys, like P2's IJKL + arrows). Keys are stored lowercased (`"arrowup"`, not `"ArrowUp"`); any new binding also needs adding to `CONTROL_KEYS` so it gets `preventDefault()` (for arrows, that's what stops the page from scrolling). Key handling calls `preventDefault()` only for the specific keys the game uses, so it doesn't swallow other browser shortcuts.
