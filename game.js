@@ -157,20 +157,26 @@ function sfxRattle(c, dest, t0, { count, spread, gain = 0.5, freq = 1800 }) {
 
 // ---- Collision library -----------------------------------------------------
 //
-// Collisions are CARTOON FOLEY, to match the cartoon art and the other
-// (cartoony) sounds. History, so nobody repeats it:
-//  1. First pass: short pitched clicks -- "like banging two pencils together".
-//  2. Second pass: realistic and heavy (rumble, ringing sheet metal, room
-//     reverb). Weighty, but "the wrong vibe" -- the only realistic thing in a
-//     cartoon world. Realistic recordings (e.g. movie crashes) would clash
-//     the same way; movie audio is also copyrighted, so it's not an option.
-//  3. Now: every hit keeps a chunky low "boomf" for weight (never pencils
-//     again), topped with classic cartoon elements -- boings, clangs,
-//     pots-and-pans clatter, a hubcap wobbling to rest, a slide whistle.
-//     Drier than pass 2 (cartoons don't sound like they're in a room).
+// Collisions are HOLLYWOOD crash sound design: not realistic (real crashes
+// don't sound like what people expect) and not cartoon -- the exaggerated,
+// designed "movie crash" everyone recognizes. History, so nobody repeats it:
+//  1. Short pitched clicks: "like banging two pencils together" (no weight).
+//  2. Realistic and heavy (rumble, ringing sheet metal, room reverb): "the
+//     wrong vibe". (Movie audio itself was suggested -- it's copyrighted,
+//     so that was never an option; this is synthesized in the same style.)
+//  3. Cartoon foley (boings, pots and pans, slide whistle): "too cartoonish".
+//  4. Now: the movie-crash recipe. Each hit layers
+//     - sfxCrack:   a sharp broadband transient at impact -- the punch
+//     - sfxBoom:    a deep, fast pitch-dropping impact, felt as much as heard
+//     - sfxCrunch:  dense metallic grains -- crumpling bodywork
+//     - sfxGroan:   twisting sheet metal (heavier hits)
+//     - sfxShatter: breaking glass (heavy hits, the odd medium one)
+//     - sfxDebris:  bits raining down afterwards
+//     through compression + saturation (glue, punch) and a roomy tail.
+//     Weight stays in the audible "body" band (see pass 1).
 
-// A "whump": rumbling noise sweeping downward, band-limited to the "body"
-// range (high-passed at 90 Hz, so it stays audible on small speakers).
+// Rumbling noise sweeping downward, band-limited to the "body" range
+// (high-passed at 90 Hz, so it stays audible on small speakers).
 function sfxWhump(c, dest, t0, { from, to, dur, gain = 1 }) {
   const src = c.createBufferSource();
   src.buffer = noiseBuffer(c, dur);
@@ -187,55 +193,87 @@ function sfxWhump(c, dest, t0, { from, to, dur, gain = 1 }) {
   src.stop(t0 + dur);
 }
 
-// The weight under every cartoon hit: a whump plus a thump. `size` 0..1
-// scales it from a light bump to a big crash.
-function sfxBoomf(c, dest, t0, { size, gain = 1 }) {
-  sfxWhump(c, dest, t0, { from: 380 + 420 * size, to: 150 - 20 * size, dur: 0.3 + 0.5 * size, gain });
-  sfxTone(c, dest, t0, { freq: 125 - 20 * size, freqTo: 65 - 15 * size, dur: 0.25 + 0.45 * size, gain: gain * 0.55 });
+// The impact's weight: a fast pitch-dropping thump (kick-drum style punch,
+// starting high enough to be heard on laptop speakers) plus a whump of
+// low-mid noise. `size` 0..1 scales from a bump to a big crash.
+function sfxBoom(c, dest, t0, { size, gain = 1 }) {
+  sfxTone(c, dest, t0, { freq: 190 - 40 * size, freqTo: 55 - 12 * size, dur: 0.18 + 0.5 * size, gain: gain * 0.8, attack: 0.002 });
+  sfxWhump(c, dest, t0, { from: 700 + 600 * size, to: 140, dur: 0.25 + 0.7 * size, gain: gain * 0.9 });
 }
 
-// Cartoon spring "boing": a tone with fast vibrato that fades as it glides.
-function sfxBoing(c, dest, t0, { freq, freqTo, dur, rate = 18, depth = 0.12, gain = 1, type = "triangle" }) {
-  const o = c.createOscillator();
-  o.type = type;
-  o.frequency.setValueAtTime(freq, t0);
-  if (freqTo) o.frequency.exponentialRampToValueAtTime(freqTo, t0 + dur);
-  const lfo = c.createOscillator();
-  lfo.frequency.value = rate;
-  const wobble = c.createGain();
-  wobble.gain.setValueAtTime(freq * depth, t0);
-  wobble.gain.exponentialRampToValueAtTime(freq * depth * 0.15, t0 + dur);
-  lfo.connect(wobble).connect(o.frequency);
-  // Slower, ringing decay than envGain's (which is -20 dB a quarter of the
-  // way in): cartoon springs hang in the air. Measured, the envGain version
-  // made light boings audible for only ~0.1-0.2s.
-  const env = c.createGain();
-  env.gain.setValueAtTime(0.0001, t0);
-  env.gain.linearRampToValueAtTime(gain, t0 + 0.005);
-  env.gain.setTargetAtTime(0.0001, t0 + 0.005, dur / 4);
-  o.connect(env).connect(dest);
-  const end = t0 + dur * 1.3; // ~-46 dB by here
-  o.start(t0);
-  o.stop(end);
-  lfo.start(t0);
-  lfo.stop(end);
+// The impact transient: a very short, bright noise burst -- the "crack" that
+// makes a hit punchy instead of soft.
+function sfxCrack(c, dest, t0, { gain = 1, bright = 1 }) {
+  sfxNoise(c, dest, t0, { dur: 0.035, freq: 1400 * bright, type: "highpass", gain, attack: 0.001 });
+  sfxNoise(c, dest, t0, { dur: 0.06, freq: 900 * bright, q: 0.8, gain: gain * 0.6, attack: 0.001 });
 }
 
-// Pots-and-pans: a run of short, bright metal clangs at random moments.
-function sfxClatter(c, dest, t0, { count, spread, gain = 0.5, low = 350, high = 1100 }) {
+// Crumpling bodywork: a dense spray of tiny metallic grains (short resonant
+// noise bursts and pings) over `dur`, thinning out as it goes.
+function sfxCrunch(c, dest, t0, { dur, density = 60, gain = 0.6, low = 700, high = 3500 }) {
+  const count = Math.round(density * dur);
   for (let i = 0; i < count; i++) {
-    const t = t0 + (i === 0 ? 0 : Math.random() * spread);
-    sfxMetal(c, dest, t, {
-      base: low + Math.random() * (high - low),
-      dur: 0.12 + Math.random() * 0.2,
-      gain: gain * (0.5 + Math.random() * 0.5),
-      ratios: [1, 1.37, 1.93, 2.61],
-    });
+    const t = t0 + Math.pow(Math.random(), 1.6) * dur; // front-loaded
+    const f = low + Math.random() * (high - low);
+    if (Math.random() < 0.7) {
+      sfxNoise(c, dest, t, { dur: 0.01 + Math.random() * 0.025, freq: f, q: 6, gain: gain * (0.4 + Math.random() * 0.6), attack: 0.0005 });
+    } else {
+      sfxTone(c, dest, t, { freq: f, dur: 0.03 + Math.random() * 0.05, type: "triangle", gain: gain * 0.35 * Math.random(), attack: 0.0005 });
+    }
   }
 }
 
-// A hubcap (or trash-can lid) wobbling to rest: a metal ring whose
-// "wah-wah-wah" tremolo speeds up as it settles, pitch creeping upward.
+// Twisting sheet metal: an inharmonic cluster bending down in pitch with a
+// slow uneven wobble -- the drawn-out "groan" of a car body deforming.
+function sfxGroan(c, dest, t0, { base, dur, gain = 0.5 }) {
+  const lfo = c.createOscillator();
+  lfo.frequency.value = 5 + Math.random() * 4;
+  const wob = c.createGain();
+  wob.gain.value = base * 0.03;
+  lfo.connect(wob);
+  const bp = c.createBiquadFilter();
+  bp.type = "bandpass";
+  bp.frequency.value = base * 2.2;
+  bp.Q.value = 1.2;
+  const env = c.createGain();
+  env.gain.setValueAtTime(0.0001, t0);
+  env.gain.linearRampToValueAtTime(gain, t0 + dur * 0.15);
+  env.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  bp.connect(env).connect(dest);
+  [1, 1.34, 1.83, 2.47].forEach((r) => {
+    const o = c.createOscillator();
+    o.type = "sawtooth";
+    o.frequency.setValueAtTime(base * r, t0);
+    o.frequency.exponentialRampToValueAtTime(base * r * 0.7, t0 + dur);
+    wob.connect(o.frequency);
+    o.connect(bp);
+    o.start(t0);
+    o.stop(t0 + dur);
+  });
+  lfo.start(t0);
+  lfo.stop(t0 + dur);
+}
+
+// Breaking glass: a bright hissing burst, then a shower of pings thinning
+// into a tinkle tail.
+function sfxShatter(c, dest, t0, { dur = 0.6, gain = 0.5 }) {
+  sfxNoise(c, dest, t0, { dur: dur * 0.5, freq: 4000, type: "highpass", gain: gain * 0.7, attack: 0.001 });
+  sfxGlass(c, dest, t0, { count: Math.round(24 * dur), spread: dur * 0.4, gain: gain * 0.6 });
+  sfxGlass(c, dest, t0 + dur * 0.3, { count: Math.round(10 * dur), spread: dur * 0.7, gain: gain * 0.3 });
+}
+
+// Bits of car raining down after the hit: small low-mid knocks and ticks
+// scattered over `spread`, sparser later.
+function sfxDebris(c, dest, t0, { count, spread, gain = 0.4 }) {
+  for (let i = 0; i < count; i++) {
+    const t = t0 + Math.pow(Math.random(), 1.3) * spread;
+    sfxNoise(c, dest, t, { dur: 0.02 + Math.random() * 0.04, freq: 500 + Math.random() * 1500, q: 4, gain: gain * (0.3 + Math.random() * 0.7), attack: 0.001 });
+    if (Math.random() < 0.3) sfxTone(c, dest, t, { freq: 160 + Math.random() * 200, freqTo: 100, dur: 0.06, gain: gain * 0.4 });
+  }
+}
+
+// A hubcap rolling away and wobbling to rest -- a genuine movie-crash trope
+// ("wah-wah-wah" tremolo speeding up as it settles).
 function sfxHubcap(c, dest, t0, { base = 520, dur = 1.3, gain = 0.5 }) {
   const am = c.createGain();
   am.gain.value = 0.5;
@@ -265,98 +303,106 @@ function sfxHubcap(c, dest, t0, { base = 520, dur = 1.3, gain = 0.5 }) {
   lfo.stop(t0 + dur);
 }
 
-// Slide whistle glide (the cartoon "falling" sound), held rather than
-// percussive.
-function sfxSlide(c, dest, t0, { from, to, dur, gain = 0.4 }) {
-  const o = c.createOscillator();
-  o.frequency.setValueAtTime(from, t0);
-  o.frequency.exponentialRampToValueAtTime(to, t0 + dur);
-  const g = c.createGain();
-  g.gain.setValueAtTime(0.0001, t0);
-  g.gain.linearRampToValueAtTime(gain, t0 + 0.04);
-  g.gain.setValueAtTime(gain, t0 + dur * 0.8);
-  g.gain.linearRampToValueAtTime(0.0001, t0 + dur);
-  o.connect(g).connect(dest);
-  o.start(t0);
-  o.stop(t0 + dur);
-}
-
 // 12 collision sounds, 4 per tier. Each recipe builds one sound into an
 // offline context; buildCollisionLibrary renders them all once at unlock and
 // normalizes them, so loudness differences come only from the tier volume
 // in HIT_TIERS (and the in-tier impact speed), not from how a recipe
 // happened to sum.
+// drive = saturation, room = reverb wet level, ir = reverb tail length (s).
+// Kept moderate: heavy saturation + a loud tail flattened the initial crack
+// so heavy hits peaked 0.1-0.7s AFTER impact (on the glass/hubcap), which
+// kills the punch -- the impact itself must be the loudest moment.
 const COLLISION_FX = {
-  light: { drive: 1.5, room: 0.1 },
-  medium: { drive: 1.8, room: 0.14 },
-  heavy: { drive: 2.2, room: 0.2 },
+  light: { drive: 1.5, room: 0.15, ir: 0.6 },
+  medium: { drive: 1.8, room: 0.2, ir: 0.9 },
+  heavy: { drive: 2.0, room: 0.22, ir: 1.1 },
 };
 
 const COLLISION_RECIPES = {
   light: [
-    { name: "bonk", dur: 0.9, build: (c, o) => {
-      sfxBoomf(c, o, 0, { size: 0.1, gain: 0.7 });
-      sfxBoing(c, o, 0, { freq: 330, freqTo: 190, dur: 0.4, rate: 9, depth: 0.02, gain: 0.8 }); // hollow cartoon "bonk"
+    { name: "thump", dur: 1.0, build: (c, o) => {
+      sfxCrack(c, o, 0, { gain: 0.35, bright: 0.8 });
+      sfxBoom(c, o, 0, { size: 0.22 });
+      sfxCrunch(c, o, 0.005, { dur: 0.08, density: 70, gain: 0.3 });
     } },
-    { name: "boing", dur: 0.9, build: (c, o) => {
-      sfxBoomf(c, o, 0, { size: 0.1, gain: 0.6 });
-      sfxBoing(c, o, 0.01, { freq: 260, freqTo: 210, dur: 0.6, rate: 18, depth: 0.1, gain: 0.75 });
+    { name: "knock", dur: 1.0, build: (c, o) => {
+      sfxCrack(c, o, 0, { gain: 0.4 });
+      sfxBoom(c, o, 0, { size: 0.2, gain: 0.8 });
+      sfxMetal(c, o, 0, { base: 170, dur: 0.3, gain: 0.3, bend: 0.93 }); // panel knock
     } },
-    { name: "donk", dur: 0.9, build: (c, o) => {
-      sfxBoomf(c, o, 0, { size: 0.15, gain: 0.7 });
-      sfxNoise(c, o, 0, { dur: 0.3, freq: 300, q: 4, gain: 0.8 }); // hollow drum body
-      sfxBoing(c, o, 0, { freq: 200, freqTo: 120, dur: 0.45, rate: 7, depth: 0.02, gain: 0.6, type: "sine" });
+    { name: "scrape", dur: 1.0, build: (c, o) => {
+      sfxBoom(c, o, 0, { size: 0.15, gain: 0.8 });
+      sfxNoise(c, o, 0.01, { dur: 0.3, freq: 2400, sweepTo: 900, q: 3, gain: 0.45, attack: 0.01 }); // paint on paint
+      sfxCrunch(c, o, 0.02, { dur: 0.2, density: 40, gain: 0.2, low: 1200, high: 3000 });
     } },
-    { name: "squeak", dur: 0.9, build: (c, o) => {
-      sfxBoomf(c, o, 0, { size: 0.1, gain: 0.7 });
-      sfxBoing(c, o, 0.02, { freq: 620, freqTo: 480, dur: 0.3, rate: 28, depth: 0.05, gain: 0.35, type: "sine" }); // rubbery squeak
+    { name: "bumper", dur: 1.0, build: (c, o) => {
+      sfxCrack(c, o, 0, { gain: 0.45, bright: 1.2 });
+      sfxBoom(c, o, 0, { size: 0.2, gain: 0.85 });
+      sfxCrunch(c, o, 0.005, { dur: 0.12, density: 80, gain: 0.35, low: 1200, high: 3200 }); // plastic crunch
     } },
   ],
   medium: [
-    { name: "clang", dur: 1.4, build: (c, o) => {
-      sfxBoomf(c, o, 0, { size: 0.45, gain: 0.75 });
-      sfxMetal(c, o, 0, { base: 330, dur: 1.0, gain: 0.7, bend: 0.97 });
-      sfxBoing(c, o, 0.05, { freq: 180, freqTo: 150, dur: 0.8, rate: 14, depth: 0.08, gain: 0.4 });
+    { name: "crunch", dur: 1.4, build: (c, o) => {
+      sfxCrack(c, o, 0, { gain: 0.6 });
+      sfxBoom(c, o, 0, { size: 0.45 });
+      sfxCrunch(c, o, 0.005, { dur: 0.35, density: 80, gain: 0.45 });
+      sfxDebris(c, o, 0.2, { count: 6, spread: 0.5, gain: 0.3 });
     } },
-    { name: "sproing", dur: 1.4, build: (c, o) => {
-      sfxBoomf(c, o, 0, { size: 0.45, gain: 0.7 });
-      sfxBoing(c, o, 0.01, { freq: 230, freqTo: 140, dur: 1.0, rate: 22, depth: 0.14, gain: 0.8 });
+    { name: "bang", dur: 1.4, build: (c, o) => {
+      sfxCrack(c, o, 0, { gain: 0.8, bright: 1.1 });
+      sfxBoom(c, o, 0, { size: 0.55 });
+      sfxMetal(c, o, 0.005, { base: 140, dur: 0.7, gain: 0.35, bend: 0.85 });
+      sfxCrunch(c, o, 0.01, { dur: 0.2, density: 60, gain: 0.3 });
     } },
-    { name: "clatter", dur: 1.4, build: (c, o) => {
-      sfxBoomf(c, o, 0, { size: 0.5, gain: 0.75 });
-      sfxClatter(c, o, 0, { count: 7, spread: 0.5, gain: 0.6 });
+    { name: "dent", dur: 1.4, build: (c, o) => {
+      sfxCrack(c, o, 0, { gain: 0.5 });
+      sfxBoom(c, o, 0, { size: 0.45 });
+      sfxGroan(c, o, 0.03, { base: 150, dur: 0.6, gain: 0.22 });
+      sfxCrunch(c, o, 0.01, { dur: 0.25, density: 60, gain: 0.35 });
     } },
-    { name: "kerthunk", dur: 1.4, build: (c, o) => {
-      sfxBoomf(c, o, 0, { size: 0.4, gain: 0.8 });
-      sfxBoomf(c, o, 0.08, { size: 0.3, gain: 0.6 }); // "ker-THUNK"
-      sfxRattle(c, o, 0.1, { count: 8, spread: 0.45, gain: 0.4, freq: 1100 }); // tin rattle
-      sfxMetal(c, o, 0.08, { base: 420, dur: 0.5, gain: 0.35 });
+    { name: "smack", dur: 1.4, build: (c, o) => {
+      sfxCrack(c, o, 0, { gain: 0.7, bright: 1.2 });
+      sfxBoom(c, o, 0, { size: 0.5 });
+      sfxCrunch(c, o, 0.005, { dur: 0.2, density: 70, gain: 0.35 });
+      sfxShatter(c, o, 0.02, { dur: 0.4, gain: 0.25 }); // a headlight goes
     } },
   ],
   heavy: [
-    { name: "kaboom", dur: 2.2, build: (c, o) => {
-      sfxBoomf(c, o, 0, { size: 1 });
-      sfxNoise(c, o, 0, { dur: 0.9, freq: 3000, type: "highpass", gain: 0.25, attack: 0.004 }); // crash splash
-      sfxClatter(c, o, 0.02, { count: 9, spread: 0.7, gain: 0.4 });
-      sfxHubcap(c, o, 0.45, { base: 500, dur: 1.3, gain: 0.3 });
+    { name: "crash", dur: 2.4, build: (c, o) => {
+      sfxCrack(c, o, 0, { gain: 1 });
+      sfxBoom(c, o, 0, { size: 1 });
+      sfxCrunch(c, o, 0.005, { dur: 0.6, density: 90, gain: 0.5 });
+      sfxShatter(c, o, 0.03, { dur: 0.8, gain: 0.3 });
+      sfxDebris(c, o, 0.25, { count: 16, spread: 1.2, gain: 0.25 });
     } },
-    { name: "hubcap", dur: 2.2, build: (c, o) => {
-      sfxBoomf(c, o, 0, { size: 0.9, gain: 1.1 });
-      sfxMetal(c, o, 0, { base: 280, dur: 0.7, gain: 0.5, bend: 0.9 });
-      sfxHubcap(c, o, 0.2, { base: 560, dur: 1.7, gain: 0.35 });
+    { name: "wreck", dur: 2.4, build: (c, o) => {
+      // two-stage: the hit, then the body folding a beat later
+      sfxCrack(c, o, 0, { gain: 0.9 });
+      sfxBoom(c, o, 0, { size: 0.85 });
+      sfxCrunch(c, o, 0.005, { dur: 0.3, density: 80, gain: 0.45 });
+      sfxCrack(c, o, 0.14, { gain: 0.45, bright: 0.8 });
+      sfxBoom(c, o, 0.14, { size: 0.7, gain: 0.6 });
+      sfxGroan(c, o, 0.16, { base: 110, dur: 1.0, gain: 0.28 });
+      sfxDebris(c, o, 0.35, { count: 12, spread: 1.1, gain: 0.3 });
     } },
-    { name: "junkpile", dur: 2.2, build: (c, o) => {
-      sfxBoomf(c, o, 0, { size: 1 });
-      sfxClatter(c, o, 0.02, { count: 13, spread: 1.0, gain: 0.35, low: 300, high: 1300 });
-      sfxBoing(c, o, 0.15, { freq: 200, freqTo: 120, dur: 0.8, rate: 20, depth: 0.14, gain: 0.35 });
-      sfxSlide(c, o, 0.5, { from: 1400, to: 380, dur: 0.6, gain: 0.18 }); // everything falling off
+    { name: "smash", dur: 2.4, build: (c, o) => {
+      sfxCrack(c, o, 0, { gain: 1, bright: 1.2 });
+      sfxBoom(c, o, 0, { size: 0.95 });
+      sfxShatter(c, o, 0.01, { dur: 1.0, gain: 0.35 });
+      sfxCrunch(c, o, 0.005, { dur: 0.4, density: 80, gain: 0.4 });
+      sfxHubcap(c, o, 0.5, { base: 430, dur: 1.4, gain: 0.1 }); // and off it rolls
     } },
-    { name: "sproing-crash", dur: 2.4, build: (c, o) => {
-      sfxBoomf(c, o, 0, { size: 1 });
-      sfxMetal(c, o, 0, { base: 300, dur: 1.2, gain: 0.5, bend: 0.85 });
-      sfxBoing(c, o, 0.05, { freq: 190, freqTo: 105, dur: 1.4, rate: 20, depth: 0.16, gain: 0.7 });
-      sfxClatter(c, o, 0.25, { count: 4, spread: 0.5, gain: 0.3 });
-      sfxGlass(c, o, 0.1, { count: 5, spread: 0.5, gain: 0.12 });
+    { name: "pileup", dur: 2.4, build: (c, o) => {
+      // three staggered impacts, like a chain reaction
+      // each later hit weaker: overlapping booms sum, and the first hit must
+      // stay the loudest moment
+      [[0, 1], [0.11, 0.6], [0.26, 0.45]].forEach(([t, g]) => {
+        sfxCrack(c, o, t, { gain: g * 0.8 });
+        sfxBoom(c, o, t, { size: 0.8, gain: g });
+        sfxCrunch(c, o, t + 0.005, { dur: 0.25, density: 70, gain: g * 0.4 });
+      });
+      sfxGroan(c, o, 0.3, { base: 95, dur: 1.1, gain: 0.2 });
+      sfxDebris(c, o, 0.4, { count: 18, spread: 1.3, gain: 0.2 });
     } },
   ],
 };
@@ -371,36 +417,42 @@ function driveCurve(drive) {
   return curve;
 }
 
-// Impulse response for a small, dull "room": decaying noise, low-passed so
-// the tail is warm rather than hissy.
+// Impulse response for the reverb tail: decaying noise, low-passed so it's
+// warm rather than hissy.
 function roomIR(c, seconds) {
   const len = Math.ceil(seconds * c.sampleRate);
   const buf = c.createBuffer(1, len, c.sampleRate);
   const d = buf.getChannelData(0);
   let y = 0;
   for (let i = 0; i < len; i++) {
-    y += 0.2 * ((Math.random() * 2 - 1) - y);
-    d[i] = y * Math.pow(1 - i / len, 2);
+    y += 0.25 * ((Math.random() * 2 - 1) - y);
+    d[i] = y * Math.pow(1 - i / len, 2.2);
   }
   return buf;
 }
 
-// Signal chain: recipe -> 70 Hz highpass (sub rumble is inaudible on small
-// speakers and only eats headroom) -> saturation (harmonics; glues layers)
-// -> dry + a little room tail.
+// Signal chain, movie-style: recipe -> 70 Hz highpass (sub rumble is
+// inaudible on small speakers and only eats headroom) -> compressor (glues
+// the layers and makes the hit punch) -> saturation -> dry + reverb tail.
 function renderSfx(sampleRate, recipe, fx) {
   const oc = new OfflineAudioContext(1, Math.ceil(recipe.dur * sampleRate), sampleRate);
   const bus = oc.createGain();
   const hp = oc.createBiquadFilter();
   hp.type = "highpass";
   hp.frequency.value = 70;
+  const comp = oc.createDynamicsCompressor();
+  comp.threshold.value = -20;
+  comp.knee.value = 6;
+  comp.ratio.value = 6;
+  comp.attack.value = 0.004; // lets the crack through before clamping down
+  comp.release.value = 0.2;
   const shaper = oc.createWaveShaper();
   shaper.curve = driveCurve(fx.drive);
   shaper.oversample = "2x";
-  bus.connect(hp).connect(shaper);
+  bus.connect(hp).connect(comp).connect(shaper);
   shaper.connect(oc.destination); // dry
   const room = oc.createConvolver();
-  room.buffer = roomIR(oc, 0.6);
+  room.buffer = roomIR(oc, fx.ir);
   const wet = oc.createGain();
   wet.gain.value = fx.room;
   shaper.connect(room).connect(wet).connect(oc.destination);

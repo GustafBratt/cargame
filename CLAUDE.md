@@ -150,25 +150,39 @@ All audio is **synthesized with the Web Audio API**, with no audio files, matchi
 
 **Collisions:**
 - **Library:** 12 recipes in `COLLISION_RECIPES`, 4 per tier (light, medium, heavy). They're rendered once into AudioBuffers via `OfflineAudioContext` when audio unlocks, then peak-normalized. Loudness therefore comes only from the tier volume and impact speed, not from how a recipe happened to sum.
-- **They're CARTOON FOLEY: weighty but playful.** This is the third design; the comment at the top of the collision library records the history:
+- **They're HOLLYWOOD crash sound design.** That means neither realistic (real crashes don't sound like what people expect) nor cartoon. It's the fourth design; the comment at the top of the collision library records the history:
   1. **Short pitched clicks:** "like banging two pencils together".
-  2. **Realistic and heavy** (rumble, ringing sheet metal, room reverb): weighty but "the wrong vibe", the only realistic thing in a cartoon world with cartoony event sounds. Real recordings would clash the same way. Movie crash audio was suggested, but it's copyrighted, so it isn't an option.
-  3. **Now:** every hit has a chunky low `sfxBoomf` (a noisy whump plus a thump, scaled by `size`) so nothing reads as pencils. On top go classic cartoon elements:
-     - `sfxBoing` (a spring with vibrato and a slow ringing decay)
-     - `sfxClatter` (pots and pans)
-     - `sfxHubcap` (a lid wobbling to rest with speeding-up tremolo)
-     - `sfxSlide` (slide whistle)
-     - clangs via `sfxMetal`
+  2. **Realistic and heavy:** "the wrong vibe".
+  3. **Cartoon foley** (boings, pots and pans, slide whistle): "too cartoonish".
+  4. **Now:** the designed movie-crash recipe.
+
+  Movie crash audio itself was suggested at one point, but it's copyrighted, so it isn't an option. Everything is synthesized in that style instead.
+- **Ingredients:**
+  - `sfxCrack`: a sharp broadband transient at impact, the punch
+  - `sfxBoom`: a fast pitch-dropping thump plus a low-mid whump; it starts ~150–190 Hz so it's audible on laptops
+  - `sfxCrunch`: a dense, front-loaded spray of tiny metallic grains, i.e. crumpling bodywork
+  - `sfxGroan`: twisting sheet metal, a bending sawtooth cluster through a bandpass
+  - `sfxShatter`: breaking glass
+  - `sfxDebris`: bits raining down afterwards
+  - `sfxHubcap`: a hubcap rolling away, the movie trope, used once
 - **Tiers:**
-  - light: bonk, boing, donk, squeak
-  - medium: clang, sproing, clatter, kerthunk
-  - heavy: kaboom, hubcap, junkpile, sproing-crash
-- **Signal chain:** `renderSfx` puts every sound through a 70 Hz highpass (sub rumble is inaudible on laptop speakers and only eats headroom after peak normalization), then mild tanh saturation (`COLLISION_FX[tier].drive`), then a *small* synthetic room tail (`roomIR`, wet amount `COLLISION_FX[tier].room`). Cartoons are drier than pass 2.
-- **Measure, don't eyeball.** Split energy into sub <90 Hz, body 120–500 Hz, mid 500 Hz–2 kHz and click >2 kHz, time how long each sound stays within 20 dB of its peak, and check that it ends silent. Things these measurements caught:
-  - The boomf initially drowned the cartoon layer, making light hits audible for only ~0.1s.
-  - envGain's fast decay (−20 dB a quarter of the way in) killed spring "boings", hence `sfxBoing`'s own slower decay.
-  - Render windows shorter than a sound's tail chopped it off, causing a click.
-- **Current measured audible length:** light ~0.2–0.4s, medium ~0.4–0.7s, heavy ~1–1.4s. Every sound keeps real low weight (sub+body ≥ ~30%).
+  - light: thump, knock, scrape, bumper
+  - medium: crunch, bang, dent, smack
+  - heavy: crash, wreck, smash, pileup
+- **Signal chain:** `renderSfx` runs 70 Hz highpass → `DynamicsCompressor` (4ms attack lets the crack through, then it glues the layers) → tanh saturation (`COLLISION_FX[tier].drive`) → dry + reverb tail (`roomIR` of length `.ir`, wet amount `.room`).
+- **The impact must be the loudest moment.** The first Hollywood pass had heavy saturation (drive 2.8) plus a loud reverb, which flattened the crack. Heavy hits then peaked 0.1–0.7s after impact, on the glass or the hubcap. Peak normalization scaled everything to that late peak, and the hit lost its punch. The fixes were moderate drive (1.5–2.0), a modest room, and later layers (glass, hubcap, second impacts, groan, debris) mixed well under the first hit. `pileup`'s chain-reaction hits get progressively weaker because overlapping booms sum.
+- **Measure, don't eyeball.** For each sound, check:
+  - energy split: sub <90 Hz / body 120–500 Hz / mid 500 Hz–2 kHz / high >2 kHz
+  - audible length: time within 20 dB of the peak
+  - time to peak and crest factor
+  - the impact's level in its first 60ms relative to the loudest moment, as the worst case over several renders (the recipes are random)
+  - that it ends silent; a render window shorter than the reverb tail chops it and clicks, which is why `.ir` scales with the tier
+
+  Current numbers:
+  - every sound peaks within ~16ms of impact
+  - in 10 of 12 sounds the impact is always the peak; `wreck` and `pileup` are within ~0.6 dB of it
+  - audible length: light ~0.15–0.25s, medium ~0.3–0.7s, heavy ~1.4–1.6s
+  - light and medium are ~75–97% sub+body energy; the heavy ones with glass have ~15–30% high energy
 - **Playback:** `collisionSound(speed, x, car)` is called from every collision site: `resolveCarVsStaticCircle`, `resolveCarVsCar` (once per pair, not per car) and `boundaryHit` (walls and curb). It picks a tier from `HIT_TIERS` by closing speed, plays a random buffer from that tier with ±10% pitch and a volume ramp within the tier, and pans by x.
 - **When a contact makes a sound:**
   - *Any car:* an impact at `HIT_SOUND_MIN` (45 px/s) or harder always sounds.
