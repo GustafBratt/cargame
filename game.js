@@ -618,18 +618,27 @@ function playParkedSound(x) {
   });
 }
 
-// Garage repair: a quick ratchet whir, a wrench clank, then a bright
-// two-note "ta-da" as the dents vanish.
-function playRepairSound(x) {
-  liveSfx(x, 0.8, (c, o, t) => {
+// Garage repair, in two parts, both played by the mechanic (see
+// updateMechanic): the wrench work -- a quick ratchet whir and a clank --
+// when they start on the car, then a bright two-note "ta-da" as the dents
+// vanish. The wrench part was turned up on request: measured peak ~0.75
+// (was ~0.49 for the whole old repair sound; volume 1.0 here hit the 1.0
+// clipping ceiling), about level with the parking jingle.
+function playWrenchSound(x) {
+  liveSfx(x, 0.75, (c, o, t) => {
     for (let i = 0; i < 9; i++) {
       // ratchet: evenly spaced clicks, rising in pitch as it tightens
-      sfxNoise(c, o, t + i * 0.035, { dur: 0.02, freq: 2200 + i * 180, q: 6, gain: 0.7 });
+      sfxNoise(c, o, t + i * 0.035, { dur: 0.022, freq: 2200 + i * 180, q: 6, gain: 1.0 });
     }
-    sfxMetal(c, o, t + 0.34, { base: 620, dur: 0.25, gain: 0.5, ratios: [1, 1.52, 2.31] });
-    sfxTone(c, o, t + 0.5, { freq: 784, dur: 0.12, type: "triangle", gain: 0.6 });
-    sfxTone(c, o, t + 0.62, { freq: 1175, dur: 0.4, type: "triangle", gain: 0.6 });
-    sfxTone(c, o, t + 0.62, { freq: 2350, dur: 0.3, gain: 0.15 }); // sparkle
+    sfxMetal(c, o, t + 0.34, { base: 620, dur: 0.3, gain: 0.8, ratios: [1, 1.52, 2.31] });
+  });
+}
+
+function playRepairSound(x) {
+  liveSfx(x, 0.8, (c, o, t) => {
+    sfxTone(c, o, t, { freq: 784, dur: 0.12, type: "triangle", gain: 0.6 });
+    sfxTone(c, o, t + 0.12, { freq: 1175, dur: 0.4, type: "triangle", gain: 0.6 });
+    sfxTone(c, o, t + 0.12, { freq: 2350, dur: 0.3, gain: 0.15 }); // sparkle
   });
 }
 
@@ -1216,6 +1225,7 @@ function buildStreet() {
     buildingY0: sidewalkBottomY + 6, bottomY: H - 8,
     doorX0: gx0 + 18, doorX1: gx1 - 18,
   };
+  garage.doorH = Math.min(18, (garage.bottomY - garage.buildingY0) * 0.3); // roll-up door depth
 
   return { curbY, carCenterY, centerlineY, npcLaneY, sidewalkBottomY, parkedCars, parkingSpots, garage };
 }
@@ -1254,6 +1264,8 @@ function setupWorld() {
   spawnCoin(); // after clearing particles, so its spawn animation survives
   resetTraffic();
   resetPedestrians();
+  mechanic = null;
+  garageDoorOpen = 0;
   gameTime = 0;
   staticDirty = true;
 }
@@ -1337,17 +1349,13 @@ function isParked(car) {
   return street.parkingSpots.some((spot) => car.pos.x > spot.x0 + PARK_X_MARGIN && car.pos.x < spot.x1 - PARK_X_MARGIN);
 }
 
-// A single shared coin is always on the map. Only a car currently in
-// "seekCoin" is eligible to collect it -- a car that just scored is parked
-// in "mustPark" and can't take the next one, no matter what the other car
-// does. Whichever eligible car reaches it first scores, goes to "mustPark",
-// and a fresh coin immediately takes its place (so the other car, if still
-// eligible, can keep going without waiting on anyone's parking job).
 // ---------------------------------------------------------------------------
 // Garage
 // ---------------------------------------------------------------------------
-// A player that stops on the garage pad with any damage pays 1 coin and is
-// fully repaired on the spot. Traffic never uses it.
+// A player that stops on the garage pad with any damage (and a coin) gets
+// the mechanic: the door rolls up, they jog out, work on the car, and it's
+// repaired -- and the coin charged -- when they finish. Traffic never uses
+// it. See the mechanic below.
 
 const GARAGE_SPEED_LIMIT = 15; // px/s -- come to a stop; driving through doesn't charge you
 const REPAIR_COST = 1;
@@ -1364,18 +1372,147 @@ function garageDenied(car) {
     Math.hypot(car.vel.x, car.vel.y) <= GARAGE_SPEED_LIMIT;
 }
 
+// Sends the mechanic out to the first eligible car. One car at a time: a
+// second car waiting on the pad is served once the mechanic is back inside.
 function updateGarage() {
+  if (mechanic) return;
   for (const car of [car1, car2]) {
     if (car.damage <= 0 || !onGaragePad(car)) continue;
     if (Math.hypot(car.vel.x, car.vel.y) > GARAGE_SPEED_LIMIT) continue;
     if (car.score < REPAIR_COST) continue;
-    car.score -= REPAIR_COST;
-    repairCar(car);
-    playRepairSound(car.pos.x);
-    spawnFirework(car.pos.x, car.pos.y, "#7dffa0");
+    mechanic = makeMechanic(car);
+    break;
   }
 }
 
+// ---- The mechanic ---------------------------------------------------------
+// States: "opening" (door rolls up) -> "walkOut" (jog to the car) ->
+// "working" (wrench; the fix lands MECH_FIX_AT in) -> "walkBack" ->
+// "closing" (door rolls down) -> gone (mechanic = null). The repair and the
+// coin charge happen only at the fix: if the car leaves the pad before
+// that, the mechanic gives up and walks back in, and nothing is charged.
+// Drawn with the pedestrian renderer (overalls, red cap, a wrench in hand).
+
+const MECH_SPEED = 90; // px/s, a brisk jog
+const MECH_DOOR_TIME = 0.35; // s for the door to roll up / down
+const MECH_WORK_TIME = 0.9; // s at the car
+const MECH_FIX_AT = 0.5; // s into the work when the car is fixed (after the ratchet + clank)
+
+let mechanic = null; // the mechanic while out (or opening/closing the door); null when idle inside
+let garageDoorOpen = 0; // 0 closed .. 1 fully rolled up, drawn over the static door
+
+function mechanicHome() {
+  const g = street.garage;
+  return { x: (g.doorX0 + g.doorX1) / 2, y: g.buildingY0 + g.doorH / 2 };
+}
+
+// Where the mechanic stands to work: on the driveway just below the curb,
+// beside the car (cars can't cross the curb, so this never overlaps one).
+function mechanicWorkSpot(car) {
+  const g = street.garage;
+  return { x: clamp(car.pos.x, g.doorX0, g.doorX1), y: g.curbY + 10 };
+}
+
+function makeMechanic(car) {
+  const home = mechanicHome();
+  const up = -Math.PI / 2;
+  return {
+    state: "opening", t: 0, car, fixed: false, nextSpark: 0,
+    x: home.x, y: home.y,
+    // pedestrian-renderer fields: overalls, red cap, a random face
+    stride: { speed: MECH_SPEED, cadence: 3, swing: 1.2, bounce: 0.2 }, speedMul: 1, size: 1.05,
+    skin: pickOf(PED_SKIN), shirt: "#2f63b8", hairStyle: "short", hairColor: pickOf(PED_HAIR),
+    hat: "cap", hatColor: "#e8514a", umbrella: null, accessory: null, dog: null,
+    phase: 0, speed: 0, facing: up, bodyAngle: up, headAngle: up, seed: Math.random() * 1000,
+  };
+}
+
+// Jog toward a target; returns true on arrival.
+function mechanicWalkTo(m, target, dt) {
+  const dx = target.x - m.x, dy = target.y - m.y, d = Math.hypot(dx, dy);
+  const stepLen = MECH_SPEED * dt;
+  if (d <= stepLen) {
+    m.x = target.x;
+    m.y = target.y;
+    m.speed = 0;
+    return true;
+  }
+  const a = Math.atan2(dy, dx);
+  m.x += (dx / d) * stepLen;
+  m.y += (dy / d) * stepLen;
+  m.speed = MECH_SPEED;
+  m.bodyAngle = m.headAngle = m.facing = a;
+  m.phase += (stepLen / (MECH_SPEED / m.stride.cadence)) * Math.PI * 2;
+  return false;
+}
+
+function updateMechanic(dt) {
+  // the door opens while the mechanic is out and rolls down once they're back
+  const wantOpen = mechanic !== null && mechanic.state !== "closing";
+  garageDoorOpen = clamp(garageDoorOpen + ((wantOpen ? 1 : -1) * dt) / MECH_DOOR_TIME, 0, 1);
+  if (!mechanic) return;
+
+  const m = mechanic, car = m.car;
+  m.t += dt;
+  const carStillThere = onGaragePad(car) && Math.hypot(car.vel.x, car.vel.y) <= GARAGE_SPEED_LIMIT * 2;
+
+  if (m.state === "opening") {
+    if (garageDoorOpen >= 1) m.state = "walkOut";
+  } else if (m.state === "walkOut") {
+    if (!carStillThere) m.state = "walkBack"; // they drove off: never mind
+    else if (mechanicWalkTo(m, mechanicWorkSpot(car), dt)) {
+      m.state = "working";
+      m.t = 0;
+      playWrenchSound(m.x);
+    }
+  } else if (m.state === "working") {
+    const toCar = Math.atan2(car.pos.y - m.y, car.pos.x - m.x);
+    m.bodyAngle = m.headAngle = m.facing = toCar;
+    if (!m.fixed && !carStillThere) {
+      m.state = "walkBack";
+    } else {
+      if (!m.fixed && m.t >= m.nextSpark) {
+        spawnWrenchSparks(m.x + Math.cos(toCar) * 11, m.y + Math.sin(toCar) * 11);
+        m.nextSpark = m.t + 0.12 + Math.random() * 0.1;
+      }
+      if (!m.fixed && m.t >= MECH_FIX_AT) {
+        m.fixed = true;
+        if (car.damage > 0 && car.score >= REPAIR_COST) {
+          car.score -= REPAIR_COST;
+          repairCar(car);
+          playRepairSound(car.pos.x);
+          spawnFirework(car.pos.x, car.pos.y, "#7dffa0");
+        }
+      }
+      if (m.t >= MECH_WORK_TIME) m.state = "walkBack";
+    }
+  } else if (m.state === "walkBack") {
+    if (mechanicWalkTo(m, mechanicHome(), dt)) m.state = "closing";
+  } else if (m.state === "closing") {
+    if (garageDoorOpen <= 0) mechanic = null;
+  }
+}
+
+// A few little sparks where the wrench meets the car (cosmetic particles).
+function spawnWrenchSparks(x, y) {
+  for (let i = 0; i < 4; i++) {
+    const a = Math.random() * Math.PI * 2, sp = 50 + Math.random() * 90;
+    particles.push({
+      type: "spark", x, y,
+      vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+      size: 1 + Math.random() * 0.9,
+      color: pickOf(["#ffd23f", "#ff9d5c", "#ffffff"]),
+      life: 0, maxLife: 0.2 + Math.random() * 0.2,
+    });
+  }
+}
+
+// A single shared coin is always on the map. Only a car currently in
+// "seekCoin" is eligible to collect it -- a car that just scored is parked
+// in "mustPark" and can't take the next one, no matter what the other car
+// does. Whichever eligible car reaches it first scores, goes to "mustPark",
+// and a fresh coin immediately takes its place (so the other car, if still
+// eligible, can keep going without waiting on anyone's parking job).
 function updateCoinRace() {
   for (const car of [car1, car2]) {
     if (car.gameState !== "seekCoin" || !coinCollectable()) continue;
@@ -1972,7 +2109,7 @@ function drawPedestrian(p) {
   // hands: holding a leash / umbrella, or swinging (stroller hands below)
   if (p.accessory !== "stroller") {
     inkCircle(-step * 1.1, -9.2, 1.6, p.skin, 1);
-    inkCircle(p.umbrella ? 3 : step * 1.1, 9.2, 1.6, p.skin, 1);
+    inkCircle(p.umbrella ? 3 : p.rightHandX ?? step * 1.1, 9.2, 1.6, p.skin, 1); // rightHandX: the mechanic reaching out with a wrench
   }
   ctx.restore();
 
@@ -2215,6 +2352,7 @@ window.addEventListener("resize", () => {
     const oldLaneY = street.npcLaneY, oldCurbY = street.curbY;
     street = buildStreet();
     staticDirty = true;
+    mechanic = null; // the garage moved: call off any repair in progress (nothing was charged yet); the door rolls shut
 
     // Carry traffic along with its lane, and pedestrians along with the
     // sidewalk; anything now past the new right edge walks/drives off.
@@ -2282,6 +2420,7 @@ function update(dt) {
   updateCoin(dt);
   updateCoinRace();
   updateGarage();
+  updateMechanic(dt);
   for (const car of movers) emitSmoke(car, dt);
   updateParticles(dt);
   updatePedestrians(dt);
@@ -2546,7 +2685,7 @@ function drawGarageBuilding(c) {
   c.fill();
   inkShape(c, wobble(roundRectPoints(g.x0, by0, w, h, 5, 8), 77, 1), PAL.garageWall, 3);
   // roll-up door with slats, on the edge facing the driveway
-  const doorH = Math.min(18, h * 0.3), dw = g.doorX1 - g.doorX0;
+  const doorH = g.doorH, dw = g.doorX1 - g.doorX0;
   // flat roof inset (below the door) with a vent, when there's room for it
   const roofY = by0 + doorH + 6, roofH = h - (doorH + 6) - 8;
   if (roofH > 14) {
@@ -2804,6 +2943,57 @@ function drawGaragePad() {
   ctx.stroke();
 }
 
+// The roll-up door, animated over the static one while the mechanic is out:
+// a dark interior shows as the slatted door rolls away into the building.
+function drawGarageDoor() {
+  if (garageDoorOpen <= 0) return;
+  const g = street.garage, y0 = g.buildingY0 - 2, dw = g.doorX1 - g.doorX0;
+  ctx.beginPath();
+  ctx.roundRect(g.doorX0, y0, dw, g.doorH, 2);
+  ctx.fillStyle = "#2c2833";
+  ctx.fill();
+  const rolled = g.doorH * (1 - garageDoorOpen); // what's left of the door, at the inner edge
+  if (rolled > 1) {
+    ctx.fillStyle = PAL.garageDoor;
+    ctx.fillRect(g.doorX0 + 1, y0 + g.doorH - rolled, dw - 2, rolled - 1);
+    ctx.strokeStyle = "rgba(35,31,46,0.45)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let y = y0 + g.doorH - rolled + 3; y < y0 + g.doorH - 2; y += 4.5) {
+      ctx.moveTo(g.doorX0 + 3, y);
+      ctx.lineTo(g.doorX1 - 3, y);
+    }
+    ctx.stroke();
+  }
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 2.2;
+  ctx.beginPath();
+  ctx.roundRect(g.doorX0, y0, dw, g.doorH, 2);
+  ctx.stroke();
+}
+
+// The mechanic (only while outside), with a wrench in their right hand that
+// swings while they work.
+function drawMechanic() {
+  const m = mechanic;
+  if (!m || (m.state !== "walkOut" && m.state !== "working" && m.state !== "walkBack")) return;
+  const working = m.state === "working" && !m.fixed;
+  const hx = working ? 7 : 0, hy = 9.2; // right hand, body-local (reaching toward the car while working)
+  m.rightHandX = hx;
+  drawPedestrian(m);
+  const s = m.size * PED_SCALE, a = m.bodyAngle;
+  const wx = m.x + (Math.cos(a) * hx - Math.sin(a) * hy) * s;
+  const wy = m.y + (Math.sin(a) * hx + Math.cos(a) * hy) * s;
+  const swing = working ? Math.sin(m.t * 26) * 0.7 : 0;
+  ctx.save();
+  ctx.translate(wx, wy);
+  ctx.rotate(a + Math.PI / 4 + swing); // drawWrench tilts -45deg itself; this points it along the arm
+  ctx.scale(0.5, 0.5);
+  drawWrench(0, 0, "#dfe3ea");
+  ctx.restore();
+  if (working) inkCircle(wx, wy, 1.6 * s, m.skin, 1); // the hand, over the wrench handle
+}
+
 // A simple open-end wrench, ~24px long, centered on (x, y), tilted 45deg.
 // Drawn twice -- a fat ink pass, then the color on top -- for an outline.
 function drawWrench(x, y, color) {
@@ -2948,7 +3138,9 @@ function render() {
   ctx.drawImage(staticLayer, 0, 0); // ground, street, garage building, crates, parked cars
   drawParkingTargets();
   drawGaragePad();
+  drawGarageDoor();
   drawPedestrians();
+  drawMechanic();
   for (const n of npcs) drawCar(ctx, n);
   if (coin) drawCoin(coin);
   drawCar(ctx, car1);
