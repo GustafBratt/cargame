@@ -19,7 +19,12 @@ resize();
 // Input
 // ---------------------------------------------------------------------------
 
-const CONTROL_KEYS = new Set(["w", "a", "s", "d", "i", "j", "k", "l", "r"]);
+// Keys are stored lowercased (e.key.toLowerCase()), so arrows are "arrowup" etc.
+// preventDefault on these also stops the arrow keys from scrolling the page.
+const CONTROL_KEYS = new Set([
+  "w", "a", "s", "d", "i", "j", "k", "l", "r",
+  "arrowup", "arrowdown", "arrowleft", "arrowright",
+]);
 const keys = new Set();
 
 window.addEventListener("keydown", (e) => {
@@ -98,7 +103,7 @@ function createCar(x, y, angle, color, input) {
     damage: 0, // 0..1, see applyDamage
     dents: [], // car-local {x, y, r}, drawn by drawCar
     color,
-    input, // { up, down, left, right } key names
+    input, // { up, down, left, right }, each an array of key names (any one of them works)
     startPos: { x, y },
     startAngle: angle,
   };
@@ -110,8 +115,9 @@ function clamp(v, lo, hi) {
 
 function readInput(car) {
   if (car.drive) return car.drive; // AI-controlled traffic, see npcDrive
-  const throttle = (keys.has(car.input.up) ? 1 : 0) - (keys.has(car.input.down) ? 1 : 0);
-  const steer = (keys.has(car.input.right) ? 1 : 0) - (keys.has(car.input.left) ? 1 : 0);
+  const held = (names) => (names.some((k) => keys.has(k)) ? 1 : 0);
+  const throttle = held(car.input.up) - held(car.input.down);
+  const steer = held(car.input.right) - held(car.input.left);
   return { throttle, steer };
 }
 
@@ -540,10 +546,10 @@ function buildCrates() {
 
 function setupWorld() {
   car1 = createCar(W * 0.35, H * 0.5, -Math.PI / 2, "#4fc3ff", {
-    up: "w", down: "s", left: "a", right: "d",
+    up: ["w"], down: ["s"], left: ["a"], right: ["d"],
   });
   car2 = createCar(W * 0.65, H * 0.5, Math.PI / 2, "#ffa64f", {
-    up: "i", down: "k", left: "j", right: "l",
+    up: ["i", "arrowup"], down: ["k", "arrowdown"], left: ["j", "arrowleft"], right: ["l", "arrowright"],
   });
 
   crates = buildCrates();

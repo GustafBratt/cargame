@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single-page, no-build, top-down 2-player car sandbox. Vanilla HTML/CSS/JS, rendered on a `<canvas>` with `requestAnimationFrame`. Cars are rectangles with visible wheels (front wheels turn with steering); Player 1 drives with WASD, Player 2 with IJKL. There's a grid of static crates to bump into, a curbside street with parked cars and two marked practice spots for parallel parking, and the two players collide with each other too. AI traffic drives across the street lane above the centerline. Hard hits dent cars, make them smoke, and slow them down; a garage in the bottom-right corner repairs a car for 1 coin.
+A single-page, no-build, top-down 2-player car sandbox. Vanilla HTML/CSS/JS, rendered on a `<canvas>` with `requestAnimationFrame`. Cars are rectangles with visible wheels (front wheels turn with steering); Player 1 drives with WASD, Player 2 with IJKL or the arrow keys. There's a grid of static crates to bump into, a curbside street with parked cars and two marked practice spots for parallel parking, and the two players collide with each other too. AI traffic drives across the street lane above the centerline. Hard hits dent cars, make them smoke, and slow them down; a garage in the bottom-right corner repairs a car for 1 coin.
 
 There is no framework, no package.json, and no build/bundle step — the browser loads `index.html`, `style.css`, and `game.js` directly.
 
@@ -97,4 +97,4 @@ A flat `particles` array (module-level) holds purely cosmetic entries, each with
 
 ### Input
 
-A single global `Set` (`keys`) tracks currently-held keys via `keydown`/`keyup` listeners; `readInput(car)` reads throttle/steer from each car's own key bindings (`car.input`). `R` resets both cars to their start positions/orientations (and clears traffic). Key handling calls `preventDefault()` only for the specific keys the game uses, so it doesn't swallow other browser shortcuts.
+A single global `Set` (`keys`) tracks currently-held keys via `keydown`/`keyup` listeners; `readInput(car)` reads throttle/steer from each car's own key bindings (`car.input`, where each direction is an array of key names so a player can have alternate keys, like P2's IJKL + arrows). Keys are stored lowercased (`"arrowup"`, not `"ArrowUp"`); any new binding also needs adding to `CONTROL_KEYS` so it gets `preventDefault()` (for arrows, that's what stops the page from scrolling). `R` resets both cars to their start positions/orientations (and clears traffic). Key handling calls `preventDefault()` only for the specific keys the game uses, so it doesn't swallow other browser shortcuts.
