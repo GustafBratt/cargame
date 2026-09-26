@@ -46,6 +46,16 @@ const CAR = {
   wheelBase: 30, // distance between front and rear axle
   track: 18, // distance between the front-left/front-right tire centers (for Ackermann geometry)
   maxSteer: 0.47, // radians, the effective single-front-wheel ("bicycle model") steering lock -- kinematic min radius = wheelBase/tan(maxSteer)
+  // Variable-ratio steering: full lock is maxSteer at steerMidSpeed, a bit
+  // more at crawl (tighter circle for parking) and a bit less at speed (wider,
+  // calmer). This shapes the *geometric* turning circle, which at crawl speed
+  // only the steer angle can change; tire grip still decides when a turn
+  // starts to slide. Linearly interpolated between the three speeds.
+  steerLockCrawl: 1.15, // x maxSteer at or below steerCrawlSpeed
+  steerLockFast: 0.8, // x maxSteer at or above steerFastSpeed
+  steerCrawlSpeed: 40, // px/s
+  steerMidSpeed: 120,
+  steerFastSpeed: 260,
   enginePower: 340, // forward acceleration, px/s^2 -- kept gentle for parking-scale control
   brakePower: 1150, // deceleration when braking while moving forward
   reversePower: 200,
@@ -145,6 +155,20 @@ function ackermannWheelAngles(centerSteer, wheelBase, track) {
   return { left: sign * leftMag, right: sign * rightMag };
 }
 
+// Variable-ratio steering multiplier on maxSteer for a given forward speed
+// (see the steerLock* constants in CAR).
+function steerLockScale(speed) {
+  const p = CAR;
+  if (speed <= p.steerCrawlSpeed) return p.steerLockCrawl;
+  if (speed <= p.steerMidSpeed) {
+    const t = (speed - p.steerCrawlSpeed) / (p.steerMidSpeed - p.steerCrawlSpeed);
+    return p.steerLockCrawl + (1 - p.steerLockCrawl) * t;
+  }
+  if (speed >= p.steerFastSpeed) return p.steerLockFast;
+  const t = (speed - p.steerMidSpeed) / (p.steerFastSpeed - p.steerMidSpeed);
+  return 1 + (p.steerLockFast - 1) * t;
+}
+
 // Two-axle dynamic bicycle model: front and rear tires each get a slip
 // angle (the angle between where the tire is pointed and where it's
 // actually moving) which produces a lateral force via a linear
@@ -179,7 +203,7 @@ function stepCar(car, dt) {
   // right away, it leaves a decaying "tail" of steering angle that keeps
   // adding rotation after release and ends up producing *more* total turn
   // from a quick tap than an instant on/instant off response would.
-  const steerTarget = steer * p.maxSteer;
+  const steerTarget = steer * p.maxSteer * steerLockScale(Math.abs(forwardSpeed));
   const steerRate = Math.abs(steerTarget) > Math.abs(car.steerCurrent) ? 6 : 30;
   car.steerCurrent += (steerTarget - car.steerCurrent) * Math.min(1, steerRate * dt);
   const steerAngle = car.steerCurrent;
