@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single-page, no-build, top-down 2-player car sandbox. Vanilla HTML/CSS/JS, rendered on a `<canvas>` with `requestAnimationFrame`. Cars are rectangles with visible wheels (front wheels turn with steering); Player 1 drives with WASD, Player 2 with IJKL or the arrow keys. There's a grid of static crates to bump into, a curbside street with parked cars and two marked practice spots for parallel parking, and the two players collide with each other too. AI traffic drives across the street lane above the centerline. Hard hits dent cars, make them smoke, and slow them down; a garage in the bottom-right corner repairs a car for 1 coin.
+A single-page, no-build, top-down 2-player car sandbox. Vanilla HTML/CSS/JS, rendered on a `<canvas>` with `requestAnimationFrame`. Cars are rectangles with visible wheels (front wheels turn with steering); Player 1 drives with WASD, Player 2 with IJKL or the arrow keys. There's a grid of static crates to bump into, a curbside street with parked cars and two marked practice spots for parallel parking, and the two players collide with each other too. AI traffic drives across the street lane above the centerline. Hard hits dent cars, make them smoke, and slow them down; a garage in the bottom-right corner repairs a car for 1 coin. Purely cosmetic pedestrians stroll the sidewalk and stop to stare at crashes and honks.
 
 There is no framework, no package.json, and no build/bundle step — the browser loads `index.html`, `style.css`, and `game.js` directly.
 
@@ -79,7 +79,7 @@ Damage has two effects:
 
 This applies to every moving car, NPCs included.
 
-The garage lives in `street.garage`, so it's rebuilt on resize along with the rest of the street. The building sits on the sidewalk in the bottom-right corner, with a service pad on the road in front of it. A *player* that stops on the pad (`GARAGE_SPEED_LIMIT`) with any damage and at least `REPAIR_COST` coins pays and is fully repaired (`repairCar`). With no coins, the pad's border flashes red instead (`garageDenied`). The garage carries no text: the pad shows a wrench (`drawWrench`) next to a coin. Coins are the same `car.score` the coin race awards, so repairs compete with score.
+The garage lives in `street.garage`, so it's rebuilt on resize along with the rest of the street. The building sits on the lawn in the bottom-right corner, *below* the sidewalk band (`street.sidewalkBottomY`), so the sidewalk runs unbroken in front of it and stays clear for pedestrians. A driveway (drawn in `drawGarageBuilding`) crosses the sidewalk from the roll-up door (`garage.doorX0`/`doorX1`) to a lowered curb, and the service pad is on the road in front of that. The driveway is visual only: cars still can't cross the curb, and repairs happen on the pad. A *player* that stops on the pad (`GARAGE_SPEED_LIMIT`) with any damage and at least `REPAIR_COST` coins pays and is fully repaired (`repairCar`). With no coins, the pad's border flashes red instead (`garageDenied`). The garage carries no text: the pad shows a wrench (`drawWrench`) next to a coin. Coins are the same `car.score` the coin race awards, so repairs compete with score.
 
 ### NPC traffic (`updateTraffic` / `npcDrive`)
 
@@ -101,6 +101,24 @@ Without these, a car knocked off the road can wait forever behind a player who i
 There's only one traffic lane, so `spawnNpc` gives a new car the same direction as any traffic already on screen, and picks a random direction only when the road is empty. This prevents head-on meetings.
 
 `resetTraffic` runs from `setupWorld`. It sets the spawn timer to 0, so the first car rolls in immediately on start; only later spawns follow the random schedule. On resize, NPCs are shifted by the change in `npcLaneY` so they stay in the lane.
+
+### Pedestrians (purely cosmetic easter egg)
+
+The "Pedestrians" section sits just before the top-level `setupWorld()` call, because `setupWorld` → `resetPedestrians` needs its `const`s initialized. Randomly generated people walk the sidewalk band (`street.curbY`..`street.sidewalkBottomY`) in both directions: `PED_START_COUNT` (2) at startup, then Poisson arrivals (`PED_SPAWN_MEAN`, 7s) capped at `PED_MAX` (5). They're kept sparse on purpose: the rate was halved after playtesting, because this is an easter egg, not a crowd. They leave at the far edge. They have **no gameplay effect whatsoever**: nothing collides with them, and they never read or write car or game state. Keep it that way.
+
+**Characters:** `makePedestrian` rolls a skin tone, shirt color and size. It then picks either a hairstyle (bald, short, long, ponytail, bun, mohawk, afro, spiky or beehive) or a hat (cap, sun hat, beanie or top hat), maybe an umbrella, and maybe a dog on a leash or a baby stroller. Finally it picks a stride (`PED_STRIDES`: stroll, brisk, shuffle, bouncy or jog), which sets speed, cadence, swing and bounce. Strollers never get jog or bouncy strides.
+
+**Animation:** the walk cycle advances with *distance covered*, not time, so a stopping walker's legs settle instead of moonwalking. The dog follows a springy target ahead of its walker (`updateDog`).
+
+**Reactions:** `pedestriansNotice(x, y, kind, speed)` is called from:
+- the three collision sites, for impacts ≥ `HIT_SOUND_MIN`
+- the NPC honk
+
+Anyone within earshot (`PED_NOTICE_CRASH` 650px, `PED_NOTICE_HONK` 380px) reacts after a small random delay plus a bit of distance delay, so the crowd doesn't turn in unison. They stop, turn their head fully and their body partway toward the noise, and stare. There is deliberately no "!" over their heads; one was tried and removed on request. Big crashes hold them longer. Their dogs stare too.
+
+**Drawing:** they're drawn top-down in the same ink style (`drawPedestrian` and friends), right after the garage pad and before NPCs and players. `PED_SCALE` (1.2) draws them a bit bigger than true scale so details read. The proportions were tuned by inspecting a 4× magnified render: shoulders about twice the head width so the shirt shows, and feet stepping out front and back so the walk reads.
+
+**Resize:** the resize handler shifts pedestrians (and their dogs) by the change in `curbY`, like NPCs follow their lane.
 
 ### Particles (`spawnFirework` / `updateParticles` / `drawParticles`)
 
