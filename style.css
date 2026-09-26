@@ -1,10 +1,17 @@
+/* Cartoon look to match the canvas: cream "paper", dark ink outlines, and
+   hard offset shadows instead of soft blurs. --ink matches INK in game.js. */
+:root {
+  --ink: #231f2e;
+  --paper: #fffbea;
+}
+
 html, body {
   margin: 0;
   height: 100%;
   overflow: hidden;
-  background: #23262e;
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
-  color: #eee;
+  background: #e8dfc6;
+  font-family: "Trebuchet MS", "Segoe UI", system-ui, sans-serif;
+  color: var(--ink);
 }
 
 canvas {
@@ -30,35 +37,38 @@ canvas {
   display: flex;
   align-items: center;
   gap: 10px;
-  background: rgba(0, 0, 0, 0.35);
-  border-radius: 8px;
-  padding: 5px 10px;
+  background: var(--paper);
+  border: 3px solid var(--ink);
+  border-radius: 12px;
+  box-shadow: 3px 3px 0 var(--ink);
+  padding: 4px 11px;
 }
 
 .hud-title {
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
+  font-size: 13px;
+  font-weight: 900;
+  letter-spacing: 0.03em;
 }
 
 .hud-coins {
   display: flex;
   align-items: center;
   gap: 5px;
-  font-size: 16px;
-  font-weight: 700;
+  font-size: 18px;
+  font-weight: 900;
 }
 
-.hud-p1 { color: #6fd0ff; }
-.hud-p2 { color: #ffb15c; }
+/* Darker than the car colors themselves, to read on the cream badge. */
+.hud-p1 { color: #1b86cc; }
+.hud-p2 { color: #d9690f; }
 
-/* Matches the in-game coin (drawCoin): gold face, dark-gold rim. */
+/* Matches the in-game coin (drawCoin): gold face, ink rim. */
 .coin-icon {
-  width: 12px;
-  height: 12px;
+  width: 14px;
+  height: 14px;
   border-radius: 50%;
-  background: #ffd54f;
-  border: 2px solid #b8860b;
+  background: #ffd23f;
+  border: 2px solid var(--ink);
   box-sizing: border-box;
 }
 
@@ -67,8 +77,16 @@ canvas {
   bottom: 10px;
   left: 50%;
   transform: translateX(-50%);
-  font-size: 12px;
-  opacity: 0.55;
+  font-size: 13px;
+  font-weight: 700;
+  width: max-content;
+  max-width: 90vw;
+  text-align: center;
+  background: var(--paper);
+  border: 2px solid var(--ink);
+  border-radius: 10px;
+  box-shadow: 2px 2px 0 var(--ink);
+  padding: 3px 12px;
   pointer-events: none;
   transition: opacity 1.5s ease;
 }

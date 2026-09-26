@@ -109,6 +109,7 @@ function createCar(x, y, angle, color, input) {
     angle,
     angularVel: 0,
     steerCurrent: 0, // the actual, rate-limited steering-rack angle (see stepCar)
+    seed: Math.random() * 1000, // this car's hand-drawn outline wobble, see carArt
     damage: 0, // 0..1, see applyDamage
     dents: [], // car-local {x, y, r}, drawn by drawCar
     color,
@@ -490,9 +491,15 @@ let car1, car2, crates, street;
 let npcs = []; // AI traffic cars, see updateTraffic
 let npcSpawnTimer = 0;
 let gameTime = 0; // seconds of simulation since setupWorld, see updateHint
+// The pre-drawn static scene (see buildStaticLayer) needs redrawing -- set
+// whenever street/crates are (re)built; render() does the actual rebuild,
+// since the render code's constants aren't initialized yet when setupWorld
+// first runs.
+let staticDirty = true;
 let particles = []; // cosmetic-only firework sparks/rings, see spawnFirework
 
-const PARKED_COLORS = ["#6b7280", "#7c6b52", "#59695a", "#69596c", "#54606b", "#7a5c53"];
+// Bright cartoon paint jobs, but none close to the players' blue/orange.
+const PARKED_COLORS = ["#b9a4e0", "#8fd6b4", "#f28b82", "#f6c85f", "#9ec5d8", "#d99ad0"];
 
 // Builds a row of parked cars along a curb, with a couple of open gaps sized
 // for parallel parking practice (a roomy one and a tight one).
@@ -571,6 +578,7 @@ function setupWorld() {
   spawnCoin(); // after clearing particles, so its spawn animation survives
   resetTraffic();
   gameTime = 0;
+  staticDirty = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -830,7 +838,7 @@ const NPC_LOST_SPEED = 55; // px/s, cautious crawl while well off the lane or tu
 // a little off-line keeps going almost normally while it drifts back.
 const NPC_LANE_ERR_OK = 15; // px
 const NPC_LOST_LANE_ERR = 70; // px
-const NPC_COLORS = ["#e6e6e6", "#d9534f", "#5cb85c", "#9b7fd4", "#3d4a5c", "#c27ba0"];
+const NPC_COLORS = ["#ffffff", "#e8514a", "#6cc24a", "#8c6fd6", "#f2e14b", "#ea7fbf"];
 
 function nextNpcSpawnDelay() {
   return -Math.log(1 - Math.random()) * NPC_SPAWN_MEAN;
@@ -983,6 +991,7 @@ window.addEventListener("resize", () => {
     crates = buildCrates();
     const oldLaneY = street.npcLaneY;
     street = buildStreet();
+    staticDirty = true;
 
     // Carry traffic along with its lane; anything now past the new right
     // edge is cleaned up by updateTraffic.
@@ -1050,56 +1059,377 @@ function update(dt) {
 }
 
 // ---------------------------------------------------------------------------
-// Render
+// Render: hand-drawn cartoon style
 // ---------------------------------------------------------------------------
+// The look: flat, bright colors with thick dark "ink" outlines that wobble
+// slightly, as if inked by hand. The wobble is seeded per object and stable
+// from frame to frame (no "line boil" shimmer while you drive).
+//
+// Everything that never moves -- ground, street, sidewalk, lawn, the garage
+// building, crates, parked cars -- is drawn once into `staticLayer` by
+// buildStaticLayer() and blitted each frame. It MUST be rebuilt whenever
+// street/crates are rebuilt (setupWorld and the resize handler), or the
+// picture drifts away from the collision geometry.
 
-function drawGrid() {
-  ctx.fillStyle = "#2b2e37";
-  ctx.fillRect(0, 0, W, H);
-  ctx.strokeStyle = "rgba(255,255,255,0.05)";
-  ctx.lineWidth = 1;
-  const step = 60;
-  ctx.beginPath();
-  for (let x = 0; x < W; x += step) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
-  for (let y = 0; y < H; y += step) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
-  ctx.stroke();
+const INK = "#231f2e";
+const PAL = {
+  lot: "#e8dfc6",
+  road: "#9491a8",
+  lane: "#ffd23f",
+  curb: "#dcd9e6",
+  sidewalk: "#f5ddb6",
+  sidewalkSeam: "#d6b58a",
+  lawn: "#86d152",
+  lawnDark: "#5fae36",
+  garageWall: "#f29bc4",
+  garageRoof: "#d377a6",
+  garageDoor: "#aac6e2",
+  crate: "#dd9a4e",
+  crateDark: "#a4652b",
+  glass: "#b3e6ff",
+  headlight: "#fff3a6",
+  taillight: "#ff5a4f",
+  tire: "#2c2833",
+  hub: "#d7dae0",
+  coin: "#ffd23f",
+  coinRing: "#e3a414",
+  shadow: "rgba(35,31,46,0.2)",
+};
+
+// Deterministic 0..1 noise from a number -- seeds the per-object wobble.
+function hash01(n) {
+  const s = Math.sin(n * 127.1 + 311.7) * 43758.5453;
+  return s - Math.floor(s);
 }
 
-function drawStreet() {
-  const { curbY, parkingSpots } = street;
+// A rounded rectangle's outline as a clockwise list of points, with the
+// straight edges subdivided every `step` px so wobble() has something to bend.
+function roundRectPoints(x, y, w, h, r, step = 6) {
+  const pts = [];
+  const corners = [
+    [x + w - r, y + r, -Math.PI / 2],
+    [x + w - r, y + h - r, 0],
+    [x + r, y + h - r, Math.PI / 2],
+    [x + r, y + r, Math.PI],
+  ];
+  for (let i = 0; i < 4; i++) {
+    const [cx, cy, a0] = corners[i];
+    for (let k = 0; k <= 4; k++) {
+      const a = a0 + (k / 4) * (Math.PI / 2);
+      pts.push({ x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r });
+    }
+    const [nx, ny, na0] = corners[(i + 1) % 4];
+    const last = pts[pts.length - 1];
+    const ex = nx + Math.cos(na0) * r, ey = ny + Math.sin(na0) * r;
+    const n = Math.max(1, Math.floor(Math.hypot(ex - last.x, ey - last.y) / step));
+    for (let k = 1; k < n; k++) pts.push({ x: last.x + ((ex - last.x) * k) / n, y: last.y + ((ey - last.y) * k) / n });
+  }
+  return pts;
+}
 
-  // sidewalk
-  ctx.fillStyle = "#4a4d55";
-  ctx.fillRect(0, curbY, W, H - curbY);
+// Nudges each outline point along its normal by a smooth, seeded amount --
+// the "inked by hand" wobble. Low-frequency on purpose: gentle bends, not fuzz.
+function wobble(pts, seed, amp) {
+  const n = pts.length;
+  const ph1 = hash01(seed) * Math.PI * 2, ph2 = hash01(seed + 7.3) * Math.PI * 2;
+  return pts.map((p, i) => {
+    const a = pts[(i - 1 + n) % n], b = pts[(i + 1) % n];
+    let nx = b.y - a.y, ny = a.x - b.x;
+    const l = Math.hypot(nx, ny) || 1;
+    nx /= l; ny /= l;
+    const s = (i / n) * Math.PI * 2;
+    const o = amp * (0.6 * Math.sin(s * 3 + ph1) + 0.4 * Math.sin(s * 7 + ph2));
+    return { x: p.x + nx * o, y: p.y + ny * o };
+  });
+}
 
-  // curb line
-  ctx.strokeStyle = "#c9ccd3";
-  ctx.lineWidth = 3;
-  ctx.beginPath();
-  ctx.moveTo(0, curbY);
-  ctx.lineTo(W, curbY);
-  ctx.stroke();
+// Closed smooth path through the points (quadratic curves via midpoints).
+function tracePath(c, pts) {
+  const n = pts.length;
+  c.beginPath();
+  c.moveTo((pts[n - 1].x + pts[0].x) / 2, (pts[n - 1].y + pts[0].y) / 2);
+  for (let i = 0; i < n; i++) {
+    const p = pts[i], q = pts[(i + 1) % n];
+    c.quadraticCurveTo(p.x, p.y, (p.x + q.x) / 2, (p.y + q.y) / 2);
+  }
+  c.closePath();
+}
 
-  // dashed road centerline, a bit above the parked row
-  ctx.strokeStyle = "rgba(230, 200, 90, 0.55)";
-  ctx.lineWidth = 3;
-  ctx.setLineDash([22, 18]);
-  ctx.beginPath();
-  ctx.moveTo(0, street.centerlineY);
-  ctx.lineTo(W, street.centerlineY);
-  ctx.stroke();
-  ctx.setLineDash([]);
+// The workhorse: fill a shape flat, then ink its outline.
+function inkShape(c, pts, fill, lw = 2.5, stroke = INK) {
+  tracePath(c, pts);
+  if (fill) { c.fillStyle = fill; c.fill(); }
+  if (lw) { c.strokeStyle = stroke; c.lineWidth = lw; c.lineJoin = "round"; c.stroke(); }
+}
 
-  // parking-spot boundary markings, painted on the curb
-  ctx.fillStyle = "rgba(255,255,255,0.8)";
-  ctx.font = "12px system-ui, sans-serif";
-  ctx.textAlign = "center";
-  for (const spot of parkingSpots) {
-    ctx.fillRect(spot.x0 - 1.5, curbY - 2, 3, 16);
-    ctx.fillRect(spot.x1 - 1.5, curbY - 2, 3, 16);
-    ctx.fillText("P", (spot.x0 + spot.x1) / 2, curbY - 22);
+// A hand-drawn line: pinned at both ends, gently bowed in between.
+function inkLine(c, x0, y0, x1, y1, seed, lw = 2, color = INK, amp = 0.8) {
+  const len = Math.hypot(x1 - x0, y1 - y0) || 1;
+  const n = Math.max(2, Math.ceil(len / 10));
+  const nx = -(y1 - y0) / len, ny = (x1 - x0) / len;
+  const ph = hash01(seed) * Math.PI * 2;
+  const waves = 1 + Math.floor(len / 120); // long lines get a few bends, short ones one
+  c.beginPath();
+  for (let i = 0; i <= n; i++) {
+    const t = i / n;
+    const o = amp * Math.sin(t * Math.PI * 2 * waves + ph) * Math.sin(t * Math.PI);
+    const x = x0 + (x1 - x0) * t + nx * o, y = y0 + (y1 - y0) * t + ny * o;
+    if (i) c.lineTo(x, y); else c.moveTo(x, y);
+  }
+  c.strokeStyle = color;
+  c.lineWidth = lw;
+  c.lineCap = "round";
+  c.stroke();
+  c.lineCap = "butt";
+}
+
+// Text with a thick ink outline, cartoon-sign style.
+function inkText(c, text, x, y, size, fill) {
+  c.font = `900 ${size}px "Trebuchet MS", "Segoe UI", sans-serif`;
+  c.textAlign = "center";
+  c.textBaseline = "middle";
+  c.lineJoin = "round";
+  c.strokeStyle = INK;
+  c.lineWidth = Math.max(3, size * 0.22);
+  c.strokeText(text, x, y);
+  c.fillStyle = fill;
+  c.fillText(text, x, y);
+  c.textBaseline = "alphabetic";
+}
+
+// ---- Static layer ---------------------------------------------------------
+
+const staticLayer = document.createElement("canvas");
+
+function buildStaticLayer() {
+  staticLayer.width = W;
+  staticLayer.height = H;
+  const c = staticLayer.getContext("2d");
+  drawGround(c);
+  drawStreetArt(c);
+  drawGarageBuilding(c);
+  for (const cr of crates) drawCrate(c, cr);
+  for (const pc of street.parkedCars) drawCar(c, pc);
+  drawPaperGrain(c);
+}
+
+// The open lot: warm, sun-bleached concrete with a few cracks and oil stains.
+function drawGround(c) {
+  c.fillStyle = PAL.lot;
+  c.fillRect(0, 0, W, H);
+  const roadTop = street.npcLaneY - CAR.width / 2 - 16;
+  for (let i = 0; i < Math.round((W * roadTop) / 60000); i++) {
+    const x = hash01(i * 3.1) * W, y = hash01(i * 5.7 + 1) * (roadTop - 20);
+    if (i % 3 === 0) {
+      // oil stain
+      const pts = wobble(roundRectPoints(x - 9, y - 6, 18, 12, 6, 4), i, 1.5);
+      tracePath(c, pts);
+      c.fillStyle = "rgba(120,105,80,0.18)";
+      c.fill();
+    } else {
+      // hairline crack: two short joined segments
+      const a = hash01(i * 9.1) * Math.PI;
+      const x1 = x + Math.cos(a) * 14, y1 = y + Math.sin(a) * 14;
+      inkLine(c, x, y, x1, y1, i, 1.2, "rgba(120,105,80,0.45)", 1);
+      inkLine(c, x1, y1, x1 + Math.cos(a + 0.8) * 9, y1 + Math.sin(a + 0.8) * 9, i + 0.5, 1.2, "rgba(120,105,80,0.45)", 0.6);
+    }
   }
 }
+
+function drawStreetArt(c) {
+  const { curbY, centerlineY, npcLaneY, parkingSpots } = street;
+
+  // road surface, inked along its top edge
+  const roadTop = npcLaneY - CAR.width / 2 - 16;
+  c.fillStyle = PAL.road;
+  c.fillRect(0, roadTop, W, curbY - roadTop);
+  inkLine(c, -5, roadTop, W + 5, roadTop, 11, 3);
+
+  // centerline: chunky painted dashes
+  for (let x = 12; x < W; x += 46) {
+    inkShape(c, wobble(roundRectPoints(x, centerlineY - 3.5, 26, 7, 3.5, 5), x, 0.5), PAL.lane, 1.5);
+  }
+
+  // sidewalk, then a strip of lawn below it
+  const swH = Math.min(46, (H - curbY) * 0.45);
+  c.fillStyle = PAL.sidewalk;
+  c.fillRect(0, curbY, W, swH);
+  for (let x = 40; x < W; x += 64) inkLine(c, x, curbY + 5, x, curbY + swH - 3, x * 0.37, 1.5, PAL.sidewalkSeam, 0.6);
+  c.fillStyle = PAL.lawn;
+  c.fillRect(0, curbY + swH, W, H - curbY - swH);
+  for (let i = 0; i < W / 14; i++) {
+    const x = hash01(i * 2.3) * W, y = curbY + swH + 8 + hash01(i * 4.1) * (H - curbY - swH - 12);
+    inkLine(c, x - 3, y + 3, x - 1, y - 2, i, 1.4, PAL.lawnDark, 0.3);
+    inkLine(c, x + 1, y + 3, x + 3, y - 3, i + 0.3, 1.4, PAL.lawnDark, 0.3);
+  }
+  inkLine(c, -5, curbY + swH, W + 5, curbY + swH, 23, 2.5);
+
+  // curb: a pale band with inked edges
+  c.fillStyle = PAL.curb;
+  c.fillRect(0, curbY - 3, W, 7);
+  inkLine(c, -5, curbY - 3, W + 5, curbY - 3, 31, 2.5);
+  inkLine(c, -5, curbY + 4, W + 5, curbY + 4, 37, 2);
+
+  // parking spots: painted end marks and a big "P"
+  for (const s of parkingSpots) {
+    for (const x of [s.x0, s.x1]) inkShape(c, roundRectPoints(x - 2, curbY - 15, 4, 13, 2, 4), "#ffffff", 1.5);
+    inkText(c, "P", (s.x0 + s.x1) / 2, street.carCenterY, 17, "#ffffff");
+  }
+}
+
+// Pink cartoon garage on the sidewalk/lawn, roll-up door facing its pad.
+function drawGarageBuilding(c) {
+  const g = street.garage;
+  const w = g.x1 - g.x0, by0 = g.curbY + 6, h = g.bottomY - by0;
+  tracePath(c, roundRectPoints(g.x0 + 5, by0 + 6, w, h, 5, 10));
+  c.fillStyle = PAL.shadow;
+  c.fill();
+  inkShape(c, wobble(roundRectPoints(g.x0, by0, w, h, 5, 8), 77, 1), PAL.garageWall, 3);
+  // flat roof inset with a vent
+  const inset = 10;
+  inkShape(c, wobble(roundRectPoints(g.x0 + inset, by0 + 28, w - inset * 2, h - 28 - inset, 4, 8), 78, 0.8), PAL.garageRoof, 2);
+  inkShape(c, wobble(roundRectPoints(g.x1 - 34, by0 + 36, 14, 14, 7, 4), 79, 0.4), "#e9e4f2", 1.8);
+  // roll-up door with slats
+  const doorH = Math.min(20, h * 0.3), dx0 = g.x0 + 18, dw = w - 36;
+  inkShape(c, roundRectPoints(dx0, by0 - 2, dw, doorH, 2, 6), PAL.garageDoor, 2.2);
+  for (let y = by0 + 3; y < by0 + doorH - 3; y += 4.5) inkLine(c, dx0 + 3, y, dx0 + dw - 3, y, y, 1, "rgba(35,31,46,0.45)", 0.3);
+}
+
+function drawCrate(c, cr) {
+  const s = cr.r, x0 = cr.x - s, y0 = cr.y - s, seed = cr.x * 0.37 + cr.y * 1.3;
+  tracePath(c, roundRectPoints(x0 + 3, y0 + 4, s * 2, s * 2, 3, 6));
+  c.fillStyle = PAL.shadow;
+  c.fill();
+  inkShape(c, wobble(roundRectPoints(x0, y0, s * 2, s * 2, 3, 5), seed, 0.8), PAL.crate, 2.5);
+  inkShape(c, wobble(roundRectPoints(x0 + 4, y0 + 4, s * 2 - 8, s * 2 - 8, 2, 5), seed + 1, 0.5), null, 1.5, PAL.crateDark);
+  inkLine(c, x0 + 5, y0 + s * 2 - 5, x0 + s * 2 - 5, y0 + 5, seed, 2.2, PAL.crateDark, 0.6);
+  inkLine(c, x0 + 4, y0 + 3, x0 + s, y0 + 3, seed + 2, 1.5, "rgba(255,255,255,0.55)", 0.3);
+}
+
+// Scattered ink specks and a soft vignette over the whole static scene --
+// the "printed on paper" feel.
+function drawPaperGrain(c) {
+  for (let i = 0; i < (W * H) / 700; i++) {
+    c.fillStyle = i % 2 ? "rgba(35,31,46,0.05)" : "rgba(255,255,255,0.08)";
+    c.fillRect(Math.random() * W, Math.random() * H, 1.5, 1.5);
+  }
+  const v = c.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.35, W / 2, H / 2, Math.max(W, H) * 0.75);
+  v.addColorStop(0, "rgba(35,31,46,0)");
+  v.addColorStop(1, "rgba(35,31,46,0.16)");
+  c.fillStyle = v;
+  c.fillRect(0, 0, W, H);
+}
+
+// ---- Cars -----------------------------------------------------------------
+
+// A car's outline shapes, in its own local frame (x forward), wobbled with
+// its own seed. They never change, so they're built once and cached.
+function carArt(car) {
+  if (car.art) return car.art;
+  const L = CAR.length, Wd = CAR.width, s = car.seed;
+  car.art = {
+    body: wobble(roundRectPoints(-L / 2, -Wd / 2, L, Wd, 8, 5), s, 0.7),
+    cabin: wobble(roundRectPoints(-L * 0.28, -Wd / 2 + 3.5, L * 0.52, Wd - 7, 5, 5), s + 1, 0.4),
+    windshield: wobble(roundRectPoints(L * 0.05, -Wd / 2 + 4.5, L * 0.17, Wd - 9, 3, 4), s + 2, 0.3),
+    rearWindow: wobble(roundRectPoints(-L * 0.26, -Wd / 2 + 5, L * 0.1, Wd - 10, 2, 4), s + 3, 0.3),
+  };
+  return car.art;
+}
+
+function drawWheel(c, x, y, angle) {
+  const wLen = 14, wWid = 7;
+  c.save();
+  c.translate(x, y);
+  c.rotate(angle);
+  c.beginPath();
+  c.roundRect(-wLen / 2, -wWid / 2, wLen, wWid, 2.5);
+  c.fillStyle = PAL.tire;
+  c.fill();
+  c.strokeStyle = INK;
+  c.lineWidth = 1.5;
+  c.stroke();
+  // light stripe along the tire, so steering direction stays legible at a glance
+  c.strokeStyle = PAL.hub;
+  c.lineWidth = 1.6;
+  c.lineCap = "round";
+  c.beginPath();
+  c.moveTo(-wLen / 2 + 3, 0);
+  c.lineTo(wLen / 2 - 3, 0);
+  c.stroke();
+  c.lineCap = "butt";
+  c.restore();
+}
+
+function drawCar(c, car) {
+  const L = CAR.length, Wd = CAR.width;
+  const halfWB = CAR.wheelBase / 2, halfTrack = Wd / 2;
+  const art = carArt(car);
+
+  // drop shadow, offset in world space (the sun doesn't turn with the car)
+  c.save();
+  c.translate(car.pos.x + 3, car.pos.y + 4);
+  c.rotate(car.angle);
+  tracePath(c, art.body);
+  c.fillStyle = PAL.shadow;
+  c.fill();
+  c.restore();
+
+  c.save();
+  c.translate(car.pos.x, car.pos.y);
+  c.rotate(car.angle);
+
+  // wheels first so the body sits on top; the two fronts get distinct
+  // Ackermann angles (the inner one visibly turns sharper)
+  const wa = ackermannWheelAngles(car.steerCurrent, CAR.wheelBase, CAR.track);
+  drawWheel(c, halfWB, -halfTrack, wa.left);
+  drawWheel(c, halfWB, halfTrack, wa.right);
+  drawWheel(c, -halfWB, -halfTrack, 0);
+  drawWheel(c, -halfWB, halfTrack, 0);
+
+  inkShape(c, art.body, car.color, 2.5);
+  inkShape(c, art.cabin, null, 1.5);
+  inkShape(c, art.windshield, PAL.glass, 1.5);
+  inkShape(c, art.rearWindow, PAL.glass, 1.2);
+  inkLine(c, L * 0.09, -Wd / 2 + 7, L * 0.09, -Wd / 2 + 11, car.seed, 1.6, "#ffffff", 0); // windshield glint
+
+  // headlights (front corners), taillights (rear corners)
+  for (const side of [-1, 1]) {
+    c.beginPath();
+    c.arc(L / 2 - 3.5, side * (Wd / 2 - 4.5), 2.4, 0, Math.PI * 2);
+    c.fillStyle = PAL.headlight;
+    c.fill();
+    c.strokeStyle = INK;
+    c.lineWidth = 1.2;
+    c.stroke();
+    c.beginPath();
+    c.roundRect(-L / 2 + 1.2, side * (Wd / 2 - 5) - 2, 2.6, 4, 1);
+    c.fillStyle = PAL.taillight;
+    c.fill();
+    c.stroke();
+  }
+
+  // collision dents: a dark bruise with ink crack lines, clipped to the body
+  if (car.dents.length) {
+    c.save();
+    tracePath(c, art.body);
+    c.clip();
+    for (const d of car.dents) {
+      const seed = d.x * 13.1 + d.y * 7.7;
+      tracePath(c, wobble(roundRectPoints(d.x - d.r, d.y - d.r, d.r * 2, d.r * 2, d.r, 3), seed, d.r * 0.15));
+      c.fillStyle = "rgba(35,31,46,0.28)";
+      c.fill();
+      for (let k = 0; k < 3; k++) {
+        const a = hash01(seed + k) * Math.PI * 2, len = d.r * (0.7 + 0.5 * hash01(seed + k + 9));
+        inkLine(c, d.x, d.y, d.x + Math.cos(a) * len, d.y + Math.sin(a) * len, seed + k, 1.2, INK, 0.4);
+      }
+    }
+    c.restore();
+  }
+
+  c.restore();
+}
+
+// ---- Dynamic scene elements ------------------------------------------------
 
 // The in-world "now go park" cue (there's no status text): while a player is
 // in "mustPark", every open spot pulses in that player's color. With both
@@ -1122,12 +1452,12 @@ function drawTargetPulse(cars, rects) {
     const pulse = 0.5 + 0.5 * Math.sin(now * 5 + i * Math.PI); // 0..1
     ctx.fillStyle = car.color;
     ctx.strokeStyle = car.color;
-    ctx.lineWidth = 2;
+    ctx.lineWidth = 3;
     for (const r of rects) {
-      ctx.globalAlpha = 0.08 + 0.22 * pulse;
+      ctx.globalAlpha = 0.1 + 0.25 * pulse;
       ctx.fillRect(r.x, r.y, r.w, r.h);
-      ctx.globalAlpha = 0.35 + 0.55 * pulse;
-      ctx.strokeRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
+      ctx.globalAlpha = 0.4 + 0.6 * pulse;
+      ctx.strokeRect(r.x + 1.5, r.y + 1.5, r.w - 3, r.h - 3);
     }
   });
   ctx.globalAlpha = 1;
@@ -1147,208 +1477,91 @@ function drawCoin(coin) {
 
   ctx.save();
   ctx.translate(coin.x, coin.y);
-
-  ctx.fillStyle = "#ffffff";
-  ctx.globalAlpha = 0.25;
+  ctx.fillStyle = "rgba(255,255,255,0.35)";
   ctx.beginPath();
-  ctx.arc(0, 0, r + 5, 0, Math.PI * 2);
+  ctx.arc(0, 0, r + 6, 0, Math.PI * 2);
   ctx.fill();
-  ctx.globalAlpha = 1;
-
-  ctx.fillStyle = "#ffd54f";
-  ctx.strokeStyle = "#b8860b";
-  ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.arc(0, 0, r, 0, Math.PI * 2);
+  ctx.fillStyle = PAL.coin;
   ctx.fill();
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 2.2;
   ctx.stroke();
-
-  ctx.strokeStyle = "rgba(255,255,255,0.6)";
-  ctx.lineWidth = 1.5;
   ctx.beginPath();
-  ctx.arc(0, 0, r * 0.6, 0, Math.PI * 2);
+  ctx.arc(0, 0, r * 0.62, 0, Math.PI * 2);
+  ctx.strokeStyle = PAL.coinRing;
+  ctx.lineWidth = 1.6;
   ctx.stroke();
-
+  ctx.beginPath(); // shine
+  ctx.arc(0, 0, r * 0.62, Math.PI * 1.05, Math.PI * 1.45);
+  ctx.strokeStyle = "#ffffff";
+  ctx.lineWidth = 1.8;
+  ctx.lineCap = "round";
+  ctx.stroke();
+  ctx.lineCap = "butt";
   ctx.restore();
 }
 
-function drawCrate(c) {
-  ctx.fillStyle = "#8a5a34";
-  ctx.strokeStyle = "#5c3a20";
-  ctx.lineWidth = 2;
-  ctx.fillRect(c.x - c.r, c.y - c.r, c.r * 2, c.r * 2);
-  ctx.strokeRect(c.x - c.r, c.y - c.r, c.r * 2, c.r * 2);
-}
-
-function drawWheel(localX, localY, extraAngle) {
-  const wLen = 14, wWid = 7;
-  ctx.save();
-  ctx.translate(localX, localY);
-  ctx.rotate(extraAngle);
-
-  // tire: dark fill with a light outline so it reads clearly against both
-  // the asphalt and the car body, at any rotation.
-  ctx.fillStyle = "#161616";
-  ctx.strokeStyle = "#9aa0aa";
-  ctx.lineWidth = 1.2;
-  ctx.beginPath();
-  ctx.roundRect(-wLen / 2, -wWid / 2, wLen, wWid, 1.5);
-  ctx.fill();
-  ctx.stroke();
-
-  // sidewall stripe running the length of the tire, so its pointing
-  // direction is legible at a glance even at small sizes.
-  ctx.strokeStyle = "#d7dae0";
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.moveTo(-wLen / 2 + 2, 0);
-  ctx.lineTo(wLen / 2 - 2, 0);
-  ctx.stroke();
-
-  ctx.restore();
-}
-
-function drawCar(car) {
-  const { length, width } = CAR;
-  const halfWB = CAR.wheelBase / 2;
-  const halfTrack = width / 2;
-
-  ctx.save();
-  ctx.translate(car.pos.x, car.pos.y);
-  ctx.rotate(car.angle);
-
-  // wheels (drawn first, so the body sits on top) -- the two front wheels
-  // get distinct Ackermann angles, so the inner one visibly turns sharper
-  // than the outer one during a turn, same as a real front axle.
-  const wheelAngles = ackermannWheelAngles(car.steerCurrent, CAR.wheelBase, CAR.track);
-  drawWheel(halfWB, -halfTrack, wheelAngles.left);
-  drawWheel(halfWB, halfTrack, wheelAngles.right);
-  drawWheel(-halfWB, -halfTrack, 0);
-  drawWheel(-halfWB, halfTrack, 0);
-
-  // body
-  ctx.fillStyle = car.color;
-  ctx.strokeStyle = "rgba(0,0,0,0.35)";
-  ctx.lineWidth = 2;
-  roundedRect(-length / 2, -width / 2, length, width, 5);
-  ctx.fill();
-  ctx.stroke();
-
-  // cabin / windshield to show facing direction
-  ctx.fillStyle = "rgba(20,25,35,0.6)";
-  roundedRect(length * 0.02, -width / 2 + 4, length * 0.35, width - 8, 3);
-  ctx.fill();
-
-  // collision dents: a dark hollow with a bright crumple edge, clipped to
-  // the body so a dent at the bumper doesn't spill onto the road.
-  if (car.dents.length) {
-    ctx.save();
-    roundedRect(-length / 2, -width / 2, length, width, 5);
-    ctx.clip();
-    for (const d of car.dents) {
-      const g = ctx.createRadialGradient(d.x, d.y, 0, d.x, d.y, d.r);
-      g.addColorStop(0, "rgba(0,0,0,0.55)");
-      g.addColorStop(0.65, "rgba(0,0,0,0.25)");
-      g.addColorStop(1, "rgba(0,0,0,0)");
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
-      ctx.fill();
-
-      ctx.strokeStyle = "rgba(255,255,255,0.35)";
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.arc(d.x, d.y, d.r * 0.6, Math.PI * 0.9, Math.PI * 1.9);
-      ctx.stroke();
-    }
-    ctx.restore();
-  }
-
-  ctx.restore();
-}
-
-function drawGarage() {
+// The garage's service pad (the building itself is in the static layer).
+function drawGaragePad() {
   const g = street.garage;
-  const w = g.x1 - g.x0;
+  const w = g.x1 - g.x0, h = g.curbY - g.padY0;
 
-  // service pad on the road: hazard-striped border around a darker slab. No
-  // text anywhere on the garage -- the wrench + coin on the pad says "repairs
-  // cost a coin", and the border flashes red at a damaged player who's
-  // stopped on it without one.
+  // No text anywhere on the garage -- the wrench + coin on the pad says
+  // "repairs cost a coin", and the border flashes red at a damaged player
+  // who's stopped on it without one.
   const denied = garageDenied(car1) || garageDenied(car2);
   const flashOn = denied && Math.floor(performance.now() / 180) % 2 === 0;
-  ctx.fillStyle = "rgba(20,22,28,0.55)";
-  ctx.fillRect(g.x0, g.padY0, w, g.curbY - g.padY0);
+  ctx.fillStyle = "rgba(35,31,46,0.16)";
+  ctx.fillRect(g.x0, g.padY0, w, h);
   // Badly damaged players see the pad pulse in their color -- same "go here"
   // cue as the parking spots. Grown a few px past the pad so the pulsing
   // outline frames the hazard border instead of hiding underneath it.
   const busted = [car1, car2].filter((c) => c.damage >= GARAGE_HINT_DAMAGE);
   const m = 4;
-  drawTargetPulse(busted, [{ x: g.x0 - m, y: g.padY0 - m, w: w + 2 * m, h: g.curbY - g.padY0 + m }]);
+  drawTargetPulse(busted, [{ x: g.x0 - m, y: g.padY0 - m, w: w + 2 * m, h: h + m }]);
   ctx.save();
-  ctx.strokeStyle = flashOn ? "#ff4b3e" : "#e0b43a";
-  ctx.lineWidth = 3;
-  ctx.setLineDash([10, 7]);
-  ctx.strokeRect(g.x0 + 1.5, g.padY0 + 1.5, w - 3, g.curbY - g.padY0 - 3);
+  ctx.lineWidth = 4;
+  ctx.setLineDash([11, 7]);
+  ctx.strokeStyle = flashOn ? "#ff4b3e" : PAL.lane;
+  ctx.strokeRect(g.x0 + 3, g.padY0 + 3, w - 6, h - 6);
   ctx.restore();
-
-  const cx = (g.x0 + g.x1) / 2, cy = (g.padY0 + g.curbY) / 2;
-  ctx.globalAlpha = 0.9;
-  drawWrench(cx - 11, cy, flashOn ? "#ff4b3e" : "#c9ccd3");
-  ctx.fillStyle = "#ffd54f";
-  ctx.strokeStyle = "#b8860b";
+  ctx.strokeStyle = INK;
   ctx.lineWidth = 2;
+  ctx.strokeRect(g.x0, g.padY0, w, h);
+
+  const cx = (g.x0 + g.x1) / 2, cy = g.padY0 + h / 2;
+  drawWrench(cx - 11, cy, flashOn ? "#ff4b3e" : "#dfe3ea");
   ctx.beginPath();
   ctx.arc(cx + 13, cy, 7, 0, Math.PI * 2);
+  ctx.fillStyle = PAL.coin;
   ctx.fill();
-  ctx.stroke();
-  ctx.globalAlpha = 1;
-
-  // building on the sidewalk, roll-up door facing the pad
-  const by0 = g.curbY + 4;
-  ctx.fillStyle = "#5b4636";
-  ctx.strokeStyle = "#2e231b";
+  ctx.strokeStyle = INK;
   ctx.lineWidth = 2;
-  ctx.fillRect(g.x0, by0, w, g.bottomY - by0);
-  ctx.strokeRect(g.x0, by0, w, g.bottomY - by0);
-
-  const doorInset = 18;
-  const doorH = Math.min(22, (g.bottomY - by0) * 0.45);
-  ctx.fillStyle = "#9aa0aa";
-  ctx.fillRect(g.x0 + doorInset, by0, w - doorInset * 2, doorH);
-  ctx.strokeStyle = "rgba(0,0,0,0.35)";
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  for (let y = by0 + 4; y < by0 + doorH; y += 4) {
-    ctx.moveTo(g.x0 + doorInset, y);
-    ctx.lineTo(g.x1 - doorInset, y);
-  }
   ctx.stroke();
 }
 
 // A simple open-end wrench, ~24px long, centered on (x, y), tilted 45deg.
+// Drawn twice -- a fat ink pass, then the color on top -- for an outline.
 function drawWrench(x, y, color) {
   ctx.save();
   ctx.translate(x, y);
   ctx.rotate(-Math.PI / 4);
-  ctx.fillStyle = color;
-  ctx.fillRect(-11, -2.5, 16, 5); // handle
-  ctx.strokeStyle = color; // head: a thick "C", open to the right for the jaw
-  ctx.lineWidth = 4;
-  ctx.beginPath();
-  ctx.arc(8, 0, 4.5, Math.PI * 0.3, Math.PI * 1.7);
-  ctx.stroke();
+  ctx.lineCap = "round";
+  for (const [stroke, extra] of [[INK, 3], [color, 0]]) {
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = 5 + extra; // handle
+    ctx.beginPath();
+    ctx.moveTo(-10, 0);
+    ctx.lineTo(4, 0);
+    ctx.stroke();
+    ctx.lineWidth = 4 + extra; // head: a thick "C", open to the right for the jaw
+    ctx.beginPath();
+    ctx.arc(8, 0, 4.5, Math.PI * 0.3, Math.PI * 1.7);
+    ctx.stroke();
+  }
   ctx.restore();
-}
-
-function roundedRect(x, y, w, h, r) {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.arcTo(x + w, y, x + w, y + h, r);
-  ctx.arcTo(x + w, y + h, x, y + h, r);
-  ctx.arcTo(x, y + h, x, y, r);
-  ctx.arcTo(x, y, x + w, y, r);
-  ctx.closePath();
 }
 
 // The HUD is deliberately minimal: each player's badge is just their label
@@ -1384,7 +1597,20 @@ function implodePos(p, t) {
   return { x: p.tx + Math.cos(a) * r, y: p.ty + Math.sin(a) * r };
 }
 
+// Strokes the current path twice -- a fat ink pass, then the color on top --
+// so thin particle lines keep a cartoon outline and stay visible on the
+// light ground.
+function inkedStroke(color, width) {
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = width + 2.2;
+  ctx.stroke();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width;
+  ctx.stroke();
+}
+
 function drawParticles() {
+  ctx.lineCap = "round";
   for (const p of particles) {
     if (p.life < 0) continue; // staggered start, not launched yet
     const t = p.life / p.maxLife;
@@ -1394,24 +1620,21 @@ function drawParticles() {
       const head = implodePos(p, t);
       const tail = implodePos(p, Math.max(0, t - 0.08));
       ctx.globalAlpha = Math.min(1, 0.2 + t * 1.2);
-      ctx.strokeStyle = p.color;
-      ctx.lineWidth = p.size;
-      ctx.lineCap = "round";
       ctx.beginPath();
       ctx.moveTo(tail.x, tail.y);
       ctx.lineTo(head.x, head.y);
-      ctx.stroke();
+      inkedStroke(p.color, p.size + 0.4);
     } else if (p.type === "spark") {
       ctx.globalAlpha = 1 - t;
-      ctx.fillStyle = p.color;
       ctx.beginPath();
-      ctx.arc(p.x, p.y, p.size * (1 - t * 0.4), 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, p.size * (1 - t * 0.4) + 0.4, 0, Math.PI * 2);
+      ctx.fillStyle = p.color;
       ctx.fill();
+      ctx.strokeStyle = INK;
+      ctx.lineWidth = 1.1;
+      ctx.stroke();
     } else if (p.type === "streak") {
       ctx.globalAlpha = 1 - t;
-      ctx.strokeStyle = p.color;
-      ctx.lineWidth = p.size;
-      ctx.lineCap = "round";
       const speed = Math.hypot(p.vx, p.vy);
       const len = Math.min(speed * 0.045, 16);
       const dx = speed > 0.01 ? (p.vx / speed) * len : 0;
@@ -1419,25 +1642,31 @@ function drawParticles() {
       ctx.beginPath();
       ctx.moveTo(p.x - dx, p.y - dy);
       ctx.lineTo(p.x, p.y);
-      ctx.stroke();
+      inkedStroke(p.color, p.size + 0.4);
     } else if (p.type === "ring") {
-      ctx.globalAlpha = (1 - t) * 0.8;
-      ctx.strokeStyle = p.color;
-      ctx.lineWidth = 2;
+      ctx.globalAlpha = (1 - t) * 0.9;
       ctx.beginPath();
       ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
-      ctx.stroke();
+      inkedStroke(p.color, 2.2);
     } else if (p.type === "smoke") {
-      ctx.globalAlpha = p.alpha * (1 - t);
+      // cartoon puff: flat fill with a faint ink outline
+      const a = p.alpha * (1 - t);
+      ctx.globalAlpha = a;
       ctx.fillStyle = p.color;
       ctx.beginPath();
       ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
       ctx.fill();
+      ctx.globalAlpha = a * 0.6;
+      ctx.strokeStyle = INK;
+      ctx.lineWidth = 1.3;
+      ctx.stroke();
     } else if (p.type === "flash") {
-      ctx.globalAlpha = (1 - t) * 0.9;
+      // warm yellow rather than white, so it reads on the light ground
+      ctx.globalAlpha = (1 - t) * 0.95;
       const grad = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.radius);
-      grad.addColorStop(0, "rgba(255,255,255,1)");
-      grad.addColorStop(1, "rgba(255,255,255,0)");
+      grad.addColorStop(0, "rgba(255,248,200,1)");
+      grad.addColorStop(0.45, "rgba(255,214,70,0.85)");
+      grad.addColorStop(1, "rgba(255,190,40,0)");
       ctx.fillStyle = grad;
       ctx.beginPath();
       ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
@@ -1450,16 +1679,17 @@ function drawParticles() {
 }
 
 function render() {
-  drawGrid();
-  drawStreet();
+  if (staticDirty) {
+    buildStaticLayer();
+    staticDirty = false;
+  }
+  ctx.drawImage(staticLayer, 0, 0); // ground, street, garage building, crates, parked cars
   drawParkingTargets();
-  drawGarage();
-  for (const c of crates) drawCrate(c);
-  for (const pc of street.parkedCars) drawCar(pc);
-  for (const n of npcs) drawCar(n);
+  drawGaragePad();
+  for (const n of npcs) drawCar(ctx, n);
   if (coin) drawCoin(coin);
-  drawCar(car1);
-  drawCar(car2);
+  drawCar(ctx, car1);
+  drawCar(ctx, car2);
   drawParticles();
 
   updateHud(car1, titleEl1, scoreEl1);
