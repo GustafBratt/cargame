@@ -40,7 +40,7 @@ const CAR = {
   width: 24,
   wheelBase: 30, // distance between front and rear axle
   track: 18, // distance between the front-left/front-right tire centers (for Ackermann geometry)
-  maxSteer: 0.38, // radians, the effective single-front-wheel ("bicycle model") steering lock -- kinematic min radius = wheelBase/tan(maxSteer)
+  maxSteer: 0.47, // radians, the effective single-front-wheel ("bicycle model") steering lock -- kinematic min radius = wheelBase/tan(maxSteer)
   enginePower: 340, // forward acceleration, px/s^2 -- kept gentle for parking-scale control
   brakePower: 1150, // deceleration when braking while moving forward
   reversePower: 200,
@@ -451,10 +451,10 @@ function setupWorld() {
 
 const COIN_RADIUS = 9;
 const PICKUP_DIST = CAR.capsuleRadius + COIN_RADIUS + 4;
-const PARK_SPEED_LIMIT = 7; // px/s, "stopped" for parking-detection purposes
-const PARK_Y_TOLERANCE = 8;
-const PARK_ANGLE_TOLERANCE = 0.2; // radians (~11.5deg), either direction along the curb
-const PARK_X_MARGIN = 5; // px inset from the spot's painted edges the center must clear
+const PARK_SPEED_LIMIT = 2; // px/s, "stopped" for parking-detection purposes
+const PARK_Y_TOLERANCE = 13;
+const PARK_ANGLE_TOLERANCE = 0.3; // radians (~17deg), either direction along the curb
+const PARK_X_MARGIN = 2; // px inset from the spot's painted edges the center must clear
 
 function randomCoinPos() {
   for (let attempt = 0; attempt < 30; attempt++) {
