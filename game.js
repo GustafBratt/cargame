@@ -635,14 +635,17 @@ function playRepairSound(x) {
 
 // An NPC car horn: two detuned sawtooth tones a third apart through a
 // lowpass (the classic two-note car-horn chord), with a sustained envelope.
-// `pitch` varies per car so different cars sound different. Randomly one
-// long honk or a double "beep-beep".
-function playHornSound(x, pitch) {
+// `pitch` varies per car so different cars sound different. A stuck car
+// randomly does one long honk or a double "beep-beep"; `angry` (a player
+// just crashed into it) is an indignant "beep-beep-beeeeep".
+function playHornSound(x, pitch, angry = false) {
   // Peak ~0.12: well under a light bump on paper, because a sustained tone
   // sounds much louder than a short percussive hit at the same peak (and
   // was lowered again after playtesting found the honks too loud).
   liveSfx(x, 0.16, (c, o, t) => {
-    const pattern = Math.random() < 0.5 ? [[0, 0.42]] : [[0, 0.13], [0.2, 0.22]];
+    const pattern = angry
+      ? [[0, 0.11], [0.16, 0.11], [0.32, 0.55]]
+      : Math.random() < 0.5 ? [[0, 0.42]] : [[0, 0.13], [0.2, 0.22]];
     for (const [start, len] of pattern) {
       const t0 = t + start;
       const f = c.createBiquadFilter();
@@ -1061,7 +1064,12 @@ function resolveCarVsCar(carA, carB) {
   const voice = isPlayer(carA) || !isPlayer(carB) ? carA : carB;
   const x = hitAtA ? hitAtA.x : (carA.pos.x + carB.pos.x) / 2;
   collisionSound(hit, x, voice, voice === carA ? newA : newB);
-  if (hit >= HIT_SOUND_MIN) pedestriansNotice(hitAtA.x, hitAtA.y, "crash", hit);
+  if (hit >= HIT_SOUND_MIN) {
+    pedestriansNotice(hitAtA.x, hitAtA.y, "crash", hit);
+    // a player crashing into traffic gets honked at
+    if (carA.drive && isPlayer(carB)) npcGotRammed(carA);
+    if (carB.drive && isPlayer(carA)) npcGotRammed(carB);
+  }
 }
 
 // A car in contact with the arena wall or the curb: same damage + sound as
@@ -1516,6 +1524,7 @@ const NPC_COLORS = ["#ffffff", "#e8514a", "#6cc24a", "#8c6fd6", "#f2e14b", "#ea7
 // random interval in [MIN, MAX] while still blocked.
 const NPC_HONK_DELAY = 0.7; // s
 const NPC_HONK_REPEAT_MIN = 2.5, NPC_HONK_REPEAT_MAX = 4.5; // s
+const NPC_ANGRY_HONK_COOLDOWN = 2.5; // s; at most one "you hit me!" honk per incident
 
 function nextNpcSpawnDelay() {
   return -Math.log(1 - Math.random()) * NPC_SPAWN_MEAN;
@@ -1555,6 +1564,16 @@ function wrapAngle(a) {
   return Math.atan2(Math.sin(a), Math.cos(a));
 }
 
+// A player just crashed into this NPC: it leans on the horn a beat later
+// (so the honk reads as the driver's reaction, not part of the crash
+// sound). One honk per incident: a repeat within NPC_ANGRY_HONK_COOLDOWN of
+// the last one -- e.g. grinding against it -- doesn't start another.
+function npcGotRammed(npc) {
+  if (npc.angryHonkIn > 0) return;
+  if (npc.lastAngryHonk !== undefined && gameTime - npc.lastAngryHonk < NPC_ANGRY_HONK_COOLDOWN) return;
+  npc.angryHonkIn = 0.35 + Math.random() * 0.4;
+}
+
 // Sets npc.drive (read by stepCar via readInput) for this step.
 function npcDrive(npc, dt) {
   const forward = { x: Math.cos(npc.angle), y: Math.sin(npc.angle) };
@@ -1568,6 +1587,16 @@ function npcDrive(npc, dt) {
   if (jolt > NPC_JOLT) {
     npc.dazedTime = NPC_DAZE_MIN + Math.random() * (NPC_DAZE_MAX - NPC_DAZE_MIN);
     npc.reverseTime = 0;
+  }
+  // A pending angry honk (see npcGotRammed). Ticks before the dazed early
+  // return below -- a rammed car is almost always dazed.
+  if (npc.angryHonkIn > 0) {
+    npc.angryHonkIn -= dt;
+    if (npc.angryHonkIn <= 0) {
+      playHornSound(npc.pos.x, npc.hornPitch, true);
+      pedestriansNotice(npc.pos.x, npc.pos.y, "honk");
+      npc.lastAngryHonk = gameTime;
+    }
   }
   if (npc.dazedTime > 0) {
     npc.dazedTime -= dt;
