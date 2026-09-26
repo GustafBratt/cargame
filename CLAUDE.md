@@ -114,7 +114,7 @@ The "Pedestrians" section sits just before the top-level `setupWorld()` call, be
 - the three collision sites, for impacts ≥ `HIT_SOUND_MIN`
 - the NPC honk
 
-Anyone within earshot (`PED_NOTICE_CRASH` 650px, `PED_NOTICE_HONK` 380px) reacts after a small random delay plus a bit of distance delay, so the crowd doesn't turn in unison. They stop, turn their head fully and their body partway toward the noise, and stare. There is deliberately no "!" over their heads; one was tried and removed on request. Big crashes hold them longer. Their dogs stare too.
+Anyone within earshot (`PED_NOTICE_CRASH` 650px, `PED_NOTICE_HONK` 380px) reacts after a small random delay plus a bit of distance delay, so the crowd doesn't turn in unison. They stop, turn their head fully and their body partway toward the noise, and stare. Parents with strollers turn their body less (0.45 rad vs 0.9). The stroller, and the hands on its handle, are drawn in the walking-direction frame (`p.facing`), not the body frame, so the stroller stays put instead of swinging around when its parent turns. There is deliberately no "!" over their heads; one was tried and removed on request. Big crashes hold them longer. Their dogs stare too.
 
 **Drawing:** they're drawn top-down in the same ink style (`drawPedestrian` and friends), right after the garage pad and before NPCs and players. `PED_SCALE` (1.2) draws them a bit bigger than true scale so details read. The proportions were tuned by inspecting a 4× magnified render: shoulders about twice the head width so the shirt shows, and feet stepping out front and back so the walk reads.
 
