@@ -31,9 +31,513 @@ window.addEventListener("keydown", (e) => {
   const k = e.key.toLowerCase();
   if (CONTROL_KEYS.has(k)) e.preventDefault();
   keys.add(k);
+  initAudio(); // browsers only allow audio after a user gesture, see the Sound section
 });
 window.addEventListener("keyup", (e) => keys.delete(e.key.toLowerCase()));
 window.addEventListener("blur", () => keys.clear());
+
+// ---------------------------------------------------------------------------
+// Sound
+// ---------------------------------------------------------------------------
+// Every sound is synthesized with the Web Audio API -- no audio files, same
+// no-assets/no-build spirit as the rest of the game.
+//
+// Collisions draw from a library of 12 pre-rendered sounds (see
+// COLLISION_RECIPES), 4 per energy tier. Each hit picks a random one from
+// its tier and plays it with a little pitch/volume variation, panned to
+// where it happened. The coin and parking sounds are short enough to just
+// synthesize live.
+//
+// Browsers only allow audio after a user gesture, so the AudioContext is
+// created on the first keydown (the game is keyboard-only anyway). Until
+// then -- and in environments with no Web Audio at all -- every play
+// function is a silent no-op.
+
+let audio = null; // { ctx, master, library } once unlocked; library fills in asynchronously
+
+function initAudio() {
+  if (audio) {
+    if (audio.ctx.state === "suspended") audio.ctx.resume();
+    return;
+  }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;
+  const ctx = new AC();
+  const master = ctx.createGain();
+  master.gain.value = 0.55;
+  master.connect(ctx.destination);
+  audio = { ctx, master, library: null };
+  buildCollisionLibrary(ctx.sampleRate).then((lib) => { audio.library = lib; });
+}
+
+function audioReady() {
+  return audio !== null && audio.ctx.state === "running";
+}
+
+// Left/right placement from a world x (kept away from hard-panned extremes).
+function panFor(x) {
+  return clamp((x / W) * 2 - 1, -1, 1) * 0.7;
+}
+
+// ---- Synthesis primitives --------------------------------------------------
+// Each schedules nodes on any BaseAudioContext `c` (live or offline) into
+// `dest`, starting at time t0.
+
+function noiseBuffer(c, dur) {
+  const len = Math.max(1, Math.ceil(dur * c.sampleRate));
+  const buf = c.createBuffer(1, len, c.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  return buf;
+}
+
+// Percussive envelope: quick attack, exponential decay to silence.
+function envGain(c, t0, peak, attack, dur) {
+  const g = c.createGain();
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.linearRampToValueAtTime(peak, t0 + attack);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  return g;
+}
+
+// Filtered noise burst: the crunch/scrape/whoosh ingredient.
+function sfxNoise(c, dest, t0, { dur, freq, q = 1, type = "bandpass", gain = 1, attack = 0.002, sweepTo }) {
+  const src = c.createBufferSource();
+  src.buffer = noiseBuffer(c, dur);
+  const f = c.createBiquadFilter();
+  f.type = type;
+  f.Q.value = q;
+  f.frequency.setValueAtTime(freq, t0);
+  if (sweepTo) f.frequency.exponentialRampToValueAtTime(sweepTo, t0 + dur);
+  src.connect(f).connect(envGain(c, t0, gain, attack, dur)).connect(dest);
+  src.start(t0);
+  src.stop(t0 + dur);
+}
+
+// Pitched tone with an optional glide: thumps (sine, falling), bleeps, notes.
+function sfxTone(c, dest, t0, { freq, freqTo, dur, type = "sine", gain = 1, attack = 0.003 }) {
+  const o = c.createOscillator();
+  o.type = type;
+  o.frequency.setValueAtTime(freq, t0);
+  if (freqTo) o.frequency.exponentialRampToValueAtTime(freqTo, t0 + dur);
+  o.connect(envGain(c, t0, gain, attack, dur)).connect(dest);
+  o.start(t0);
+  o.stop(t0 + dur);
+}
+
+// Body-panel "clang": a cluster of inharmonic partials, optionally bending
+// down in pitch (a panel buckling).
+function sfxMetal(c, dest, t0, { base, dur, gain = 1, bend = 1, ratios = [1, 1.47, 2.09, 2.76, 3.43] }) {
+  ratios.forEach((r, i) => {
+    sfxTone(c, dest, t0, {
+      freq: base * r,
+      freqTo: bend !== 1 ? base * r * bend : undefined,
+      dur: dur * (1 - i * 0.12),
+      type: i % 2 ? "triangle" : "sine",
+      gain: gain / (1 + i * 0.6),
+    });
+  });
+}
+
+// Scattered tiny high pings: breaking glass / trim bits.
+function sfxGlass(c, dest, t0, { count, spread, gain = 0.4 }) {
+  for (let i = 0; i < count; i++) {
+    const t = t0 + Math.random() * spread;
+    sfxTone(c, dest, t, { freq: 2600 + Math.random() * 3800, dur: 0.05 + Math.random() * 0.08, gain: gain * (0.5 + Math.random() * 0.5) });
+  }
+}
+
+// Scattered short noise ticks: debris skittering / rattling.
+function sfxRattle(c, dest, t0, { count, spread, gain = 0.5, freq = 1800 }) {
+  for (let i = 0; i < count; i++) {
+    const t = t0 + Math.random() * spread;
+    sfxNoise(c, dest, t, { dur: 0.015 + Math.random() * 0.03, freq: freq * (0.6 + Math.random() * 0.9), q: 3, gain: gain * (0.4 + Math.random() * 0.6) });
+  }
+}
+
+// ---- Collision library -----------------------------------------------------
+
+// A "whump": rumbling noise sweeping downward, band-limited to the "body"
+// range -- the core of a heavy impact. Noise rather than a pure tone on
+// purpose: clean falling sine tones read as a wood block or toy ("banging
+// two pencils together"), while a noisy low-mid rumble reads as a ton of
+// car. The highpass keeps it out of the sub range (see COLLISION_FX).
+function sfxWhump(c, dest, t0, { from, to, dur, gain = 1 }) {
+  const src = c.createBufferSource();
+  src.buffer = noiseBuffer(c, dur);
+  const lp = c.createBiquadFilter();
+  lp.type = "lowpass";
+  lp.Q.value = 0.9;
+  lp.frequency.setValueAtTime(from, t0);
+  lp.frequency.exponentialRampToValueAtTime(to, t0 + dur);
+  const hp = c.createBiquadFilter();
+  hp.type = "highpass";
+  hp.frequency.value = 90;
+  src.connect(lp).connect(hp).connect(envGain(c, t0, gain, 0.006, dur)).connect(dest);
+  src.start(t0);
+  src.stop(t0 + dur);
+}
+
+// 12 collision sounds, 4 per tier. Each recipe builds one sound into an
+// offline context; buildCollisionLibrary renders them all once at unlock and
+// normalizes them, so loudness differences come only from the tier volume
+// in HIT_TIERS (and the in-tier impact speed), not from how a recipe
+// happened to sum.
+//
+// They're built to sound HEAVY. The first pass sounded like "banging two
+// pencils together"; measuring it showed the problem was character, not a
+// lack of bass: short (0.1-0.45s), tonal (clean falling sines), dry. A
+// second pass overcorrected into sub-bass (up to 95% of energy below 90 Hz),
+// which laptop speakers can't play and which, after peak normalization,
+// made the audible part quieter. So:
+//  - energy lives in the ~100-500 Hz "body" band: noisy whumps, thumps that
+//    start ~110-150 Hz, low sheet metal (80-200 Hz) that rings and bends
+//    down as it buckles
+//  - COLLISION_FX high-passes everything at 70 Hz (sub rumble is inaudible
+//    on small speakers and only eats headroom), saturates for harmonics,
+//    and adds a synthetic room tail for size
+//  - long: light hits stay audible ~0.2s+, medium ~0.45s+, heavy ~1s+
+// Re-measure (sub/body/click band split + audible duration) after retuning.
+const COLLISION_FX = {
+  light: { drive: 1.8, room: 0.35 },
+  medium: { drive: 2.5, room: 0.45 },
+  heavy: { drive: 3.2, room: 0.55 },
+};
+
+const COLLISION_RECIPES = {
+  light: [
+    { name: "thunk", dur: 0.9, build: (c, o) => {
+      sfxWhump(c, o, 0, { from: 450, to: 180, dur: 0.6 });
+      sfxTone(c, o, 0, { freq: 130, freqTo: 75, dur: 0.45, gain: 0.45 });
+      sfxMetal(c, o, 0, { base: 165, dur: 0.5, gain: 0.25, ratios: [1, 1.41, 2.13] });
+    } },
+    { name: "bump", dur: 0.9, build: (c, o) => {
+      sfxWhump(c, o, 0, { from: 380, to: 160, dur: 0.65 });
+      sfxNoise(c, o, 0, { dur: 0.08, freq: 900, type: "lowpass", gain: 0.3 }); // contact scuff
+      sfxTone(c, o, 0, { freq: 120, freqTo: 70, dur: 0.5, gain: 0.4 });
+    } },
+    { name: "knock", dur: 0.9, build: (c, o) => {
+      sfxWhump(c, o, 0, { from: 520, to: 200, dur: 0.5 });
+      sfxMetal(c, o, 0, { base: 200, dur: 0.6, gain: 0.35, bend: 0.95, ratios: [1, 1.53] });
+      sfxTone(c, o, 0, { freq: 140, freqTo: 80, dur: 0.4, gain: 0.4 });
+    } },
+    { name: "scuff", dur: 0.9, build: (c, o) => {
+      sfxNoise(c, o, 0, { dur: 0.35, freq: 1300, sweepTo: 450, type: "lowpass", gain: 0.5, attack: 0.012 }); // rub
+      sfxWhump(c, o, 0, { from: 400, to: 170, dur: 0.6, gain: 0.9 });
+    } },
+  ],
+  medium: [
+    { name: "clunk", dur: 1.4, build: (c, o) => {
+      sfxWhump(c, o, 0, { from: 650, to: 170, dur: 0.9 });
+      sfxTone(c, o, 0, { freq: 125, freqTo: 65, dur: 0.6, gain: 0.5 });
+      sfxMetal(c, o, 0.005, { base: 125, dur: 1.0, gain: 0.5, bend: 0.85 });
+      sfxNoise(c, o, 0, { dur: 0.35, freq: 1500, sweepTo: 500, type: "lowpass", gain: 0.45 });
+    } },
+    { name: "crunch", dur: 1.4, build: (c, o) => {
+      sfxNoise(c, o, 0, { dur: 0.7, freq: 1700, sweepTo: 400, type: "lowpass", gain: 0.8, attack: 0.005 });
+      sfxRattle(c, o, 0.03, { count: 9, spread: 0.45, gain: 0.3, freq: 800 });
+      sfxWhump(c, o, 0, { from: 600, to: 160, dur: 0.85 });
+      sfxTone(c, o, 0, { freq: 115, freqTo: 60, dur: 0.55, gain: 0.45 });
+    } },
+    { name: "dent", dur: 1.4, build: (c, o) => {
+      sfxMetal(c, o, 0, { base: 110, dur: 1.2, gain: 0.7, bend: 0.72 });
+      sfxWhump(c, o, 0, { from: 520, to: 150, dur: 0.8 });
+      sfxNoise(c, o, 0, { dur: 0.7, freq: 220, q: 3, gain: 0.6 }); // panel "boom"
+    } },
+    { name: "bang", dur: 1.4, build: (c, o) => {
+      sfxWhump(c, o, 0, { from: 750, to: 180, dur: 0.8 });
+      sfxTone(c, o, 0, { freq: 120, freqTo: 60, dur: 0.6, gain: 0.5 });
+      sfxNoise(c, o, 0, { dur: 0.45, freq: 1200, sweepTo: 350, type: "lowpass", gain: 0.55 });
+      sfxRattle(c, o, 0.05, { count: 5, spread: 0.4, gain: 0.25, freq: 700 });
+    } },
+  ],
+  heavy: [
+    { name: "crash", dur: 2.2, build: (c, o) => {
+      sfxWhump(c, o, 0, { from: 900, to: 150, dur: 1.4 });
+      sfxTone(c, o, 0, { freq: 110, freqTo: 55, dur: 0.9, gain: 0.5 });
+      sfxNoise(c, o, 0, { dur: 1.5, freq: 2400, sweepTo: 220, type: "lowpass", gain: 0.8 });
+      sfxMetal(c, o, 0.01, { base: 100, dur: 1.6, gain: 0.6, bend: 0.65 });
+      sfxGlass(c, o, 0.08, { count: 6, spread: 0.7, gain: 0.15 });
+      sfxRattle(c, o, 0.15, { count: 12, spread: 1.1, gain: 0.3, freq: 900 });
+    } },
+    { name: "smash", dur: 2.2, build: (c, o) => {
+      sfxMetal(c, o, 0, { base: 90, dur: 1.7, gain: 0.8, bend: 0.6 });
+      sfxMetal(c, o, 0.02, { base: 150, dur: 1.3, gain: 0.45, bend: 0.7 });
+      sfxWhump(c, o, 0, { from: 850, to: 150, dur: 1.2 });
+      sfxTone(c, o, 0, { freq: 105, freqTo: 52, dur: 0.8, gain: 0.5 });
+      sfxRattle(c, o, 0.1, { count: 18, spread: 1.2, gain: 0.3, freq: 800 });
+    } },
+    { name: "wreck", dur: 2.2, build: (c, o) => {
+      // two-stage: the hit, then the car body settling a beat later
+      sfxWhump(c, o, 0, { from: 800, to: 150, dur: 0.9 });
+      sfxTone(c, o, 0, { freq: 115, freqTo: 55, dur: 0.6, gain: 0.5 });
+      sfxWhump(c, o, 0.14, { from: 600, to: 130, dur: 1.1, gain: 0.85 });
+      sfxTone(c, o, 0.14, { freq: 100, freqTo: 50, dur: 0.7, gain: 0.45 });
+      sfxNoise(c, o, 0.14, { dur: 1.4, freq: 2000, sweepTo: 200, type: "lowpass", gain: 0.7 });
+      sfxGlass(c, o, 0.2, { count: 5, spread: 0.6, gain: 0.15 });
+    } },
+    { name: "pileup", dur: 2.2, build: (c, o) => {
+      // three staggered impacts, like a chain reaction
+      [[0, 1], [0.1, 0.85], [0.24, 0.75]].forEach(([t, g]) => {
+        sfxWhump(c, o, t, { from: 750, to: 150, dur: 1.0, gain: g });
+        sfxTone(c, o, t, { freq: 110, freqTo: 55, dur: 0.6, gain: g * 0.45 });
+      });
+      sfxMetal(c, o, 0, { base: 85, dur: 1.8, gain: 0.6, bend: 0.6 });
+      sfxRattle(c, o, 0.15, { count: 22, spread: 1.4, gain: 0.3, freq: 750 });
+    } },
+  ],
+};
+
+// tanh soft-clip curve: `drive` > 1 pushes loud parts into saturation.
+function driveCurve(drive) {
+  const n = 1024, curve = new Float32Array(n), norm = Math.tanh(drive);
+  for (let i = 0; i < n; i++) {
+    const x = (i / (n - 1)) * 2 - 1;
+    curve[i] = Math.tanh(drive * x) / norm;
+  }
+  return curve;
+}
+
+// Impulse response for a small, dull "room": decaying noise, low-passed so
+// the tail is warm rather than hissy.
+function roomIR(c, seconds) {
+  const len = Math.ceil(seconds * c.sampleRate);
+  const buf = c.createBuffer(1, len, c.sampleRate);
+  const d = buf.getChannelData(0);
+  let y = 0;
+  for (let i = 0; i < len; i++) {
+    y += 0.2 * ((Math.random() * 2 - 1) - y);
+    d[i] = y * Math.pow(1 - i / len, 2);
+  }
+  return buf;
+}
+
+// Signal chain: recipe -> 70 Hz highpass -> saturation -> dry + room tail.
+function renderSfx(sampleRate, recipe, fx) {
+  const oc = new OfflineAudioContext(1, Math.ceil(recipe.dur * sampleRate), sampleRate);
+  const bus = oc.createGain();
+  const hp = oc.createBiquadFilter();
+  hp.type = "highpass";
+  hp.frequency.value = 70;
+  const shaper = oc.createWaveShaper();
+  shaper.curve = driveCurve(fx.drive);
+  shaper.oversample = "2x";
+  bus.connect(hp).connect(shaper);
+  shaper.connect(oc.destination); // dry
+  const room = oc.createConvolver();
+  room.buffer = roomIR(oc, 0.9);
+  const wet = oc.createGain();
+  wet.gain.value = fx.room;
+  shaper.connect(room).connect(wet).connect(oc.destination);
+  recipe.build(oc, bus);
+  return oc.startRendering().then((buf) => {
+    const d = buf.getChannelData(0);
+    let peak = 0;
+    for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i]));
+    if (peak > 0) for (let i = 0; i < d.length; i++) d[i] *= 0.9 / peak;
+    return buf;
+  });
+}
+
+async function buildCollisionLibrary(sampleRate) {
+  const lib = {};
+  for (const [tier, recipes] of Object.entries(COLLISION_RECIPES)) {
+    lib[tier] = await Promise.all(recipes.map((r) => renderSfx(sampleRate, r, COLLISION_FX[tier])));
+  }
+  return lib;
+}
+
+// Impact speed (closing speed along the contact normal, px/s) -> tier.
+// For scale: DAMAGE_THRESHOLD is 70, a hard ram is ~300.
+//
+// Two rules decide whether a contact makes a sound:
+//  - Any car: an impact at HIT_SOUND_MIN or harder always sounds.
+//  - Player cars only: the FIRST touch of any obstacle sounds, however slow
+//    (a parking nudge, easing onto the curb) -- quietly, scaled by speed
+//    (TOUCH_VOLUME_MIN at a dead-slow touch). Continued contact after that
+//    stays silent below HIT_SOUND_MIN, so resting against the curb doesn't
+//    tick every frame. Traffic keeps only the speed rule, so distant NPC
+//    scrapes don't clutter the mix.
+const HIT_SOUND_MIN = 45;
+const HIT_TIERS = [
+  { name: "light", upTo: 130, volume: 0.35 },
+  { name: "medium", upTo: 260, volume: 0.6 },
+  { name: "heavy", upTo: 420, volume: 0.9 }, // upTo here only caps the in-tier volume ramp
+];
+const TOUCH_VOLUME_MIN = 0.12;
+const HIT_SOUND_COOLDOWN = 0.09; // s; per car, unless the new hit is a higher tier
+// A contact counts as "new" only after the car has been clear of that
+// obstacle this long -- contact flickers on/off step to step when resting
+// against something, and each flicker must not count as a fresh touch.
+const TOUCH_GAP = 0.25; // s
+
+function isPlayer(car) {
+  return car === car1 || car === car2;
+}
+
+// Records that `car` is touching `key` (a crate/parked-car/other-car object,
+// or "wall"/"curb") this step; returns true if it's a new touch.
+function isNewTouch(car, key) {
+  if (!car.contacts) car.contacts = new Map();
+  const last = car.contacts.get(key);
+  car.contacts.set(key, gameTime);
+  return last === undefined || gameTime - last > TOUCH_GAP;
+}
+
+// Called from every collision site on every step of contact, with the
+// closing speed (0 for resting contact) and whether it's a new touch.
+// The per-car cooldown throttles repeats: grinding contact can register a
+// run of small impacts step after step, which would otherwise machine-gun.
+function collisionSound(speed, x, car, newTouch) {
+  if (!audioReady() || !audio.library) return;
+  const soft = speed < HIT_SOUND_MIN;
+  if (soft && !(newTouch && isPlayer(car))) return;
+  const tierIdx = HIT_TIERS.findIndex((t) => speed < t.upTo);
+  const ti = soft ? 0 : tierIdx === -1 ? HIT_TIERS.length - 1 : tierIdx;
+  const tier = HIT_TIERS[ti];
+  const now = audio.ctx.currentTime;
+  if (car.hitSoundAt !== undefined && now - car.hitSoundAt < HIT_SOUND_COOLDOWN && ti <= car.hitSoundTier) return;
+  car.hitSoundAt = now;
+  car.hitSoundTier = ti;
+
+  let volume;
+  if (soft) {
+    // gentle first touch: from barely-there up to where the light tier starts
+    volume = TOUCH_VOLUME_MIN + (tier.volume * 0.7 - TOUCH_VOLUME_MIN) * (speed / HIT_SOUND_MIN);
+  } else {
+    const lo = ti === 0 ? HIT_SOUND_MIN : HIT_TIERS[ti - 1].upTo;
+    volume = tier.volume * (0.7 + 0.3 * clamp((speed - lo) / (tier.upTo - lo), 0, 1));
+  }
+  const choices = audio.library[tier.name];
+  playBuffer(choices[Math.floor(Math.random() * choices.length)], {
+    volume,
+    rate: 0.9 + Math.random() * 0.2,
+    pan: panFor(x),
+  });
+}
+
+function playBuffer(buf, { volume, rate, pan }) {
+  const ac = audio.ctx;
+  const src = ac.createBufferSource();
+  src.buffer = buf;
+  src.playbackRate.value = rate;
+  const g = ac.createGain();
+  g.gain.value = volume;
+  const p = ac.createStereoPanner();
+  p.pan.value = pan;
+  src.connect(g).connect(p).connect(audio.master);
+  src.start();
+}
+
+// ---- Coin and parking sounds (synthesized live) ---------------------------
+
+// Routes a live-synthesized sound through its own volume + pan into master.
+// Volumes are balanced against the collision tiers by measured peak level:
+// coin pickup (~0.37) and parking (~0.65) sit clearly above a light bump
+// (~0.3), so the rewards never lose to a fender-tap; the spawn whoosh is
+// quieter, as ambience.
+function liveSfx(x, volume, build) {
+  if (!audioReady()) return;
+  const ac = audio.ctx;
+  const g = ac.createGain();
+  g.gain.value = volume;
+  const p = ac.createStereoPanner();
+  p.pan.value = panFor(x);
+  g.connect(p).connect(audio.master);
+  build(ac, g, ac.currentTime + 0.01);
+}
+
+// Reverse whoosh that swells over the implosion animation, then a pop right
+// as the coin appears (timed to COIN_IMPLODE_TIME).
+function playCoinSpawnSound(x) {
+  liveSfx(x, 0.6, (c, o, t) => {
+    const src = c.createBufferSource();
+    src.buffer = noiseBuffer(c, COIN_IMPLODE_TIME);
+    const f = c.createBiquadFilter();
+    f.type = "bandpass";
+    f.Q.value = 4;
+    f.frequency.setValueAtTime(300, t);
+    f.frequency.exponentialRampToValueAtTime(3200, t + COIN_IMPLODE_TIME);
+    const g = c.createGain(); // crescendo: a reversed explosion swells in, then cuts off
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.8, t + COIN_IMPLODE_TIME - 0.02);
+    g.gain.linearRampToValueAtTime(0.0001, t + COIN_IMPLODE_TIME);
+    src.connect(f).connect(g).connect(o);
+    src.start(t);
+    src.stop(t + COIN_IMPLODE_TIME);
+    sfxTone(c, o, t + COIN_IMPLODE_TIME, { freq: 520, freqTo: 1250, dur: 0.12, type: "triangle", gain: 0.9 });
+  });
+}
+
+// Classic two-note "ka-ching".
+function playCoinPickupSound(x) {
+  liveSfx(x, 1.0, (c, o, t) => {
+    sfxTone(c, o, t, { freq: 988, dur: 0.09, type: "square", gain: 0.35 });
+    sfxTone(c, o, t + 0.075, { freq: 1319, dur: 0.35, type: "square", gain: 0.35 });
+    sfxTone(c, o, t + 0.075, { freq: 2638, dur: 0.25, gain: 0.2 }); // shimmer
+  });
+}
+
+// Successful park: a rising cartoon arpeggio, then firework pops and crackle
+// to go with spawnFirework's two-stage burst.
+function playParkedSound(x) {
+  liveSfx(x, 0.9, (c, o, t) => {
+    [523, 659, 784, 1047].forEach((f, i) => {
+      sfxTone(c, o, t + i * 0.08, { freq: f, dur: i === 3 ? 0.4 : 0.12, type: "triangle", gain: 0.6 });
+    });
+    sfxNoise(c, o, t, { dur: 0.15, freq: 900, q: 0.7, gain: 0.7 }); // the pop
+    sfxTone(c, o, t, { freq: 180, freqTo: 60, dur: 0.15, gain: 0.6 });
+    sfxRattle(c, o, t + 0.18, { count: 14, spread: 0.5, gain: 0.35, freq: 3000 }); // crackle
+  });
+}
+
+// Garage repair: a quick ratchet whir, a wrench clank, then a bright
+// two-note "ta-da" as the dents vanish.
+function playRepairSound(x) {
+  liveSfx(x, 0.8, (c, o, t) => {
+    for (let i = 0; i < 9; i++) {
+      // ratchet: evenly spaced clicks, rising in pitch as it tightens
+      sfxNoise(c, o, t + i * 0.035, { dur: 0.02, freq: 2200 + i * 180, q: 6, gain: 0.7 });
+    }
+    sfxMetal(c, o, t + 0.34, { base: 620, dur: 0.25, gain: 0.5, ratios: [1, 1.52, 2.31] });
+    sfxTone(c, o, t + 0.5, { freq: 784, dur: 0.12, type: "triangle", gain: 0.6 });
+    sfxTone(c, o, t + 0.62, { freq: 1175, dur: 0.4, type: "triangle", gain: 0.6 });
+    sfxTone(c, o, t + 0.62, { freq: 2350, dur: 0.3, gain: 0.15 }); // sparkle
+  });
+}
+
+// An NPC car horn: two detuned sawtooth tones a third apart through a
+// lowpass (the classic two-note car-horn chord), with a sustained envelope.
+// `pitch` varies per car so different cars sound different. Randomly one
+// long honk or a double "beep-beep".
+function playHornSound(x, pitch) {
+  // Peak ~0.12: well under a light bump on paper, because a sustained tone
+  // sounds much louder than a short percussive hit at the same peak (and
+  // was lowered again after playtesting found the honks too loud).
+  liveSfx(x, 0.16, (c, o, t) => {
+    const pattern = Math.random() < 0.5 ? [[0, 0.42]] : [[0, 0.13], [0.2, 0.22]];
+    for (const [start, len] of pattern) {
+      const t0 = t + start;
+      const f = c.createBiquadFilter();
+      f.type = "lowpass";
+      f.frequency.value = 1900;
+      const g = c.createGain();
+      g.gain.setValueAtTime(0.0001, t0);
+      g.gain.linearRampToValueAtTime(0.5, t0 + 0.015);
+      g.gain.setValueAtTime(0.5, t0 + len - 0.03);
+      g.gain.linearRampToValueAtTime(0.0001, t0 + len);
+      f.connect(g).connect(o);
+      for (const base of [370, 466]) {
+        const osc = c.createOscillator();
+        osc.type = "sawtooth";
+        osc.frequency.value = base * pitch;
+        osc.connect(f);
+        osc.start(t0);
+        osc.stop(t0 + len + 0.01);
+      }
+    }
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Car physics
@@ -285,37 +789,38 @@ function resolveWalls(car) {
   const b = CAR.wallBounce;
   if (car.pos.x - r < 0) {
     car.pos.x = r;
-    if (car.vel.x < 0) applyDamage(car, -car.vel.x, { x: 0, y: car.pos.y });
+    boundaryHit(car, Math.max(0, -car.vel.x), { x: 0, y: car.pos.y }, "wall");
     car.vel.x = Math.abs(car.vel.x) * b;
     car.angularVel *= 0.5;
   } else if (car.pos.x + r > W) {
     car.pos.x = W - r;
-    if (car.vel.x > 0) applyDamage(car, car.vel.x, { x: W, y: car.pos.y });
+    boundaryHit(car, Math.max(0, car.vel.x), { x: W, y: car.pos.y }, "wall");
     car.vel.x = -Math.abs(car.vel.x) * b;
     car.angularVel *= 0.5;
   }
   if (car.pos.y - r < 0) {
     car.pos.y = r;
-    if (car.vel.y < 0) applyDamage(car, -car.vel.y, { x: car.pos.x, y: 0 });
+    boundaryHit(car, Math.max(0, -car.vel.y), { x: car.pos.x, y: 0 }, "wall");
     car.vel.y = Math.abs(car.vel.y) * b;
     car.angularVel *= 0.5;
   } else if (car.pos.y + r > H) {
     car.pos.y = H - r;
-    if (car.vel.y > 0) applyDamage(car, car.vel.y, { x: car.pos.x, y: H });
+    boundaryHit(car, Math.max(0, car.vel.y), { x: car.pos.x, y: H }, "wall");
     car.vel.y = -Math.abs(car.vel.y) * b;
     car.angularVel *= 0.5;
   }
 }
 
-// Returns the closing speed along the contact normal (0 if the circles
-// weren't touching or were already separating) -- how hard the hit was, for
-// collision damage.
+// Returns -1 if the circles aren't touching at all; otherwise the closing
+// speed along the contact normal (0 if touching but already separating) --
+// how hard the hit was, for collision damage and sound. Callers use `>= 0`
+// to mean "in contact" (contact sounds) and `> 0` to mean "an impact".
 function resolveCircles(aPos, aVel, aR, bPos, bVel, bR, bStatic, restitution) {
   const dx = bPos.x - aPos.x;
   const dy = bPos.y - aPos.y;
   const dist = Math.hypot(dx, dy) || 0.001;
   const overlap = aR + bR - dist;
-  if (overlap <= 0) return 0;
+  if (overlap <= 0) return -1;
 
   const nx = dx / dist, ny = dy / dist;
   const pushA = bStatic ? overlap : overlap / 2;
@@ -364,10 +869,6 @@ function applyCollisionSpin(car, r, velBefore) {
   );
 }
 
-// Collides a car's capsule against a single static circle (a crate, or one
-// end of a parked car's capsule), feeding the resulting push/impulse back
-// into the car's actual pos/vel (each capsule circle is a fixed offset from
-// the car center, so a pure translation of the center moves both).
 // Point on circle `from`'s rim facing `toward` -- where a collision touched.
 function contactPoint(from, toward, radius) {
   const dx = toward.x - from.x, dy = toward.y - from.y;
@@ -375,25 +876,33 @@ function contactPoint(from, toward, radius) {
   return { x: from.x + (dx / d) * radius, y: from.y + (dy / d) * radius };
 }
 
-function resolveCarVsStaticCircle(car, obstaclePos, obstacleR) {
+// Collides a car's capsule against a single static circle (a crate, or one
+// end of a parked car's capsule), feeding the resulting push/impulse back
+// into the car's actual pos/vel (each capsule circle is a fixed offset from
+// the car center, so a pure translation of the center moves both).
+// `key` identifies the obstacle for contact-sound tracking (isNewTouch).
+function resolveCarVsStaticCircle(car, obstaclePos, obstacleR, key) {
   // Both capsule circles can register the same hit; damage is taken once,
   // from the harder of the two.
-  let hit = 0, hitAt = null;
+  let hit = 0, hitAt = null, touched = false;
   for (const r of capsuleOffsets(car.angle)) {
     const c = { x: car.pos.x + r.x, y: car.pos.y + r.y };
     const posBefore = { x: c.x, y: c.y };
     const velBefore = { x: car.vel.x, y: car.vel.y };
     const s = resolveCircles(c, car.vel, CAR.capsuleRadius, obstaclePos, null, obstacleR, true, CAR.obstacleCollisionRestitution);
+    if (s >= 0) touched = true;
     if (s > hit) { hit = s; hitAt = contactPoint(c, obstaclePos, CAR.capsuleRadius); }
     car.pos.x += c.x - posBefore.x;
     car.pos.y += c.y - posBefore.y;
     applyCollisionSpin(car, r, velBefore);
   }
+  if (!touched) return;
   if (hitAt) applyDamage(car, hit, hitAt);
+  collisionSound(hit, (hitAt || obstaclePos).x, car, isNewTouch(car, key));
 }
 
 function resolveCarVsCar(carA, carB) {
-  let hit = 0, hitAtA = null, hitAtB = null;
+  let hit = 0, hitAtA = null, hitAtB = null, touched = false;
   for (const rA of capsuleOffsets(carA.angle)) {
     for (const rB of capsuleOffsets(carB.angle)) {
       const a = { x: carA.pos.x + rA.x, y: carA.pos.y + rA.y };
@@ -401,6 +910,7 @@ function resolveCarVsCar(carA, carB) {
       const posBeforeA = { x: a.x, y: a.y }, posBeforeB = { x: b.x, y: b.y };
       const velBeforeA = { x: carA.vel.x, y: carA.vel.y }, velBeforeB = { x: carB.vel.x, y: carB.vel.y };
       const s = resolveCircles(a, carA.vel, CAR.capsuleRadius, b, carB.vel, CAR.capsuleRadius, false, CAR.carCollisionRestitution);
+      if (s >= 0) touched = true;
       if (s > hit) {
         hit = s;
         hitAtA = contactPoint(a, b, CAR.capsuleRadius);
@@ -412,10 +922,26 @@ function resolveCarVsCar(carA, carB) {
       applyCollisionSpin(carB, rB, velBeforeB);
     }
   }
+  if (!touched) return;
   if (hitAtA) {
     applyDamage(carA, hit, hitAtA);
     applyDamage(carB, hit, hitAtB);
   }
+  // Track the contact on both cars, but play one sound for the pair, voiced
+  // by a player if one is involved (so the player "first touch" rule applies).
+  const newA = isNewTouch(carA, carB), newB = isNewTouch(carB, carA);
+  const voice = isPlayer(carA) || !isPlayer(carB) ? carA : carB;
+  const x = hitAtA ? hitAtA.x : (carA.pos.x + carB.pos.x) / 2;
+  collisionSound(hit, x, voice, voice === carA ? newA : newB);
+}
+
+// A car in contact with the arena wall or the curb: same damage + sound as
+// any other collision, just without a second body to push against. Called
+// on every step of contact (speed 0 when not moving into it), so contact
+// tracking sees resting contact as continuous.
+function boundaryHit(car, speed, point, key) {
+  applyDamage(car, speed, point);
+  collisionSound(speed, point.x, car, isNewTouch(car, key));
 }
 
 // ---------------------------------------------------------------------------
@@ -616,6 +1142,7 @@ const COIN_POP_TIME = 0.25; // seconds of the overshoot "pop" scale-in after tha
 function spawnCoin() {
   coin = { ...randomCoinPos(), age: 0, popped: false };
   spawnImplosion(coin.x, coin.y);
+  playCoinSpawnSound(coin.x);
 }
 
 // coin.age drives both the draw (drawCoin) and collectability (updateCoinRace).
@@ -680,6 +1207,7 @@ function updateGarage() {
     if (car.score < REPAIR_COST) continue;
     car.score -= REPAIR_COST;
     repairCar(car);
+    playRepairSound(car.pos.x);
     spawnFirework(car.pos.x, car.pos.y, "#7dffa0");
   }
 }
@@ -690,6 +1218,7 @@ function updateCoinRace() {
     if (Math.hypot(car.pos.x - coin.x, car.pos.y - coin.y) < PICKUP_DIST) {
       car.score++;
       car.gameState = "mustPark";
+      playCoinPickupSound(car.pos.x);
       spawnCoin();
       break;
     }
@@ -699,6 +1228,7 @@ function updateCoinRace() {
     if (car.gameState === "mustPark" && isParked(car)) {
       car.gameState = "seekCoin";
       spawnFirework(car.pos.x, car.pos.y, car.color);
+      playParkedSound(car.pos.x);
     }
   }
 }
@@ -839,6 +1369,10 @@ const NPC_LOST_SPEED = 55; // px/s, cautious crawl while well off the lane or tu
 const NPC_LANE_ERR_OK = 15; // px
 const NPC_LOST_LANE_ERR = 70; // px
 const NPC_COLORS = ["#ffffff", "#e8514a", "#6cc24a", "#8c6fd6", "#f2e14b", "#ea7fbf"];
+// Horn: honk after being blocked by a car this long, then repeat at a
+// random interval in [MIN, MAX] while still blocked.
+const NPC_HONK_DELAY = 0.7; // s
+const NPC_HONK_REPEAT_MIN = 2.5, NPC_HONK_REPEAT_MAX = 4.5; // s
 
 function nextNpcSpawnDelay() {
   return -Math.log(1 - Math.random()) * NPC_SPAWN_MEAN;
@@ -867,6 +1401,9 @@ function spawnNpc() {
   npc.reverseTime = 0;
   npc.dazedTime = 0;
   npc.prevVel = { x: npc.vel.x, y: npc.vel.y };
+  npc.blockedTime = 0;
+  npc.nextHonkAt = NPC_HONK_DELAY;
+  npc.hornPitch = 0.85 + Math.random() * 0.33; // every car's horn sounds a bit different
   npcs.push(npc);
   return true;
 }
@@ -920,6 +1457,19 @@ function npcDrive(npc, dt) {
       blockerSide = side;
       break;
     }
+  }
+
+  // Obstructed by a car in its path: lean on the horn after a moment, then
+  // again every few seconds for as long as it stays stuck.
+  if (blocked) {
+    npc.blockedTime += dt;
+    if (npc.blockedTime >= npc.nextHonkAt) {
+      playHornSound(npc.pos.x, npc.hornPitch);
+      npc.nextHonkAt = npc.blockedTime + NPC_HONK_REPEAT_MIN + Math.random() * (NPC_HONK_REPEAT_MAX - NPC_HONK_REPEAT_MIN);
+    }
+  } else {
+    npc.blockedTime = 0;
+    npc.nextHonkAt = NPC_HONK_DELAY;
   }
 
   let throttle;
@@ -1022,7 +1572,7 @@ function resolveCurb(car) {
   const limit = street.curbY - CAR.capsuleRadius;
   if (car.pos.y > limit) {
     car.pos.y = limit;
-    if (car.vel.y > 0) applyDamage(car, car.vel.y, { x: car.pos.x, y: street.curbY });
+    boundaryHit(car, Math.max(0, car.vel.y), { x: car.pos.x, y: street.curbY }, "curb");
     car.vel.y = -Math.abs(car.vel.y) * 0.4;
     car.angularVel *= 0.5;
   }
@@ -1042,9 +1592,10 @@ function update(dt) {
 
   for (const car of movers) {
     resolveCurb(car);
-    for (const c of crates) resolveCarVsStaticCircle(car, { x: c.x, y: c.y }, c.r);
+    for (const c of crates) resolveCarVsStaticCircle(car, { x: c.x, y: c.y }, c.r, c);
     for (const pc of street.parkedCars) {
-      for (const cc of pc.collisionCircles) resolveCarVsStaticCircle(car, cc, CAR.capsuleRadius);
+      // both ends of a parked car share one contact key: touching it is one touch
+      for (const cc of pc.collisionCircles) resolveCarVsStaticCircle(car, cc, CAR.capsuleRadius, pc);
     }
   }
   for (let i = 0; i < movers.length; i++) {

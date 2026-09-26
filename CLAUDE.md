@@ -126,6 +126,39 @@ Wheels keep a light center stripe (`drawWheel`) so steering direction stays legi
 
 **Dynamic layers:** after the static layer, `render()` draws `drawParkingTargets`, `drawGaragePad` (pad, pulse, flash, wrench and coin), NPCs, the coin, the players, then particles. Particle lines are drawn with `inkedStroke` (a fat ink pass, then the color). The pale sparks and flash were tuned for the old dark background and nearly vanished on the light one until they got outlines, and the flash was switched from white to warm yellow for the same reason.
 
+### Sound (the "Sound" section near the top of `game.js`)
+
+All audio is **synthesized with the Web Audio API**, with no audio files, matching the no-assets/no-build setup. The building blocks, which work on any live or offline context, are `sfxNoise` (filtered noise burst), `sfxTone` (pitched tone or glide), `sfxMetal` (inharmonic clang cluster), `sfxGlass` (scattered high pings) and `sfxRattle` (scattered noise ticks).
+
+**Collisions:**
+- **Library:** 12 recipes in `COLLISION_RECIPES`, 4 per tier (light, medium, heavy). They're rendered once into AudioBuffers via `OfflineAudioContext` when audio unlocks, then peak-normalized. Loudness therefore comes only from the tier volume and impact speed, not from how a recipe happened to sum.
+- **They must sound HEAVY:** a car weighs a ton. The first version was called "banging two pencils together". Measuring it (energy split into sub <90 Hz / body 120–500 Hz / click >2 kHz, plus how long each sound stays within 20 dB of its peak) showed the problem was *character*, not a lack of bass: sounds were short (0.1–0.45s), tonal (clean falling sines read as wood blocks) and dry. The first fix overcorrected into sub-bass (up to 95% below 90 Hz). That's inaudible on laptop speakers, and after peak normalization it made the audible part *quieter*.
+- **The current recipe:**
+  - energy lives in the **body band**: noisy `sfxWhump` rumbles (band-limited, high-passed at 90 Hz), thumps starting around 110–150 Hz, and low sheet metal (80–200 Hz) that rings long and bends down
+  - `renderSfx` puts every sound through a **70 Hz highpass, then tanh saturation** (`COLLISION_FX[tier].drive`, which adds harmonics so the low end still reads on small speakers), **then a synthetic room reverb** (`roomIR`, wet amount `COLLISION_FX[tier].room`) for size
+  - measured audible length: light ~0.2–0.3s, medium ~0.4–0.6s, heavy ~0.8–1.1s; light and medium are 72–97% body, heavy about half body and half sub
+
+  Re-measure the same way after retuning rather than going by ear alone. Don't reintroduce short, clean pitched "bonk"-style tones.
+- **Playback:** `collisionSound(speed, x, car)` is called from every collision site: `resolveCarVsStaticCircle`, `resolveCarVsCar` (once per pair, not per car) and `boundaryHit` (walls and curb). It picks a tier from `HIT_TIERS` by closing speed, plays a random buffer from that tier with ±10% pitch and a volume ramp within the tier, and pans by x.
+- **When a contact makes a sound:**
+  - *Any car:* an impact at `HIT_SOUND_MIN` (45 px/s) or harder always sounds.
+  - *Player cars only:* the first touch of any obstacle sounds however slow, quietly, scaled from `TOUCH_VOLUME_MIN`. This was requested: "collision sounds should come as soon as the player car touches anything". Continued soft contact stays silent. Traffic keeps only the speed rule, so distant NPC scrapes don't clutter the mix.
+- **Contact tracking:** "first touch" needs to know what the car is touching. `resolveCircles` returns **-1** for no contact and ≥0 (closing speed) for contact, so callers can tell "touching but separating" (0) from "not touching" (-1). Every contact site reports each step via `isNewTouch(car, key)`. The key is the crate or parked-car object (both ends of a parked car share one key), the other car, or `"wall"`/`"curb"`. `resolveWalls`/`resolveCurb` call `boundaryHit` on *every* step of contact (speed 0 when not pushing into it), so resting contact reads as continuous. A contact is new only after `TOUCH_GAP` (0.25s) clear of that object, because resting contact flickers on and off step to step. In a car-vs-car contact both cars are tracked, but one sound plays, voiced by the player if one is involved.
+- **Throttling:** a per-car `HIT_SOUND_COOLDOWN` (90ms, bypassed by a higher-tier hit) stops grinding contact from machine-gunning sounds.
+
+**Event sounds** are synthesized live via `liveSfx`:
+- coin spawn: a reverse whoosh timed to `COIN_IMPLODE_TIME`, then a pop
+- coin pickup: a "ka-ching"
+- parking success: an arpeggio plus firework crackle
+- garage repair (`playRepairSound`, from `updateGarage`): a ratchet whir, a clank, then a "ta-da"
+- NPC horn (`playHornSound`): a two-tone sawtooth chord, as one long honk or a double beep, with a per-car `hornPitch`
+
+Volumes were balanced by *measured* peak level. Approximate peaks: light bump 0.27, horn 0.12 (lowered from 0.21 after playtesting: too loud), coin pickup 0.38, repair 0.49, parking 0.70, heavy crash 0.73. The horn sits below a light bump on purpose: a sustained tone sounds far louder than a percussive hit at the same peak. Re-measure (render offline, compare peaks) rather than eyeballing if you retune.
+
+**Horns:** `npcDrive` accumulates `npc.blockedTime` while a car is in its path (the same `blocked` test that makes it brake). It honks after `NPC_HONK_DELAY` (0.7s), then every `NPC_HONK_REPEAT_MIN`–`MAX` (2.5–4.5s) while still blocked, and resets once unblocked. A dazed NPC doesn't honk, since `npcDrive` returns early.
+
+**Unlock:** browsers only allow audio after a user gesture, so `initAudio()` runs from the keydown handler. Until then, or with no Web Audio at all (headless tests), `audio` is null and every play function is a silent no-op. The `let audio` declaration sits near the top of the file on purpose: `setupWorld()` → `spawnCoin()` → `playCoinSpawnSound()` runs at startup, so it must not hit a TDZ.
+
 ### HUD and on-screen text: keep it minimal
 
 On-screen text was deliberately cut down after feedback that the game felt like an airport full of signs. The rule: **show game state in the world, not as text**.
