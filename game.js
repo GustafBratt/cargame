@@ -774,8 +774,21 @@ function updateParticles(dt) {
 
 const NPC_SPAWN_MEAN = 10; // seconds, average time between spawns
 const NPC_CRUISE_SPEED = 140; // px/s
-const NPC_LOOKAHEAD = 90; // px, how far along the lane the steering aims
+const NPC_LOOKAHEAD = 170; // px, how far along the lane the steering aims -- longer = lazier, wider corrections
+const NPC_STEER_GAIN = 1.1; // steer per radian of heading error -- low on purpose, NPCs are sloppy drivers
 const NPC_BRAKE_DIST = 110; // px, brake for any car this close ahead in the car's path
+// NPCs are deliberately mediocre drivers once knocked out of their routine:
+// a sudden jolt (a collision) leaves them dazed for a moment, and while off
+// the lane or pointing the wrong way they creep along instead of snapping
+// straight back to cruise.
+const NPC_JOLT = 50; // px/s velocity change in one step that counts as "got hit" (driving alone never exceeds ~15)
+const NPC_DAZE_MIN = 1.5, NPC_DAZE_MAX = 3.5; // seconds of coasting, wheel straight, after a jolt
+const NPC_LOST_SPEED = 55; // px/s, cautious crawl while well off the lane or turned around
+// Target speed eases from cruise (within NPC_LANE_ERR_OK of the lane line)
+// down to NPC_LOST_SPEED (at NPC_LOST_LANE_ERR or more) -- a car that's only
+// a little off-line keeps going almost normally while it drifts back.
+const NPC_LANE_ERR_OK = 15; // px
+const NPC_LOST_LANE_ERR = 70; // px
 const NPC_COLORS = ["#e6e6e6", "#d9534f", "#5cb85c", "#9b7fd4", "#3d4a5c", "#c27ba0"];
 
 function nextNpcSpawnDelay() {
@@ -784,7 +797,7 @@ function nextNpcSpawnDelay() {
 
 function resetTraffic() {
   npcs.length = 0;
-  npcSpawnTimer = nextNpcSpawnDelay();
+  npcSpawnTimer = 0; // first car rolls in right away; later ones follow the random schedule
 }
 
 function spawnNpc() {
@@ -803,6 +816,8 @@ function spawnNpc() {
   npc.drive = { throttle: 0, steer: 0 };
   npc.stuckTime = 0;
   npc.reverseTime = 0;
+  npc.dazedTime = 0;
+  npc.prevVel = { x: npc.vel.x, y: npc.vel.y };
   npcs.push(npc);
   return true;
 }
@@ -816,35 +831,67 @@ function npcDrive(npc, dt) {
   const forward = { x: Math.cos(npc.angle), y: Math.sin(npc.angle) };
   const forwardSpeed = npc.vel.x * forward.x + npc.vel.y * forward.y;
 
+  // Got hit since last step? prevVel was recorded at the end of the last
+  // npcDrive, so the difference is one stepCar (small) plus any collision.
+  const jolt = Math.hypot(npc.vel.x - npc.prevVel.x, npc.vel.y - npc.prevVel.y);
+  npc.prevVel.x = npc.vel.x;
+  npc.prevVel.y = npc.vel.y;
+  if (jolt > NPC_JOLT) {
+    npc.dazedTime = NPC_DAZE_MIN + Math.random() * (NPC_DAZE_MAX - NPC_DAZE_MIN);
+    npc.reverseTime = 0;
+  }
+  if (npc.dazedTime > 0) {
+    npc.dazedTime -= dt;
+    npc.stuckTime = 0;
+    npc.drive.throttle = 0;
+    npc.drive.steer = 0;
+    return;
+  }
+
   // Steer toward a point further along the lane -- keeps the car on the lane
   // line, and also brings it back (turning around if needed) after a hit.
   const tx = npc.pos.x + npc.dir * NPC_LOOKAHEAD;
   const headingErr = wrapAngle(Math.atan2(street.npcLaneY - npc.pos.y, tx - npc.pos.x) - npc.angle);
-  let steer = clamp(headingErr * 2.5, -1, 1);
+  let steer = clamp(headingErr * NPC_STEER_GAIN, -1, 1);
 
-  let blocked = false;
+  const laneErr = Math.abs(npc.pos.y - street.npcLaneY);
+  const turnedAround = Math.abs(headingErr) > Math.PI / 2;
+  const lost = laneErr > NPC_LANE_ERR_OK * 2 || turnedAround; // off the road enough to not queue behind things
+  const offness = turnedAround ? 1 : clamp((laneErr - NPC_LANE_ERR_OK) / (NPC_LOST_LANE_ERR - NPC_LANE_ERR_OK), 0, 1);
+  const targetSpeed = NPC_CRUISE_SPEED + (NPC_LOST_SPEED - NPC_CRUISE_SPEED) * offness;
+
+  let blocked = false, blockerSide = 0;
   for (const other of [car1, car2, ...npcs]) {
     if (other === npc) continue;
     const dx = other.pos.x - npc.pos.x, dy = other.pos.y - npc.pos.y;
     const ahead = dx * forward.x + dy * forward.y;
-    const side = dy * forward.x - dx * forward.y;
+    const side = dy * forward.x - dx * forward.y; // > 0: blocker is to our right
     if (ahead > 0 && ahead < NPC_BRAKE_DIST && Math.abs(side) < CAR.width + 6) {
       blocked = true;
+      blockerSide = side;
       break;
     }
   }
 
   let throttle;
   if (npc.reverseTime > 0) {
-    // Backing out of a jam: opposite lock, since reversing swings the nose
-    // the other way.
+    // Backing out of a jam: full opposite lock (reversing swings the nose the
+    // other way), so the retry comes in on a genuinely different line -- the
+    // lazy NPC_STEER_GAIN alone would back out nearly straight and just
+    // drive back into the same spot.
     npc.reverseTime -= dt;
     throttle = -1;
-    steer = -steer;
+    steer = headingErr >= 0 ? -1 : 1;
+  } else if (blocked && lost) {
+    // Off the road there's no queue to wait in, and the lane point it's
+    // aiming for can sit right behind the blocker (waiting and retrying would
+    // just loop) -- so creep around it instead, turning away from its side.
+    steer = blockerSide >= 0 ? -1 : 1;
+    throttle = forwardSpeed < NPC_LOST_SPEED * 0.6 ? 1 : 0;
   } else if (blocked) {
     throttle = forwardSpeed > 1 ? -1 : 0; // brake, but never start reversing into a queue
   } else {
-    throttle = forwardSpeed < NPC_CRUISE_SPEED ? 1 : 0;
+    throttle = forwardSpeed < targetSpeed ? 1 : 0;
   }
 
   // Stopped for too long -- wedged against something (a crate, the curb), or

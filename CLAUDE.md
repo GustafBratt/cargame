@@ -83,11 +83,22 @@ The garage lives in `street.garage`, so it's rebuilt on resize along with the re
 
 AI cars (`npcs`, module-level) spawn as a Poisson process (`NPC_SPAWN_MEAN`, ~10s average), enter from just off the left or right edge, and drive the lane at `street.npcLaneY`, just above the dashed centerline (`street.centerlineY`, also used by `drawStreet`). They're ordinary car objects running through the same `stepCar` physics and all the same collisions as the players; the only difference is that `readInput` returns `car.drive` (set each step by `npcDrive`) instead of reading keys. The one exception is `resolveWalls`: NPCs aren't fenced in by the arena, and `updateTraffic` removes them once they're well outside the canvas.
 
-`npcDrive` steers toward a point `NPC_LOOKAHEAD` ahead along the lane. That both holds the lane and, after a hit, turns the car back around onto it. It brakes for any car within `NPC_BRAKE_DIST` in its path (never reversing into a queue), and after being stopped too long (1.5s wedged, 3s waiting behind a car) it backs up with opposite lock for 1s and retries. Without that timeout, a car knocked off the road could wait forever behind a player who isn't moving.
+`npcDrive` steers toward a point `NPC_LOOKAHEAD` ahead along the lane. That both holds the lane and, after a hit, turns the car back around onto it. NPCs are **deliberately mediocre drivers**, per feedback that they recovered from hits too quickly and competently:
+- **Lazy steering:** a low `NPC_STEER_GAIN` and a long lookahead, so they rejoin the lane in a wide, sloppy arc.
+- **Dazed after a hit:** a jolt (velocity change > `NPC_JOLT` in one step, which only a collision produces) leaves them coasting with the wheel straight for 1.5–3.5s.
+- **Slow when lost:** target speed eases from cruise down to a crawl (`NPC_LOST_SPEED`) the further off the lane they are, and they crawl whenever turned around.
+
+Headless measurements: recovery takes ~3–8.5s back to the lane (it was ~1–3.5s); undisturbed cars still hold the lane exactly.
+
+Blocking and getting unstuck:
+- **Braking:** they brake for any car within `NPC_BRAKE_DIST` in their path, never reversing into a queue. In the lane they wait behind a blocker. Off the road (`lost`) they creep around it instead. Waiting there loops forever, because the lane point they aim for can sit right behind the blocker.
+- **Stopped too long** (1.5s wedged, 3s waiting behind a car): they back up at *full* opposite lock for 1s and retry. It has to be full lock: the lazy steering gain alone backs out nearly straight and drives right back into the same spot.
+
+Without these, a car knocked off the road can wait forever behind a player who isn't moving. That was reproduced headlessly while tuning.
 
 There's only one traffic lane, so `spawnNpc` gives a new car the same direction as any traffic already on screen, and picks a random direction only when the road is empty. This prevents head-on meetings.
 
-`resetTraffic` runs from `setupWorld` and `resetCars`. On resize, NPCs are shifted by the change in `npcLaneY` so they stay in the lane.
+`resetTraffic` runs from `setupWorld` and `resetCars`. It sets the spawn timer to 0, so the first car rolls in immediately on start/reset; only later spawns follow the random schedule. On resize, NPCs are shifted by the change in `npcLaneY` so they stay in the lane.
 
 ### Particles (`spawnFirework` / `updateParticles` / `drawParticles`)
 
