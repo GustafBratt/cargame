@@ -95,6 +95,8 @@ function createCar(x, y, angle, color, input) {
     angle,
     angularVel: 0,
     steerCurrent: 0, // the actual, rate-limited steering-rack angle (see stepCar)
+    damage: 0, // 0..1, see applyDamage
+    dents: [], // car-local {x, y, r}, drawn by drawCar
     color,
     input, // { up, down, left, right } key names
     startPos: { x, y },
@@ -217,11 +219,14 @@ function stepCar(car, dt) {
   // a force purely along the heading, applied at the rear axle (which sits
   // on that same heading line), produces zero torque either way, so it's
   // simplest to just add it straight to the CG.
+  // Collision damage saps the engine (brakes are left alone -- a wrecked car
+  // should still be able to stop).
+  const health = carHealth(car);
   let longAccel = 0;
   if (throttle > 0) {
-    longAccel = p.enginePower;
+    longAccel = p.enginePower * health;
   } else if (throttle < 0) {
-    longAccel = forwardSpeed > 1 ? -p.brakePower : -p.reversePower;
+    longAccel = forwardSpeed > 1 ? -p.brakePower : -p.reversePower * health;
   }
   car.vel.x += forward.x * longAccel * dt;
   car.vel.y += forward.y * longAccel * dt;
@@ -238,7 +243,7 @@ function stepCar(car, dt) {
   // (drift) speed is left alone, it's already grip-limited above.
   const fwdAfter = car.vel.x * forward.x + car.vel.y * forward.y;
   const latAfter = car.vel.x * right.x + car.vel.y * right.y;
-  const fwdClamped = clamp(fwdAfter, -p.maxReverseSpeed, p.maxSpeed);
+  const fwdClamped = clamp(fwdAfter, -p.maxReverseSpeed * health, p.maxSpeed * health);
   car.vel.x = forward.x * fwdClamped + right.x * latAfter;
   car.vel.y = forward.y * fwdClamped + right.y * latAfter;
 
@@ -251,30 +256,37 @@ function resolveWalls(car) {
   const b = CAR.wallBounce;
   if (car.pos.x - r < 0) {
     car.pos.x = r;
+    if (car.vel.x < 0) applyDamage(car, -car.vel.x, { x: 0, y: car.pos.y });
     car.vel.x = Math.abs(car.vel.x) * b;
     car.angularVel *= 0.5;
   } else if (car.pos.x + r > W) {
     car.pos.x = W - r;
+    if (car.vel.x > 0) applyDamage(car, car.vel.x, { x: W, y: car.pos.y });
     car.vel.x = -Math.abs(car.vel.x) * b;
     car.angularVel *= 0.5;
   }
   if (car.pos.y - r < 0) {
     car.pos.y = r;
+    if (car.vel.y < 0) applyDamage(car, -car.vel.y, { x: car.pos.x, y: 0 });
     car.vel.y = Math.abs(car.vel.y) * b;
     car.angularVel *= 0.5;
   } else if (car.pos.y + r > H) {
     car.pos.y = H - r;
+    if (car.vel.y > 0) applyDamage(car, car.vel.y, { x: car.pos.x, y: H });
     car.vel.y = -Math.abs(car.vel.y) * b;
     car.angularVel *= 0.5;
   }
 }
 
+// Returns the closing speed along the contact normal (0 if the circles
+// weren't touching or were already separating) -- how hard the hit was, for
+// collision damage.
 function resolveCircles(aPos, aVel, aR, bPos, bVel, bR, bStatic, restitution) {
   const dx = bPos.x - aPos.x;
   const dy = bPos.y - aPos.y;
   const dist = Math.hypot(dx, dy) || 0.001;
   const overlap = aR + bR - dist;
-  if (overlap <= 0) return;
+  if (overlap <= 0) return 0;
 
   const nx = dx / dist, ny = dy / dist;
   const pushA = bStatic ? overlap : overlap / 2;
@@ -285,11 +297,12 @@ function resolveCircles(aPos, aVel, aR, bPos, bVel, bR, bStatic, restitution) {
   const rvx = (bStatic ? 0 : bVel.x) - aVel.x;
   const rvy = (bStatic ? 0 : bVel.y) - aVel.y;
   const velAlongNormal = rvx * nx + rvy * ny;
-  if (velAlongNormal > 0) return;
+  if (velAlongNormal > 0) return 0;
 
   const impulse = (-(1 + restitution) * velAlongNormal) / (bStatic ? 1 : 2);
   aVel.x -= impulse * nx; aVel.y -= impulse * ny;
   if (!bStatic) { bVel.x += impulse * nx; bVel.y += impulse * ny; }
+  return -velAlongNormal;
 }
 
 // The two capsule-circle centers as offsets from the car's own center
@@ -326,32 +339,119 @@ function applyCollisionSpin(car, r, velBefore) {
 // end of a parked car's capsule), feeding the resulting push/impulse back
 // into the car's actual pos/vel (each capsule circle is a fixed offset from
 // the car center, so a pure translation of the center moves both).
+// Point on circle `from`'s rim facing `toward` -- where a collision touched.
+function contactPoint(from, toward, radius) {
+  const dx = toward.x - from.x, dy = toward.y - from.y;
+  const d = Math.hypot(dx, dy) || 0.001;
+  return { x: from.x + (dx / d) * radius, y: from.y + (dy / d) * radius };
+}
+
 function resolveCarVsStaticCircle(car, obstaclePos, obstacleR) {
+  // Both capsule circles can register the same hit; damage is taken once,
+  // from the harder of the two.
+  let hit = 0, hitAt = null;
   for (const r of capsuleOffsets(car.angle)) {
     const c = { x: car.pos.x + r.x, y: car.pos.y + r.y };
     const posBefore = { x: c.x, y: c.y };
     const velBefore = { x: car.vel.x, y: car.vel.y };
-    resolveCircles(c, car.vel, CAR.capsuleRadius, obstaclePos, null, obstacleR, true, CAR.obstacleCollisionRestitution);
+    const s = resolveCircles(c, car.vel, CAR.capsuleRadius, obstaclePos, null, obstacleR, true, CAR.obstacleCollisionRestitution);
+    if (s > hit) { hit = s; hitAt = contactPoint(c, obstaclePos, CAR.capsuleRadius); }
     car.pos.x += c.x - posBefore.x;
     car.pos.y += c.y - posBefore.y;
     applyCollisionSpin(car, r, velBefore);
   }
+  if (hitAt) applyDamage(car, hit, hitAt);
 }
 
 function resolveCarVsCar(carA, carB) {
+  let hit = 0, hitAtA = null, hitAtB = null;
   for (const rA of capsuleOffsets(carA.angle)) {
     for (const rB of capsuleOffsets(carB.angle)) {
       const a = { x: carA.pos.x + rA.x, y: carA.pos.y + rA.y };
       const b = { x: carB.pos.x + rB.x, y: carB.pos.y + rB.y };
       const posBeforeA = { x: a.x, y: a.y }, posBeforeB = { x: b.x, y: b.y };
       const velBeforeA = { x: carA.vel.x, y: carA.vel.y }, velBeforeB = { x: carB.vel.x, y: carB.vel.y };
-      resolveCircles(a, carA.vel, CAR.capsuleRadius, b, carB.vel, CAR.capsuleRadius, false, CAR.carCollisionRestitution);
+      const s = resolveCircles(a, carA.vel, CAR.capsuleRadius, b, carB.vel, CAR.capsuleRadius, false, CAR.carCollisionRestitution);
+      if (s > hit) {
+        hit = s;
+        hitAtA = contactPoint(a, b, CAR.capsuleRadius);
+        hitAtB = contactPoint(b, a, CAR.capsuleRadius);
+      }
       carA.pos.x += a.x - posBeforeA.x; carA.pos.y += a.y - posBeforeA.y;
       carB.pos.x += b.x - posBeforeB.x; carB.pos.y += b.y - posBeforeB.y;
       applyCollisionSpin(carA, rA, velBeforeA);
       applyCollisionSpin(carB, rB, velBeforeB);
     }
   }
+  if (hitAtA) {
+    applyDamage(carA, hit, hitAtA);
+    applyDamage(carB, hit, hitAtB);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Collision damage
+// ---------------------------------------------------------------------------
+// Any hit harder than a gentle bump adds to car.damage (0..1), leaves a dent
+// on the body where it landed, and -- via the health factor in stepCar --
+// saps engine power and top speed. Damaged cars smoke (emitSmoke), more
+// thickly and darkly the worse it gets. Only the garage (updateGarage)
+// resets it.
+
+const DAMAGE_THRESHOLD = 70; // px/s closing speed; softer contact (parking nudges, curb scrapes) is free
+const DAMAGE_PER_SPEED = 1 / 1200; // damage per px/s of closing speed above the threshold
+const DAMAGE_SLOWDOWN = 0.6; // at full damage, engine power and top speed drop to 40%
+const MAX_DENTS = 14;
+const SMOKE_DAMAGE_MIN = 0.12; // below this, a car is dented but not smoking yet
+
+function applyDamage(car, impactSpeed, worldPoint) {
+  const excess = impactSpeed - DAMAGE_THRESHOLD;
+  if (excess <= 0) return;
+  car.damage = Math.min(1, car.damage + excess * DAMAGE_PER_SPEED);
+
+  // Record the dent in the car's own frame so it moves/rotates with the body,
+  // clamped onto the body rectangle (wall contacts come from a coarser shape).
+  const dx = worldPoint.x - car.pos.x, dy = worldPoint.y - car.pos.y;
+  const cos = Math.cos(car.angle), sin = Math.sin(car.angle);
+  car.dents.push({
+    x: clamp(dx * cos + dy * sin, -CAR.length / 2, CAR.length / 2),
+    y: clamp(-dx * sin + dy * cos, -CAR.width / 2, CAR.width / 2),
+    r: clamp(4 + excess / 35, 4, 10),
+  });
+  if (car.dents.length > MAX_DENTS) car.dents.shift();
+}
+
+// Engine-power / top-speed multiplier for a car's current damage.
+function carHealth(car) {
+  return 1 - DAMAGE_SLOWDOWN * car.damage;
+}
+
+function repairCar(car) {
+  car.damage = 0;
+  car.dents.length = 0;
+}
+
+// Puffs of smoke out the back of the car, at a rate and darkness that scale
+// with damage. Purely cosmetic -- rides the shared particles array.
+function emitSmoke(car, dt) {
+  if (car.damage < SMOKE_DAMAGE_MIN) return;
+  const rate = 3 + car.damage * 22; // puffs per second
+  if (Math.random() > rate * dt) return;
+  const tail = -CAR.length / 2 - 2; // just behind the rear bumper
+  const gray = Math.round(185 - car.damage * 125);
+  particles.push({
+    type: "smoke",
+    x: car.pos.x + Math.cos(car.angle) * tail + (Math.random() - 0.5) * 6,
+    y: car.pos.y + Math.sin(car.angle) * tail + (Math.random() - 0.5) * 6,
+    vx: car.vel.x * 0.25 + (Math.random() - 0.5) * 18,
+    vy: car.vel.y * 0.25 + (Math.random() - 0.5) * 18,
+    size: 3 + Math.random() * 2,
+    growSpeed: 10 + Math.random() * 8,
+    color: `rgb(${gray},${gray},${gray})`,
+    alpha: 0.3 + car.damage * 0.3,
+    life: 0,
+    maxLife: 0.9 + Math.random() * 0.8,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -400,7 +500,12 @@ function buildStreet() {
   const centerlineY = curbY - 90;
   const npcLaneY = centerlineY - CAR.width / 2 - 8; // traffic lane, just above the centerline
 
-  return { curbY, carCenterY, centerlineY, npcLaneY, parkedCars, parkingSpots };
+  // Repair garage in the bottom-right corner: the building sits on the
+  // sidewalk, and its service pad is the patch of road in front of its door.
+  const garageW = 120;
+  const garage = { x0: W - garageW - 16, x1: W - 16, padY0: curbY - 66, curbY, bottomY: H - 8 };
+
+  return { curbY, carCenterY, centerlineY, npcLaneY, parkedCars, parkingSpots, garage };
 }
 
 function resetCars() {
@@ -411,6 +516,8 @@ function resetCars() {
 
   car1.score = 0; car1.gameState = "seekCoin";
   car2.score = 0; car2.gameState = "seekCoin";
+  repairCar(car1);
+  repairCar(car2);
   spawnCoin();
   particles.length = 0;
   resetTraffic();
@@ -499,6 +606,31 @@ function isParked(car) {
 // does. Whichever eligible car reaches it first scores, goes to "mustPark",
 // and a fresh coin immediately takes its place (so the other car, if still
 // eligible, can keep going without waiting on anyone's parking job).
+// ---------------------------------------------------------------------------
+// Garage
+// ---------------------------------------------------------------------------
+// A player that stops on the garage pad with any damage pays 1 coin and is
+// fully repaired on the spot. Traffic never uses it.
+
+const GARAGE_SPEED_LIMIT = 15; // px/s -- come to a stop; driving through doesn't charge you
+const REPAIR_COST = 1;
+
+function onGaragePad(car) {
+  const g = street.garage;
+  return car.pos.x > g.x0 && car.pos.x < g.x1 && car.pos.y > g.padY0 && car.pos.y < g.curbY;
+}
+
+function updateGarage() {
+  for (const car of [car1, car2]) {
+    if (car.damage <= 0 || !onGaragePad(car)) continue;
+    if (Math.hypot(car.vel.x, car.vel.y) > GARAGE_SPEED_LIMIT) continue;
+    if (car.score < REPAIR_COST) continue;
+    car.score -= REPAIR_COST;
+    repairCar(car);
+    spawnFirework(car.pos.x, car.pos.y, "#7dffa0");
+  }
+}
+
 function updateCoinRace() {
   for (const car of [car1, car2]) {
     if (car.gameState !== "seekCoin") continue;
@@ -587,6 +719,12 @@ function updateParticles(dt) {
       p.y += p.vy * dt;
     } else if (p.type === "ring") {
       p.radius += p.growSpeed * dt;
+    } else if (p.type === "smoke") {
+      p.vx *= 1 - 1.5 * dt;
+      p.vy *= 1 - 1.5 * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.size += p.growSpeed * dt;
     }
     // "flash" and "delayedBurst" hold position and just decay via life/maxLife.
   }
@@ -757,6 +895,7 @@ function resolveCurb(car) {
   const limit = street.curbY - CAR.capsuleRadius;
   if (car.pos.y > limit) {
     car.pos.y = limit;
+    if (car.vel.y > 0) applyDamage(car, car.vel.y, { x: car.pos.x, y: street.curbY });
     car.vel.y = -Math.abs(car.vel.y) * 0.4;
     car.angularVel *= 0.5;
   }
@@ -785,6 +924,8 @@ function update(dt) {
   }
 
   updateCoinRace();
+  updateGarage();
+  for (const car of movers) emitSmoke(car, dt);
   updateParticles(dt);
 }
 
@@ -938,7 +1079,76 @@ function drawCar(car) {
   roundedRect(length * 0.02, -width / 2 + 4, length * 0.35, width - 8, 3);
   ctx.fill();
 
+  // collision dents: a dark hollow with a bright crumple edge, clipped to
+  // the body so a dent at the bumper doesn't spill onto the road.
+  if (car.dents.length) {
+    ctx.save();
+    roundedRect(-length / 2, -width / 2, length, width, 5);
+    ctx.clip();
+    for (const d of car.dents) {
+      const g = ctx.createRadialGradient(d.x, d.y, 0, d.x, d.y, d.r);
+      g.addColorStop(0, "rgba(0,0,0,0.55)");
+      g.addColorStop(0.65, "rgba(0,0,0,0.25)");
+      g.addColorStop(1, "rgba(0,0,0,0)");
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(d.x, d.y, d.r, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.strokeStyle = "rgba(255,255,255,0.35)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(d.x, d.y, d.r * 0.6, Math.PI * 0.9, Math.PI * 1.9);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   ctx.restore();
+}
+
+function drawGarage() {
+  const g = street.garage;
+  const w = g.x1 - g.x0;
+
+  // service pad on the road: hazard-striped border around a darker slab
+  ctx.fillStyle = "rgba(20,22,28,0.55)";
+  ctx.fillRect(g.x0, g.padY0, w, g.curbY - g.padY0);
+  ctx.save();
+  ctx.strokeStyle = "#e0b43a";
+  ctx.lineWidth = 3;
+  ctx.setLineDash([10, 7]);
+  ctx.strokeRect(g.x0 + 1.5, g.padY0 + 1.5, w - 3, g.curbY - g.padY0 - 3);
+  ctx.restore();
+  ctx.fillStyle = "rgba(224,180,58,0.85)";
+  ctx.font = "bold 11px system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText(`REPAIR · ${REPAIR_COST} COIN`, (g.x0 + g.x1) / 2, g.padY0 + 16);
+
+  // building on the sidewalk, roll-up door facing the pad
+  const by0 = g.curbY + 4;
+  ctx.fillStyle = "#5b4636";
+  ctx.strokeStyle = "#2e231b";
+  ctx.lineWidth = 2;
+  ctx.fillRect(g.x0, by0, w, g.bottomY - by0);
+  ctx.strokeRect(g.x0, by0, w, g.bottomY - by0);
+
+  const doorInset = 18;
+  const doorH = Math.min(22, (g.bottomY - by0) * 0.45);
+  ctx.fillStyle = "#9aa0aa";
+  ctx.fillRect(g.x0 + doorInset, by0, w - doorInset * 2, doorH);
+  ctx.strokeStyle = "rgba(0,0,0,0.35)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let y = by0 + 4; y < by0 + doorH; y += 4) {
+    ctx.moveTo(g.x0 + doorInset, y);
+    ctx.lineTo(g.x1 - doorInset, y);
+  }
+  ctx.stroke();
+
+  ctx.fillStyle = "#f1e3c8";
+  ctx.font = "bold 13px system-ui, sans-serif";
+  ctx.fillText("GARAGE", (g.x0 + g.x1) / 2, Math.min(by0 + doorH + 18, g.bottomY - 6));
 }
 
 function roundedRect(x, y, w, h, r) {
@@ -959,6 +1169,7 @@ const statusEl1 = document.getElementById("p1-status");
 const statusEl2 = document.getElementById("p2-status");
 
 function statusText(car) {
+  if (car.damage > 0 && car.score < REPAIR_COST && onGaragePad(car)) return `Repairs cost ${REPAIR_COST} coin!`;
   return car.gameState === "mustPark" ? "Now parallel park!" : "Race for the coin!";
 }
 
@@ -997,6 +1208,12 @@ function drawParticles() {
       ctx.beginPath();
       ctx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
       ctx.stroke();
+    } else if (p.type === "smoke") {
+      ctx.globalAlpha = p.alpha * (1 - t);
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+      ctx.fill();
     } else if (p.type === "flash") {
       ctx.globalAlpha = (1 - t) * 0.9;
       const grad = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, p.radius);
@@ -1016,6 +1233,7 @@ function drawParticles() {
 function render() {
   drawGrid();
   drawStreet();
+  drawGarage();
   for (const c of crates) drawCrate(c);
   for (const pc of street.parkedCars) drawCar(pc);
   for (const n of npcs) drawCar(n);
