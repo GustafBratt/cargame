@@ -1273,11 +1273,24 @@ const PARK_Y_TOLERANCE = 13;
 const PARK_ANGLE_TOLERANCE = 0.3; // radians (~17deg), either direction along the curb
 const PARK_X_MARGIN = 2; // px inset from the spot's painted edges the center must clear
 
+// How far a coin's edge must stay from a crate's square (so the coin and its
+// glow never overlap a box). Deliberately small: coins may spawn in the
+// lanes BETWEEN the crates in the grid (38px+ wide, a car is 24px), which
+// the old rule (56px from every crate center) ruled out almost entirely.
+const COIN_CRATE_GAP = 5;
+
+// Distance from (x, y) to the nearest point of crate c's drawn square.
+function distToCrate(x, y, c) {
+  const dx = Math.max(Math.abs(x - c.x) - c.r, 0);
+  const dy = Math.max(Math.abs(y - c.y) - c.r, 0);
+  return Math.hypot(dx, dy);
+}
+
 function randomCoinPos() {
   for (let attempt = 0; attempt < 30; attempt++) {
     const x = 60 + Math.random() * (W - 120);
     const y = 60 + Math.random() * Math.max(40, street.curbY - 150 - 60);
-    if (crates.every((c) => Math.hypot(x - c.x, y - c.y) > c.r + 40)) return { x, y };
+    if (crates.every((c) => distToCrate(x, y, c) > COIN_RADIUS + COIN_CRATE_GAP)) return { x, y };
   }
   return { x: W / 2, y: H * 0.3 };
 }
