@@ -974,6 +974,7 @@ function resolveCarVsStaticCircle(car, obstaclePos, obstacleR, key) {
   if (!touched) return;
   if (hitAt) applyDamage(car, hit, hitAt);
   collisionSound(hit, (hitAt || obstaclePos).x, car, isNewTouch(car, key));
+  if (hit >= HIT_SOUND_MIN) pedestriansNotice(hitAt.x, hitAt.y, "crash", hit);
 }
 
 function resolveCarVsCar(carA, carB) {
@@ -1008,6 +1009,7 @@ function resolveCarVsCar(carA, carB) {
   const voice = isPlayer(carA) || !isPlayer(carB) ? carA : carB;
   const x = hitAtA ? hitAtA.x : (carA.pos.x + carB.pos.x) / 2;
   collisionSound(hit, x, voice, voice === carA ? newA : newB);
+  if (hit >= HIT_SOUND_MIN) pedestriansNotice(hitAtA.x, hitAtA.y, "crash", hit);
 }
 
 // A car in contact with the arena wall or the curb: same damage + sound as
@@ -1017,6 +1019,7 @@ function resolveCarVsCar(carA, carB) {
 function boundaryHit(car, speed, point, key) {
   applyDamage(car, speed, point);
   collisionSound(speed, point.x, car, isNewTouch(car, key));
+  if (speed >= HIT_SOUND_MIN) pedestriansNotice(point.x, point.y, "crash", speed);
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,12 +1140,24 @@ function buildStreet() {
   const centerlineY = curbY - 90;
   const npcLaneY = centerlineY - CAR.width / 2 - 8; // traffic lane, just above the centerline
 
-  // Repair garage in the bottom-right corner: the building sits on the
-  // sidewalk, and its service pad is the patch of road in front of its door.
-  const garageW = 120;
-  const garage = { x0: W - garageW - 16, x1: W - 16, padY0: curbY - 66, curbY, bottomY: H - 8 };
+  // Sidewalk band just below the curb (kept clear for pedestrians), lawn
+  // below that.
+  const sidewalkBottomY = curbY + Math.min(46, (H - curbY) * 0.45);
 
-  return { curbY, carCenterY, centerlineY, npcLaneY, parkedCars, parkingSpots, garage };
+  // Repair garage in the bottom-right corner. The building sits on the lawn
+  // BELOW the sidewalk, so the sidewalk runs unbroken in front of it, and a
+  // driveway (drawGarageBuilding) crosses the sidewalk from its door to a
+  // lowered curb. Its service pad is the patch of road in front of that.
+  const garageW = 120;
+  const gx0 = W - garageW - 16, gx1 = W - 16;
+  const garage = {
+    x0: gx0, x1: gx1,
+    padY0: curbY - 66, curbY,
+    buildingY0: sidewalkBottomY + 6, bottomY: H - 8,
+    doorX0: gx0 + 18, doorX1: gx1 - 18,
+  };
+
+  return { curbY, carCenterY, centerlineY, npcLaneY, sidewalkBottomY, parkedCars, parkingSpots, garage };
 }
 
 function buildCrates() {
@@ -1178,6 +1193,7 @@ function setupWorld() {
   particles.length = 0;
   spawnCoin(); // after clearing particles, so its spawn animation survives
   resetTraffic();
+  resetPedestrians();
   gameTime = 0;
   staticDirty = true;
 }
@@ -1540,6 +1556,7 @@ function npcDrive(npc, dt) {
     npc.blockedTime += dt;
     if (npc.blockedTime >= npc.nextHonkAt) {
       playHornSound(npc.pos.x, npc.hornPitch);
+      pedestriansNotice(npc.pos.x, npc.pos.y, "honk");
       npc.nextHonkAt = npc.blockedTime + NPC_HONK_REPEAT_MIN + Math.random() * (NPC_HONK_REPEAT_MAX - NPC_HONK_REPEAT_MIN);
     }
   } else {
@@ -1600,6 +1617,471 @@ function updateTraffic(dt) {
   for (const n of npcs) npcDrive(n, dt);
 }
 
+// ---------------------------------------------------------------------------
+// Pedestrians (purely cosmetic easter egg)
+// ---------------------------------------------------------------------------
+// Randomly generated people stroll along the sidewalk band (street.curbY ..
+// street.sidewalkBottomY) in both directions, entering and leaving at the
+// screen edges. They have NO effect on gameplay: nothing collides with them
+// and they never read or write car/game state. The one thing they react to
+// is commotion -- pedestriansNotice() is called on real collisions (>=
+// HIT_SOUND_MIN) and NPC honks, and anyone within earshot stops, turns to
+// look for a while, then carries on.
+//
+// Every character is rolled by makePedestrian: skin, shirt, size, a
+// hairstyle or a hat, maybe an umbrella, maybe a dog on a leash or a baby
+// stroller, and a stride (speed, cadence, arm swing, bounce).
+
+// Kept sparse on purpose (halved after playtesting): an easter egg, not a crowd.
+const PED_SPAWN_MEAN = 7; // s between arrivals (Poisson)
+const PED_MAX = 5;
+const PED_START_COUNT = 2; // already out walking when the game starts
+const PED_NOTICE_CRASH = 650; // px: how far a collision is heard
+const PED_NOTICE_HONK = 380; // px: how far a honk is heard
+// Drawn a bit bigger than true scale next to the cars, so the details read.
+const PED_SCALE = 1.2;
+
+const PED_SKIN = ["#ffdcc0", "#f6c9a4", "#e3a67b", "#c4855a", "#98613d", "#6b4428"];
+const PED_HAIR = ["#2b2118", "#5a3825", "#a0522d", "#e8c872", "#d8d4cc", "#c0392b", "#3d6fd6"];
+const PED_SHIRT = ["#e8514a", "#4f9de0", "#6cc24a", "#f2c14b", "#ea7fbf", "#8c6fd6", "#ffffff", "#ff8f3f", "#3dbfae"];
+const PED_HATS = ["cap", "sunhat", "beanie", "tophat"];
+const PED_HAT_COLORS = ["#e8514a", "#4f9de0", "#f2c14b", "#6cc24a", "#8c6fd6", "#f4e1b8"];
+const PED_UMBRELLAS = ["#e8514a", "#4f9de0", "#f2c14b", "#ea7fbf", "#6cc24a", "#8c6fd6"];
+const PED_DOGS = ["#c8874a", "#f1e6d2", "#3a3035", "#e0b76a", "#8a6a55"];
+const PED_STROLLERS = ["#4f9de0", "#ea7fbf", "#6cc24a", "#8c6fd6"];
+const PED_HAIRSTYLES = ["bald", "short", "short", "long", "ponytail", "bun", "mohawk", "afro", "spiky", "beehive"];
+// speed px/s; cadence = steps/s at that speed; swing = arm/leg amplitude;
+// bounce = body bob amount.
+const PED_STRIDES = [
+  { name: "stroll", speed: 26, cadence: 1.7, swing: 0.8, bounce: 0.1 },
+  { name: "brisk", speed: 44, cadence: 2.4, swing: 1.0, bounce: 0.1 },
+  { name: "shuffle", speed: 17, cadence: 2.3, swing: 0.3, bounce: 0.05 },
+  { name: "bouncy", speed: 36, cadence: 2.0, swing: 1.2, bounce: 0.35 },
+  { name: "jog", speed: 72, cadence: 3.2, swing: 1.4, bounce: 0.25 },
+];
+
+let pedestrians = [];
+let pedSpawnTimer = 0;
+
+function pickOf(a) {
+  return a[Math.floor(Math.random() * a.length)];
+}
+
+// y of a random walking line within the sidewalk band.
+function pedLaneY() {
+  return street.curbY + 12 + Math.random() * Math.max(1, street.sidewalkBottomY - street.curbY - 22);
+}
+
+function makePedestrian(x, dir) {
+  const r = Math.random;
+  let stride = pickOf(PED_STRIDES);
+  const accessory = r() < 0.2 ? "dog" : r() < 0.18 ? "stroller" : null;
+  if (accessory === "stroller" && (stride.name === "jog" || stride.name === "bouncy")) stride = PED_STRIDES[0];
+  const hat = r() < 0.3 ? pickOf(PED_HATS) : null;
+  const facing = dir > 0 ? 0 : Math.PI;
+  const p = {
+    x, y: pedLaneY(), dir,
+    stride, speedMul: 0.85 + r() * 0.3,
+    size: 0.85 + r() * 0.3,
+    skin: pickOf(PED_SKIN),
+    shirt: pickOf(PED_SHIRT),
+    hairStyle: hat ? "short" : pickOf(PED_HAIRSTYLES),
+    hairColor: pickOf(PED_HAIR),
+    hat, hatColor: pickOf(PED_HAT_COLORS),
+    umbrella: !hat && accessory !== "stroller" && r() < 0.14 ? pickOf(PED_UMBRELLAS) : null,
+    accessory,
+    strollerColor: pickOf(PED_STROLLERS),
+    phase: r() * Math.PI * 2,
+    speed: 0,
+    facing, bodyAngle: facing, headAngle: facing,
+    look: null, // { x, y } being stared at
+    lookTimer: 0, reactDelay: 0, pendingLook: 0,
+    seed: r() * 1000,
+  };
+  p.speed = p.stride.speed * p.speedMul;
+  if (accessory === "dog") {
+    p.dog = {
+      x: x + dir * 18, y: p.y + (r() < 0.5 ? -7 : 7),
+      side: r() < 0.5 ? -7 : 7,
+      color: pickOf(PED_DOGS), size: 0.8 + r() * 0.45,
+      angle: facing, phase: r() * 6, tail: r() * 6,
+    };
+  }
+  return p;
+}
+
+function resetPedestrians() {
+  pedestrians = [];
+  for (let i = 0; i < PED_START_COUNT; i++) {
+    const p = makePedestrian(40 + Math.random() * (W - 80), Math.random() < 0.5 ? 1 : -1);
+    if (p.dog) p.dog.x = p.x + p.dir * 18;
+    pedestrians.push(p);
+  }
+  pedSpawnTimer = -Math.log(1 - Math.random()) * PED_SPAWN_MEAN;
+}
+
+// Commotion at (x, y): everyone within earshot stops and stares for a while,
+// each reacting after a small random delay (plus a hint of distance) so the
+// crowd doesn't turn in perfect unison. `kind` is "crash" or "honk"; for a
+// crash, `speed` (closing speed) makes a bigger hit hold attention longer.
+function pedestriansNotice(x, y, kind, speed = 0) {
+  const radius = kind === "honk" ? PED_NOTICE_HONK : PED_NOTICE_CRASH;
+  const dur = kind === "honk" ? 1.4 + Math.random() : 2.2 + Math.min(2.5, speed / 150) + Math.random();
+  for (const p of pedestrians) {
+    const d = Math.hypot(p.x - x, p.y - y);
+    if (d > radius) continue;
+    if (p.lookTimer > 0) {
+      // already staring: turn to the new thing, keep looking a bit longer
+      p.look = { x, y };
+      p.lookTimer = Math.max(p.lookTimer, dur);
+    } else if (p.reactDelay <= 0) {
+      p.look = { x, y };
+      p.reactDelay = 0.08 + Math.random() * 0.35 + d / 2500;
+      p.pendingLook = dur;
+    }
+  }
+}
+
+// Turn `from` toward `to` by at most `rate * dt` radians.
+function turnToward(from, to, rate, dt) {
+  const diff = wrapAngle(to - from);
+  const maxStep = rate * dt;
+  return from + clamp(diff, -maxStep, maxStep);
+}
+
+function updatePedestrians(dt) {
+  pedSpawnTimer -= dt;
+  if (pedSpawnTimer <= 0) {
+    if (pedestrians.length < PED_MAX) {
+      const dir = Math.random() < 0.5 ? 1 : -1;
+      pedestrians.push(makePedestrian(dir > 0 ? -30 : W + 30, dir));
+    }
+    pedSpawnTimer = -Math.log(1 - Math.random()) * PED_SPAWN_MEAN;
+  }
+
+  for (let i = pedestrians.length - 1; i >= 0; i--) {
+    const p = pedestrians[i];
+
+    if (p.reactDelay > 0) {
+      p.reactDelay -= dt;
+      if (p.reactDelay <= 0) p.lookTimer = p.pendingLook;
+    }
+    if (p.lookTimer > 0) p.lookTimer -= dt;
+
+    const staring = p.lookTimer > 0 && p.look;
+    const cruise = p.stride.speed * p.speedMul;
+    const target = staring ? 0 : cruise;
+    p.speed += clamp(target - p.speed, -90 * dt, 60 * dt); // stop quicker than restart
+
+    // Head swings fully toward whatever they're staring at; the body turns
+    // partway. Back to facing the way they're walking afterwards.
+    if (staring) {
+      const toLook = Math.atan2(p.look.y - p.y, p.look.x - p.x);
+      p.headAngle = turnToward(p.headAngle, toLook, 7, dt);
+      p.bodyAngle = turnToward(p.bodyAngle, p.facing + clamp(wrapAngle(toLook - p.facing), -0.9, 0.9), 3, dt);
+    } else {
+      p.headAngle = turnToward(p.headAngle, p.facing, 4, dt);
+      p.bodyAngle = turnToward(p.bodyAngle, p.facing, 3, dt);
+    }
+
+    p.x += p.dir * p.speed * dt;
+    // walk cycle advances with distance covered, so a stopping walker's legs
+    // settle instead of moonwalking
+    const strideLen = p.stride.speed / p.stride.cadence;
+    p.phase += ((p.speed * dt) / strideLen) * Math.PI * 2;
+
+    if (p.dog) updateDog(p, staring, dt);
+
+    if ((p.dir > 0 && p.x > W + 40) || (p.dir < 0 && p.x < -40)) pedestrians.splice(i, 1);
+  }
+}
+
+// The dog trots ahead of its walker on a springy leash, lagging a little,
+// and stops (and stares) when they do.
+function updateDog(p, staring, dt) {
+  const d = p.dog;
+  const tx = p.x + p.dir * 18, ty = p.y + d.side;
+  const px = d.x, py = d.y;
+  d.x += (tx - d.x) * Math.min(1, 5 * dt);
+  d.y += (ty - d.y) * Math.min(1, 5 * dt);
+  const moved = Math.hypot(d.x - px, d.y - py);
+  d.phase += moved * 0.9;
+  d.tail += dt * (staring ? 9 : 14);
+  const wantAngle = staring ? Math.atan2(p.look.y - d.y, p.look.x - d.x) : p.facing;
+  d.angle = turnToward(d.angle, wantAngle, 5, dt);
+}
+
+// ---- Drawing (top-down, same ink-outline cartoon style as the cars) -------
+
+function drawPedestrians() {
+  for (const p of pedestrians) drawPedestrian(p);
+}
+
+function inkCircle(x, y, r, fill, lw = 1.2) {
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (lw) { ctx.strokeStyle = INK; ctx.lineWidth = lw; ctx.stroke(); }
+}
+
+function inkEllipse(x, y, rx, ry, fill, lw = 1.2) {
+  ctx.beginPath();
+  ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (lw) { ctx.strokeStyle = INK; ctx.lineWidth = lw; ctx.stroke(); }
+}
+
+function drawPedestrian(p) {
+  const s = p.size * PED_SCALE;
+  const moving = clamp(p.speed / (p.stride.speed * p.speedMul), 0, 1);
+  const step = Math.sin(p.phase) * p.stride.swing * 3 * moving;
+  const bob = 1 + Math.abs(Math.sin(p.phase)) * p.stride.bounce * 0.12 * moving;
+
+  if (p.dog) drawDog(p.dog);
+
+  // soft shadow (world space, offset like every other shadow)
+  ctx.fillStyle = PAL.shadow;
+  ctx.beginPath();
+  ctx.ellipse(p.x + 2, p.y + 3, 7.5 * s, 7.5 * s, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  ctx.rotate(p.bodyAngle);
+  ctx.scale(s * bob, s * bob);
+
+  if (p.accessory === "stroller") drawStroller(p);
+
+  // feet, stepping out front and back of the body (the visible walk cycle)
+  inkEllipse(step * 1.7, -3, 2.5, 1.6, "#3a3035", 1);
+  inkEllipse(-step * 1.7, 3, 2.5, 1.6, "#3a3035", 1);
+
+  // shoulders/torso: about twice as wide as the head, as seen from above
+  inkEllipse(0, 0, 4.8, 8.6, p.shirt, 1.4);
+
+  // hands: on the stroller handle, holding a leash / umbrella, or swinging
+  if (p.accessory === "stroller") {
+    inkCircle(7, -3.8, 1.5, p.skin, 1);
+    inkCircle(7, 3.8, 1.5, p.skin, 1);
+  } else {
+    inkCircle(-step * 1.1, -9.2, 1.6, p.skin, 1);
+    inkCircle(p.umbrella ? 3 : step * 1.1, 9.2, 1.6, p.skin, 1);
+  }
+
+  // head, in its own rotation (they look around independently of the body)
+  ctx.save();
+  ctx.translate(0.6, 0);
+  ctx.rotate(p.headAngle - p.bodyAngle);
+  ctx.scale(0.88, 0.88); // head a little smaller than the shoulders
+  drawPedHead(p);
+  ctx.restore();
+
+  ctx.restore();
+
+  // leash: from the walker's hand to the dog's collar
+  if (p.dog) {
+    const ha = p.bodyAngle, hx = p.x + (Math.cos(ha) * -step * 1.1 - Math.sin(ha) * -9.2) * s;
+    const hy = p.y + (Math.sin(ha) * -step * 1.1 + Math.cos(ha) * -9.2) * s;
+    const d = p.dog, cx = d.x + Math.cos(d.angle) * 5 * d.size, cy = d.y + Math.sin(d.angle) * 5 * d.size;
+    ctx.strokeStyle = "#c0392b";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(hx, hy);
+    ctx.quadraticCurveTo((hx + cx) / 2, (hy + cy) / 2 + 3, cx, cy); // a little slack
+    ctx.stroke();
+  }
+
+  if (p.umbrella) drawUmbrella(p);
+}
+
+// Head seen from above: face toward +x (a nose peeks out the front), hair or
+// hat covering the rest.
+function drawPedHead(p) {
+  const hr = 4.6, hc = p.hairColor;
+  if (p.hairStyle === "long") inkEllipse(-4.2, 0, 4.2, 4.8, hc, 1.2); // falls over the shoulders
+  if (p.hairStyle === "ponytail") { inkEllipse(-6.2, 0, 2.4, 1.7, hc, 1); inkCircle(-4.4, 0, 0.8, "#e8514a", 0.6); }
+  inkCircle(0, 0, hr, p.skin, 1.3);
+  inkCircle(4.1, 0, 1, p.skin, 0.8); // nose
+
+  switch (p.hairStyle) {
+    case "bald":
+      ctx.strokeStyle = "rgba(255,255,255,0.7)";
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.arc(-0.8, 0, 2.6, Math.PI * 0.9, Math.PI * 1.4);
+      ctx.stroke();
+      break;
+    case "short": case "long": case "ponytail":
+      inkCircle(-1.1, 0, 4.3, hc, 1.1);
+      break;
+    case "bun":
+      inkCircle(-1.1, 0, 4.3, hc, 1.1);
+      inkCircle(-2.4, 0, 2.3, hc, 1.1);
+      break;
+    case "mohawk":
+      ctx.beginPath();
+      ctx.roundRect(-4.6, -1.1, 8, 2.2, 1);
+      ctx.fillStyle = hc;
+      ctx.fill();
+      ctx.strokeStyle = INK;
+      ctx.lineWidth = 0.9;
+      ctx.stroke();
+      break;
+    case "afro":
+      inkCircle(-0.9, 0, 6.3, hc, 1.2);
+      break;
+    case "spiky":
+      for (let a = Math.PI * 0.55; a <= Math.PI * 1.46; a += Math.PI * 0.15) {
+        ctx.beginPath();
+        ctx.moveTo(-1.1 + Math.cos(a - 0.22) * 3.6, Math.sin(a - 0.22) * 3.6);
+        ctx.lineTo(-1.1 + Math.cos(a) * 6.4, Math.sin(a) * 6.4);
+        ctx.lineTo(-1.1 + Math.cos(a + 0.22) * 3.6, Math.sin(a + 0.22) * 3.6);
+        ctx.closePath();
+        ctx.fillStyle = hc;
+        ctx.fill();
+        ctx.strokeStyle = INK;
+        ctx.lineWidth = 0.9;
+        ctx.stroke();
+      }
+      inkCircle(-1.1, 0, 4.1, hc, 1.1);
+      break;
+    case "beehive":
+      // a tall 'do, seen from above: a big swirl
+      inkCircle(-1.2, 0, 5.4, hc, 1.2);
+      ctx.strokeStyle = "rgba(35,31,46,0.45)";
+      ctx.lineWidth = 0.9;
+      ctx.beginPath();
+      ctx.arc(-1.2, 0, 3.4, 0.3, Math.PI * 1.7);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(-1.2, 0, 1.6, 2, Math.PI * 2 + 1);
+      ctx.stroke();
+      break;
+  }
+
+  switch (p.hat) {
+    case "cap":
+      inkEllipse(3.8, 0, 3.1, 3.7, p.hatColor, 1.1); // brim, facing forward
+      inkCircle(-0.5, 0, 4.4, p.hatColor, 1.2);
+      inkCircle(-0.5, 0, 0.8, INK, 0);
+      break;
+    case "sunhat":
+      inkCircle(0, 0, 7.8, p.hatColor, 1.2);
+      inkCircle(0, 0, 4.2, p.hatColor, 1.1);
+      ctx.strokeStyle = "#e8514a";
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.arc(0, 0, 4.2, 0, Math.PI * 2);
+      ctx.stroke();
+      break;
+    case "beanie":
+      inkCircle(-0.4, 0, 4.8, p.hatColor, 1.2);
+      ctx.strokeStyle = "rgba(35,31,46,0.35)";
+      ctx.lineWidth = 0.7;
+      for (let a = 0; a < Math.PI * 2; a += Math.PI / 4) {
+        ctx.beginPath();
+        ctx.moveTo(-0.4 + Math.cos(a) * 1.8, Math.sin(a) * 1.8);
+        ctx.lineTo(-0.4 + Math.cos(a) * 4.6, Math.sin(a) * 4.6);
+        ctx.stroke();
+      }
+      inkCircle(-0.4, 0, 1.7, "#ffffff", 1); // pompom
+      break;
+    case "tophat":
+      inkCircle(0, 0, 6.4, "#2a2530", 1.2);
+      inkCircle(0, 0, 4.1, "#3a3442", 1.2);
+      break;
+  }
+}
+
+// A baby stroller, pushed ahead (walker-local coordinates, x forward).
+function drawStroller(p) {
+  for (const [wx, wy] of [[10, -6], [10, 6], [21, -6], [21, 6]]) inkCircle(wx, wy, 1.6, "#2c2833", 0.8);
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  ctx.moveTo(7.5, -5);
+  ctx.lineTo(7.5, 5); // handle bar
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.roundRect(8.5, -5.5, 14, 11, 3);
+  ctx.fillStyle = p.strollerColor;
+  ctx.fill();
+  ctx.lineWidth = 1.3;
+  ctx.stroke();
+  inkCircle(13.5, 0, 2.4, p.skin, 0.9); // the baby
+  ctx.beginPath(); // canopy over the front half
+  ctx.moveTo(16, -5.5);
+  ctx.quadraticCurveTo(25, 0, 16, 5.5);
+  ctx.closePath();
+  ctx.fillStyle = "rgba(35,31,46,0.25)";
+  ctx.fill();
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 1.1;
+  ctx.stroke();
+}
+
+// Two-tone umbrella canopy, drawn over the walker.
+function drawUmbrella(p) {
+  const r = 12.5 * p.size * PED_SCALE, n = 8;
+  const cx = p.x + Math.cos(p.bodyAngle) * 1.5, cy = p.y + Math.sin(p.bodyAngle) * 1.5;
+  const spin = p.bodyAngle + p.seed;
+  for (let i = 0; i < n; i++) {
+    const a0 = spin + (i / n) * Math.PI * 2, a1 = spin + ((i + 1) / n) * Math.PI * 2;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + Math.cos(a0) * r, cy + Math.sin(a0) * r);
+    ctx.lineTo(cx + Math.cos(a1) * r, cy + Math.sin(a1) * r);
+    ctx.closePath();
+    ctx.fillStyle = i % 2 ? "#ffffff" : p.umbrella;
+    ctx.fill();
+  }
+  ctx.beginPath();
+  for (let i = 0; i <= n; i++) {
+    const a = spin + (i / n) * Math.PI * 2;
+    const x = cx + Math.cos(a) * r, y = cy + Math.sin(a) * r;
+    if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+  }
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 1.4;
+  ctx.stroke();
+  inkCircle(cx, cy, 1.3, "#3a3035", 0.8); // tip
+}
+
+function drawDog(d) {
+  const s = d.size;
+  ctx.fillStyle = PAL.shadow;
+  ctx.beginPath();
+  ctx.ellipse(d.x + 2, d.y + 2.5, 7 * s, 4.5 * s, d.angle, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.save();
+  ctx.translate(d.x, d.y);
+  ctx.rotate(d.angle);
+  ctx.scale(s, s);
+  const trot = Math.sin(d.phase) * 1.6;
+  for (const [px, py, k] of [[3.5, -3, 1], [3.5, 3, -1], [-3.5, -3, -1], [-3.5, 3, 1]]) {
+    inkCircle(px + trot * k, py, 1.2, "#3a3035", 0.6); // paws
+  }
+  // tail, wagging
+  const wag = Math.sin(d.tail) * 0.7;
+  ctx.strokeStyle = INK;
+  ctx.lineWidth = 2.6;
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(-5.5, 0);
+  ctx.lineTo(-5.5 - Math.cos(wag) * 4, Math.sin(wag) * 4);
+  ctx.stroke();
+  ctx.strokeStyle = d.color;
+  ctx.lineWidth = 1.4;
+  ctx.stroke();
+  ctx.lineCap = "butt";
+  inkEllipse(0, 0, 6, 3.6, d.color, 1.2); // body
+  inkEllipse(5.8, -2.8, 1.4, 1, d.color, 0.9); // ears
+  inkEllipse(5.8, 2.8, 1.4, 1, d.color, 0.9);
+  inkCircle(6.2, 0, 2.9, d.color, 1.1); // head
+  inkCircle(8.8, 0, 0.9, INK, 0); // nose
+  ctx.restore();
+}
+
 setupWorld();
 
 // Crates/street are laid out relative to W/H at build time; left stale after
@@ -1614,13 +2096,17 @@ window.addEventListener("resize", () => {
   clearTimeout(rebuildTimer);
   rebuildTimer = setTimeout(() => {
     crates = buildCrates();
-    const oldLaneY = street.npcLaneY;
+    const oldLaneY = street.npcLaneY, oldCurbY = street.curbY;
     street = buildStreet();
     staticDirty = true;
 
-    // Carry traffic along with its lane; anything now past the new right
-    // edge is cleaned up by updateTraffic.
+    // Carry traffic along with its lane, and pedestrians along with the
+    // sidewalk; anything now past the new right edge walks/drives off.
     for (const n of npcs) n.pos.y += street.npcLaneY - oldLaneY;
+    for (const p of pedestrians) {
+      p.y += street.curbY - oldCurbY;
+      if (p.dog) p.dog.y += street.curbY - oldCurbY;
+    }
 
     car1.pos.x = clamp(car1.pos.x, CAR.wallRadius, W - CAR.wallRadius);
     car1.pos.y = clamp(car1.pos.y, CAR.wallRadius, street.curbY - CAR.wallRadius);
@@ -1682,6 +2168,7 @@ function update(dt) {
   updateGarage();
   for (const car of movers) emitSmoke(car, dt);
   updateParticles(dt);
+  updatePedestrians(dt);
 }
 
 // ---------------------------------------------------------------------------
@@ -1705,6 +2192,7 @@ const PAL = {
   curb: "#dcd9e6",
   sidewalk: "#f5ddb6",
   sidewalkSeam: "#d6b58a",
+  driveway: "#e6dccb",
   lawn: "#86d152",
   lawnDark: "#5fae36",
   garageWall: "#f29bc4",
@@ -1877,7 +2365,7 @@ function drawStreetArt(c) {
   }
 
   // sidewalk, then a strip of lawn below it
-  const swH = Math.min(46, (H - curbY) * 0.45);
+  const swH = street.sidewalkBottomY - curbY;
   c.fillStyle = PAL.sidewalk;
   c.fillRect(0, curbY, W, swH);
   for (let x = 40; x < W; x += 64) inkLine(c, x, curbY + 5, x, curbY + swH - 3, x * 0.37, 1.5, PAL.sidewalkSeam, 0.6);
@@ -1903,22 +2391,54 @@ function drawStreetArt(c) {
   }
 }
 
-// Pink cartoon garage on the sidewalk/lawn, roll-up door facing its pad.
+// A polygon's outline as points, edges subdivided every `step` px -- so
+// tracePath's midpoint smoothing only softens the corners slightly instead
+// of turning a 4-point shape into a blob.
+function polygonPoints(verts, step = 6) {
+  const pts = [];
+  verts.forEach((a, i) => {
+    const b = verts[(i + 1) % verts.length];
+    const n = Math.max(1, Math.round(Math.hypot(b.x - a.x, b.y - a.y) / step));
+    for (let k = 0; k < n; k++) pts.push({ x: a.x + ((b.x - a.x) * k) / n, y: a.y + ((b.y - a.y) * k) / n });
+  });
+  return pts;
+}
+
+// Pink cartoon garage on the lawn, below the sidewalk, with a driveway
+// crossing the sidewalk to a lowered curb -- the sidewalk itself stays
+// continuous, so pedestrians can walk straight past.
 function drawGarageBuilding(c) {
   const g = street.garage;
-  const w = g.x1 - g.x0, by0 = g.curbY + 6, h = g.bottomY - by0;
+  const w = g.x1 - g.x0, by0 = g.buildingY0, h = g.bottomY - by0;
+
+  // driveway apron: concrete from the door out to the curb, flaring toward
+  // the street like a real one, over a lowered (cut) curb
+  const top = g.curbY - 1, bottom = by0 + 3;
+  inkShape(c, polygonPoints([
+    { x: g.doorX0 - 16, y: top }, { x: g.doorX1 + 16, y: top },
+    { x: g.doorX1 + 6, y: bottom }, { x: g.doorX0 - 6, y: bottom },
+  ]), PAL.driveway, 0);
+  inkLine(c, g.doorX0 - 16, top + 1, g.doorX0 - 6, bottom, 91, 2);
+  inkLine(c, g.doorX1 + 16, top + 1, g.doorX1 + 6, bottom, 92, 2);
+  for (const x of [g.doorX0 - 16, g.doorX1 + 16]) inkLine(c, x, g.curbY - 3, x, g.curbY + 4, x, 2); // curb-cut edges
+  inkLine(c, g.doorX0 - 12, g.curbY + 5, g.doorX1 + 12, g.curbY + 5, 93, 1.2, PAL.sidewalkSeam, 0.3); // lowered-curb lip
+  inkLine(c, g.doorX0 - 8, street.sidewalkBottomY, g.doorX1 + 8, street.sidewalkBottomY, 94, 1.2, PAL.sidewalkSeam, 0.3); // sidewalk edge
+
+  // building
   tracePath(c, roundRectPoints(g.x0 + 5, by0 + 6, w, h, 5, 10));
   c.fillStyle = PAL.shadow;
   c.fill();
   inkShape(c, wobble(roundRectPoints(g.x0, by0, w, h, 5, 8), 77, 1), PAL.garageWall, 3);
-  // flat roof inset with a vent
-  const inset = 10;
-  inkShape(c, wobble(roundRectPoints(g.x0 + inset, by0 + 28, w - inset * 2, h - 28 - inset, 4, 8), 78, 0.8), PAL.garageRoof, 2);
-  inkShape(c, wobble(roundRectPoints(g.x1 - 34, by0 + 36, 14, 14, 7, 4), 79, 0.4), "#e9e4f2", 1.8);
-  // roll-up door with slats
-  const doorH = Math.min(20, h * 0.3), dx0 = g.x0 + 18, dw = w - 36;
-  inkShape(c, roundRectPoints(dx0, by0 - 2, dw, doorH, 2, 6), PAL.garageDoor, 2.2);
-  for (let y = by0 + 3; y < by0 + doorH - 3; y += 4.5) inkLine(c, dx0 + 3, y, dx0 + dw - 3, y, y, 1, "rgba(35,31,46,0.45)", 0.3);
+  // roll-up door with slats, on the edge facing the driveway
+  const doorH = Math.min(18, h * 0.3), dw = g.doorX1 - g.doorX0;
+  // flat roof inset (below the door) with a vent, when there's room for it
+  const roofY = by0 + doorH + 6, roofH = h - (doorH + 6) - 8;
+  if (roofH > 14) {
+    inkShape(c, wobble(roundRectPoints(g.x0 + 10, roofY, w - 20, roofH, 4, 8), 78, 0.8), PAL.garageRoof, 2);
+    if (roofH > 26) inkShape(c, wobble(roundRectPoints(g.x1 - 34, roofY + 6, 14, 14, 7, 4), 79, 0.4), "#e9e4f2", 1.8);
+  }
+  inkShape(c, roundRectPoints(g.doorX0, by0 - 2, dw, doorH, 2, 6), PAL.garageDoor, 2.2);
+  for (let y = by0 + 3; y < by0 + doorH - 3; y += 4.5) inkLine(c, g.doorX0 + 3, y, g.doorX1 - 3, y, y, 1, "rgba(35,31,46,0.45)", 0.3);
 }
 
 function drawCrate(c, cr) {
@@ -2312,6 +2832,7 @@ function render() {
   ctx.drawImage(staticLayer, 0, 0); // ground, street, garage building, crates, parked cars
   drawParkingTargets();
   drawGaragePad();
+  drawPedestrians();
   for (const n of npcs) drawCar(ctx, n);
   if (coin) drawCoin(coin);
   drawCar(ctx, car1);
