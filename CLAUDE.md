@@ -108,7 +108,23 @@ A flat `particles` array (module-level) holds purely cosmetic entries, each with
 
 ### Rendering
 
-`drawCar` draws each car (player or parked) in its own rotated/translated canvas context: wheels first, then the body rectangle, then a cabin/windshield rect to make facing direction readable at a glance. The two front wheels get distinct angles from `ackermannWheelAngles(car.steerCurrent, ...)` rather than sharing one — see the Ackermann section above. Wheels are drawn with a light outline + center stripe (`drawWheel`) specifically so steering direction stays legible at small sizes against the dark asphalt — keep that contrast if retuning colors. `drawStreet` draws the sidewalk, curb line, dashed centerline, and the "P" spot markings, in that order. `drawParkingTargets` and `drawGarage` follow, and then crates and cars are drawn on top.
+The art style is a **hand-drawn cartoon**, chosen on explicit request (the earlier flat dark-gray look felt ugly):
+- **Ink outlines:** everything gets a thick dark outline (`INK`, also `--ink` in `style.css`).
+- **Palette:** bright, flat colors from the `PAL` object: sandy lot, purple-gray road, peach sidewalk, green lawn, pink garage.
+- **Hand-drawn wobble:** outlines are bent slightly, seeded per object and stable across frames. The building blocks are `roundRectPoints` (samples a rounded rect's outline), `wobble` (bends it along its normals), `tracePath`/`inkShape` (smooth path, flat fill plus ink stroke) and `inkLine` (a bowed line pinned at both ends). There's deliberately no frame-to-frame "line boil", which would shimmer while driving.
+
+Keep new art consistent: flat fill, ink outline, and a soft `PAL.shadow` drop shadow offset down-right in *world* space.
+
+**Static layer:** everything that never moves is drawn once into an offscreen `staticLayer` canvas by `buildStaticLayer`, and `render()` blits it each frame. That covers ground (with cracks and oil stains), street, sidewalk, lawn, the garage *building*, crates, parked cars and paper grain. Setting `staticDirty = true` requests a rebuild, and `render()` performs it. It must be set wherever `street` or `crates` are rebuilt (`setupWorld`, the resize handler), or the picture drifts away from the collision geometry. The rebuild is deferred to `render()` because `setupWorld()` first runs before the render section's `const`s (`INK`, `PAL`, `staticLayer`) are initialized; calling `buildStaticLayer` directly from there throws a TDZ ReferenceError.
+
+**Cars:** `drawCar(c, car)` takes the target context, so the same code paints parked cars into the static layer and moving cars onto the main canvas. The body, cabin and window outlines come from `carArt(car)`, built once per car from `car.seed` and cached in `car.art`. Draw order:
+1. A world-space drop shadow.
+2. Wheels (the two fronts get distinct Ackermann angles from `ackermannWheelAngles(car.steerCurrent, ...)`; see the Ackermann section).
+3. The body, cabin, glass, head/tail lights, and dents (dark bruises with ink cracks, clipped to the body).
+
+Wheels keep a light center stripe (`drawWheel`) so steering direction stays legible at small sizes. Keep that contrast if retuning colors.
+
+**Dynamic layers:** after the static layer, `render()` draws `drawParkingTargets`, `drawGaragePad` (pad, pulse, flash, wrench and coin), NPCs, the coin, the players, then particles. Particle lines are drawn with `inkedStroke` (a fat ink pass, then the color). The pale sparks and flash were tuned for the old dark background and nearly vanished on the light one until they got outlines, and the flash was switched from white to warm yellow for the same reason.
 
 ### HUD and on-screen text: keep it minimal
 
