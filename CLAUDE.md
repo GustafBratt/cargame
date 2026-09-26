@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A single-page, no-build, top-down 2-player car sandbox. Vanilla HTML/CSS/JS, rendered on a `<canvas>` with `requestAnimationFrame`. Cars are rectangles with visible wheels (front wheels turn with steering); Player 1 drives with WASD, Player 2 with IJKL. There's a grid of static crates to bump into, a curbside street with parked cars and two marked practice spots for parallel parking, and the two players collide with each other too.
+A single-page, no-build, top-down 2-player car sandbox. Vanilla HTML/CSS/JS, rendered on a `<canvas>` with `requestAnimationFrame`. Cars are rectangles with visible wheels (front wheels turn with steering); Player 1 drives with WASD, Player 2 with IJKL. There's a grid of static crates to bump into, a curbside street with parked cars and two marked practice spots for parallel parking, and the two players collide with each other too. AI traffic drives across the street lane above the centerline.
 
 There is no framework, no package.json, and no build/bundle step — the browser loads `index.html`, `style.css`, and `game.js` directly.
 
@@ -65,6 +65,16 @@ A row of parked cars (reusing the same car object shape, just never fed through 
 
 A single shared `coin` (`{x,y}`, module-level) is always present on the map. Eligibility to collect it is per-car, not shared: a car can only pick it up while its own `gameState === "seekCoin"`. Whichever eligible car reaches it first (checked in `car1, car2` order, so simultaneous ties favor P1) scores, flips to `gameState = "mustPark"`, and `spawnCoin()` immediately drops a new coin elsewhere — the *other* car's eligibility never depended on the scorer parking, so it can keep going right away. A car in `"mustPark"` stays locked out of every coin (even ones that spawned after its own pickup) until it independently satisfies `isParked` — stopped (`PARK_SPEED_LIMIT`), aligned with the curb within `PARK_ANGLE_TOLERANCE`, at the parked row's y-offset, centered inside one of `street.parkingSpots` — at which point it flips back to `"seekCoin"` and can grab whatever coin is currently sitting there, and `spawnFirework(car.pos.x, car.pos.y, car.color)` fires as the visible "you parked successfully" cue. This is the key invariant: **each car's own take→park cycle gates only that car**, never the other one. `resetCars` (bound to `R`) resets both scores/states, spawns a fresh coin, and clears `particles`.
 
+### NPC traffic (`updateTraffic` / `npcDrive`)
+
+AI cars (`npcs`, module-level) spawn as a Poisson process (`NPC_SPAWN_MEAN`, ~10s average), enter from just off the left or right edge, and drive the lane at `street.npcLaneY`, just above the dashed centerline (`street.centerlineY`, also used by `drawStreet`). They're ordinary car objects running through the same `stepCar` physics and all the same collisions as the players; the only difference is that `readInput` returns `car.drive` (set each step by `npcDrive`) instead of reading keys. The one exception is `resolveWalls`: NPCs aren't fenced in by the arena, and `updateTraffic` removes them once they're well outside the canvas.
+
+`npcDrive` steers toward a point `NPC_LOOKAHEAD` ahead along the lane. That both holds the lane and, after a hit, turns the car back around onto it. It brakes for any car within `NPC_BRAKE_DIST` in its path (never reversing into a queue), and after being stopped too long (1.5s wedged, 3s waiting behind a car) it backs up with opposite lock for 1s and retries. Without that timeout, a car knocked off the road could wait forever behind a player who isn't moving.
+
+There's only one traffic lane, so `spawnNpc` gives a new car the same direction as any traffic already on screen, and picks a random direction only when the road is empty. This prevents head-on meetings.
+
+`resetTraffic` runs from `setupWorld` and `resetCars`. On resize, NPCs are shifted by the change in `npcLaneY` so they stay in the lane.
+
 ### Particles (`spawnFirework` / `updateParticles` / `drawParticles`)
 
 A flat `particles` array (module-level) holds purely cosmetic entries, each with its own `life`/`maxLife`, of five types: `"spark"` (radiating, decelerating dot), `"streak"` (same motion, drawn as a short trailing line along its velocity instead of a dot), `"ring"` (expanding stroked circle), `"flash"` (a fast-fading radial-gradient glow for the initial "pop"), and `"delayedBurst"` (an invisible timer-only marker -- when it expires, `updateParticles` spawns a smaller `spawnSecondaryPop` burst at a jittered offset, which is what gives the firework its two-stage "pop-pop" read instead of one flat burst). `updateParticles(dt)` ages, moves, and prunes all of these inside the fixed-step `update()` loop (so motion stays smooth regardless of render rate); `drawParticles()` paints them last in `render()`, on top of everything else, and resets `ctx.lineCap` afterward since the `"streak"` render sets it to `"round"` and nothing else in the file wraps its own drawing in `save()`/`restore()`. This system never touches car state or game logic — it's purely triggered by (and reacts to) `updateCoinRace`, never the other way around. If another "moment" ever needs celebrating, reuse `spawnFirework` rather than growing a second particle system.
@@ -75,4 +85,4 @@ A flat `particles` array (module-level) holds purely cosmetic entries, each with
 
 ### Input
 
-A single global `Set` (`keys`) tracks currently-held keys via `keydown`/`keyup` listeners; `readInput(car)` reads throttle/steer from each car's own key bindings (`car.input`). `R` resets both cars to their start positions/orientations. Key handling calls `preventDefault()` only for the specific keys the game uses, so it doesn't swallow other browser shortcuts.
+A single global `Set` (`keys`) tracks currently-held keys via `keydown`/`keyup` listeners; `readInput(car)` reads throttle/steer from each car's own key bindings (`car.input`). `R` resets both cars to their start positions/orientations (and clears traffic). Key handling calls `preventDefault()` only for the specific keys the game uses, so it doesn't swallow other browser shortcuts.

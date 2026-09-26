@@ -107,6 +107,7 @@ function clamp(v, lo, hi) {
 }
 
 function readInput(car) {
+  if (car.drive) return car.drive; // AI-controlled traffic, see npcDrive
   const throttle = (keys.has(car.input.up) ? 1 : 0) - (keys.has(car.input.down) ? 1 : 0);
   const steer = (keys.has(car.input.right) ? 1 : 0) - (keys.has(car.input.left) ? 1 : 0);
   return { throttle, steer };
@@ -358,6 +359,8 @@ function resolveCarVsCar(carA, carB) {
 // ---------------------------------------------------------------------------
 
 let car1, car2, crates, street;
+let npcs = []; // AI traffic cars, see updateTraffic
+let npcSpawnTimer = 0;
 let particles = []; // cosmetic-only firework sparks/rings, see spawnFirework
 
 const PARKED_COLORS = ["#6b7280", "#7c6b52", "#59695a", "#69596c", "#54606b", "#7a5c53"];
@@ -394,7 +397,10 @@ function buildStreet() {
     }
   }
 
-  return { curbY, carCenterY, parkedCars, parkingSpots };
+  const centerlineY = curbY - 90;
+  const npcLaneY = centerlineY - CAR.width / 2 - 8; // traffic lane, just above the centerline
+
+  return { curbY, carCenterY, centerlineY, npcLaneY, parkedCars, parkingSpots };
 }
 
 function resetCars() {
@@ -407,6 +413,7 @@ function resetCars() {
   car2.score = 0; car2.gameState = "seekCoin";
   spawnCoin();
   particles.length = 0;
+  resetTraffic();
 }
 
 function buildCrates() {
@@ -439,6 +446,7 @@ function setupWorld() {
   car2.score = 0; car2.gameState = "seekCoin";
   spawnCoin();
   particles.length = 0;
+  resetTraffic();
 }
 
 // ---------------------------------------------------------------------------
@@ -584,6 +592,125 @@ function updateParticles(dt) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// NPC traffic
+// ---------------------------------------------------------------------------
+// AI cars appear at random (a Poisson process averaging one every
+// NPC_SPAWN_MEAN seconds), enter from the left or right edge, and drive
+// across the lane just above the road centerline. They're ordinary car
+// objects run through the same stepCar physics and collisions as the
+// players -- only their input comes from npcDrive instead of the keyboard --
+// so they can be rammed, spun and shoved like anything else. They aren't
+// fenced in by the arena walls (they enter and leave through the side
+// edges) and are removed once well outside the canvas.
+
+const NPC_SPAWN_MEAN = 10; // seconds, average time between spawns
+const NPC_CRUISE_SPEED = 140; // px/s
+const NPC_LOOKAHEAD = 90; // px, how far along the lane the steering aims
+const NPC_BRAKE_DIST = 110; // px, brake for any car this close ahead in the car's path
+const NPC_COLORS = ["#e6e6e6", "#d9534f", "#5cb85c", "#9b7fd4", "#3d4a5c", "#c27ba0"];
+
+function nextNpcSpawnDelay() {
+  return -Math.log(1 - Math.random()) * NPC_SPAWN_MEAN;
+}
+
+function resetTraffic() {
+  npcs.length = 0;
+  npcSpawnTimer = nextNpcSpawnDelay();
+}
+
+function spawnNpc() {
+  // There's only one lane, so while any traffic is still out there, new cars
+  // follow its direction rather than spawning head-on into it.
+  const dir = npcs.length ? npcs[0].dir : Math.random() < 0.5 ? 1 : -1;
+  const x = dir > 0 ? -CAR.length : W + CAR.length;
+  const y = street.npcLaneY;
+  const clear = [car1, car2, ...npcs].every((c) => Math.hypot(c.pos.x - x, c.pos.y - y) > CAR.length * 2.5);
+  if (!clear) return false;
+
+  const color = NPC_COLORS[Math.floor(Math.random() * NPC_COLORS.length)];
+  const npc = createCar(x, y, dir > 0 ? 0 : Math.PI, color, null);
+  npc.dir = dir;
+  npc.vel.x = dir * NPC_CRUISE_SPEED;
+  npc.drive = { throttle: 0, steer: 0 };
+  npc.stuckTime = 0;
+  npc.reverseTime = 0;
+  npcs.push(npc);
+  return true;
+}
+
+function wrapAngle(a) {
+  return Math.atan2(Math.sin(a), Math.cos(a));
+}
+
+// Sets npc.drive (read by stepCar via readInput) for this step.
+function npcDrive(npc, dt) {
+  const forward = { x: Math.cos(npc.angle), y: Math.sin(npc.angle) };
+  const forwardSpeed = npc.vel.x * forward.x + npc.vel.y * forward.y;
+
+  // Steer toward a point further along the lane -- keeps the car on the lane
+  // line, and also brings it back (turning around if needed) after a hit.
+  const tx = npc.pos.x + npc.dir * NPC_LOOKAHEAD;
+  const headingErr = wrapAngle(Math.atan2(street.npcLaneY - npc.pos.y, tx - npc.pos.x) - npc.angle);
+  let steer = clamp(headingErr * 2.5, -1, 1);
+
+  let blocked = false;
+  for (const other of [car1, car2, ...npcs]) {
+    if (other === npc) continue;
+    const dx = other.pos.x - npc.pos.x, dy = other.pos.y - npc.pos.y;
+    const ahead = dx * forward.x + dy * forward.y;
+    const side = dy * forward.x - dx * forward.y;
+    if (ahead > 0 && ahead < NPC_BRAKE_DIST && Math.abs(side) < CAR.width + 6) {
+      blocked = true;
+      break;
+    }
+  }
+
+  let throttle;
+  if (npc.reverseTime > 0) {
+    // Backing out of a jam: opposite lock, since reversing swings the nose
+    // the other way.
+    npc.reverseTime -= dt;
+    throttle = -1;
+    steer = -steer;
+  } else if (blocked) {
+    throttle = forwardSpeed > 1 ? -1 : 0; // brake, but never start reversing into a queue
+  } else {
+    throttle = forwardSpeed < NPC_CRUISE_SPEED ? 1 : 0;
+  }
+
+  // Stopped for too long -- wedged against something (a crate, the curb), or
+  // waiting on a car that isn't moving out of the way: back up for a moment,
+  // then try again on a different line. Waiting behind a car gets more
+  // patience than being wedged.
+  const speed = Math.hypot(npc.vel.x, npc.vel.y);
+  if (npc.reverseTime <= 0 && speed < 5) {
+    npc.stuckTime += dt;
+    if (npc.stuckTime > (blocked ? 3 : 1.5)) {
+      npc.stuckTime = 0;
+      npc.reverseTime = 1;
+    }
+  } else {
+    npc.stuckTime = 0;
+  }
+
+  npc.drive.throttle = throttle;
+  npc.drive.steer = steer;
+}
+
+function updateTraffic(dt) {
+  npcSpawnTimer -= dt;
+  if (npcSpawnTimer <= 0) npcSpawnTimer = spawnNpc() ? nextNpcSpawnDelay() : 0.5;
+
+  const m = CAR.length * 2;
+  for (let i = npcs.length - 1; i >= 0; i--) {
+    const n = npcs[i];
+    if (n.pos.x < -m || n.pos.x > W + m || n.pos.y < -m || n.pos.y > H + m) npcs.splice(i, 1);
+  }
+
+  for (const n of npcs) npcDrive(n, dt);
+}
+
 setupWorld();
 
 // Crates/street are laid out relative to W/H at build time; left stale after
@@ -598,7 +725,12 @@ window.addEventListener("resize", () => {
   clearTimeout(rebuildTimer);
   rebuildTimer = setTimeout(() => {
     crates = buildCrates();
+    const oldLaneY = street.npcLaneY;
     street = buildStreet();
+
+    // Carry traffic along with its lane; anything now past the new right
+    // edge is cleaned up by updateTraffic.
+    for (const n of npcs) n.pos.y += street.npcLaneY - oldLaneY;
 
     car1.pos.x = clamp(car1.pos.x, CAR.wallRadius, W - CAR.wallRadius);
     car1.pos.y = clamp(car1.pos.y, CAR.wallRadius, street.curbY - CAR.wallRadius);
@@ -631,25 +763,26 @@ function resolveCurb(car) {
 }
 
 function update(dt) {
-  stepCar(car1, dt);
-  stepCar(car2, dt);
+  updateTraffic(dt);
 
+  const movers = [car1, car2, ...npcs];
+  for (const car of movers) stepCar(car, dt);
+
+  // Only the players are fenced in by the arena walls -- traffic enters and
+  // leaves through the side edges (see updateTraffic).
   resolveWalls(car1);
   resolveWalls(car2);
-  resolveCurb(car1);
-  resolveCurb(car2);
 
-  for (const c of crates) {
-    resolveCarVsStaticCircle(car1, { x: c.x, y: c.y }, c.r);
-    resolveCarVsStaticCircle(car2, { x: c.x, y: c.y }, c.r);
-  }
-  for (const pc of street.parkedCars) {
-    for (const cc of pc.collisionCircles) {
-      resolveCarVsStaticCircle(car1, cc, CAR.capsuleRadius);
-      resolveCarVsStaticCircle(car2, cc, CAR.capsuleRadius);
+  for (const car of movers) {
+    resolveCurb(car);
+    for (const c of crates) resolveCarVsStaticCircle(car, { x: c.x, y: c.y }, c.r);
+    for (const pc of street.parkedCars) {
+      for (const cc of pc.collisionCircles) resolveCarVsStaticCircle(car, cc, CAR.capsuleRadius);
     }
   }
-  resolveCarVsCar(car1, car2);
+  for (let i = 0; i < movers.length; i++) {
+    for (let j = i + 1; j < movers.length; j++) resolveCarVsCar(movers[i], movers[j]);
+  }
 
   updateCoinRace();
   updateParticles(dt);
@@ -691,8 +824,8 @@ function drawStreet() {
   ctx.lineWidth = 3;
   ctx.setLineDash([22, 18]);
   ctx.beginPath();
-  ctx.moveTo(0, curbY - 90);
-  ctx.lineTo(W, curbY - 90);
+  ctx.moveTo(0, street.centerlineY);
+  ctx.lineTo(W, street.centerlineY);
   ctx.stroke();
   ctx.setLineDash([]);
 
@@ -885,6 +1018,7 @@ function render() {
   drawStreet();
   for (const c of crates) drawCrate(c);
   for (const pc of street.parkedCars) drawCar(pc);
+  for (const n of npcs) drawCar(n);
   if (coin) drawCoin(coin);
   drawCar(car1);
   drawCar(car2);
