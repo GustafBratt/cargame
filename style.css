@@ -72,6 +72,34 @@ canvas {
   box-sizing: border-box;
 }
 
+/* Autopilot toggle: a little cartoon push button in the badge, filled with
+   the player's color while the AI is driving. The HUD ignores the mouse,
+   so the button opts back in. */
+.auto-btn {
+  pointer-events: auto;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: inherit;
+  background: var(--paper);
+  border: 2px solid var(--ink);
+  border-radius: 8px;
+  box-shadow: 2px 2px 0 var(--ink);
+  padding: 2px 7px;
+}
+
+.auto-btn:active {
+  transform: translate(1px, 1px);
+  box-shadow: 1px 1px 0 var(--ink);
+}
+
+.auto-btn.on { color: var(--paper); }
+.hud-p1 .auto-btn.on { background: #1b86cc; }
+.hud-p2 .auto-btn.on { background: #d9690f; }
+
 .hint {
   position: fixed;
   bottom: 10px;

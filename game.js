@@ -766,6 +766,7 @@ function clamp(v, lo, hi) {
 
 function readInput(car) {
   if (car.drive) return car.drive; // AI-controlled traffic, see npcDrive
+  if (car.autopilot) return car.ap.drive; // a player on autopilot, see updateAutopilot
   const held = (names) => (names.some((k) => keys.has(k)) ? 1 : 0);
   const throttle = held(car.input.up) - held(car.input.down);
   const steer = held(car.input.right) - held(car.input.left);
@@ -1849,6 +1850,383 @@ function updateTraffic(dt) {
 }
 
 // ---------------------------------------------------------------------------
+// Autopilot (a player car driven by a deliberately bad AI)
+// ---------------------------------------------------------------------------
+// Each player's HUD button toggles car.autopilot. The AI then plays the game
+// for them: chases coins, parallel parks, and visits the garage when badly
+// dented. It plays it BADLY on purpose:
+// - it drives too fast, steers with a wobble, and brakes late
+// - it doesn't always notice a crate in its path (AP_BLIND_CHANCE)
+// - it picks a random parking spot, and sometimes the one the other
+//   autopilot is already going for, so they fight over it
+// - its parking is a scripted S-curve that works only when it doesn't
+//   rush it or get knocked off line; a failed attempt pulls out and retries
+// - now and then it forgets about coins and goes ramming traffic
+// It drives through the same readInput -> stepCar path as a human (readInput
+// returns car.ap.drive), so it obeys the same physics and collisions.
+
+const AP_CRUISE_MIN = 170, AP_CRUISE_MAX = 250; // px/s chasing coins (rolled per activation)
+const AP_STEER_GAIN = 2.4; // steer per radian of heading error
+const AP_WOBBLE = 0.3; // steering wander amplitude, times the per-activation sloppiness
+const AP_BLIND_CHANCE = 0.4; // chance of not seeing a crate in its path, rolled per encounter
+const AP_SEEN_RESET = 2.5; // s until crates it saw (or missed) get re-rolled
+const AP_HARASS_MEAN = 18; // s, average time chasing coins before it gets bored and bullies traffic
+const AP_HARASS_MIN = 5, AP_HARASS_MAX = 10; // s of harassment
+const AP_HARASS_SPEED = 280;
+const AP_PARK_SPEED = 28; // px/s while reversing into a spot (times the per-attempt rush)
+const AP_PARK_TIMEOUT = 20; // s before a stalled parking attempt starts over
+
+function makeAutopilot() {
+  return {
+    drive: { throttle: 0, steer: 0 },
+    goal: null,
+    cruise: AP_CRUISE_MIN + Math.random() * (AP_CRUISE_MAX - AP_CRUISE_MIN),
+    sloppy: 0.5 + Math.random() * 0.8,
+    lateBraking: 1 + Math.random() * 0.8, // overestimates its brakes by this much
+    garageAt: 0.35 + Math.random() * 0.35, // damage that sends it to the garage
+    wobblePhase: Math.random() * 10,
+    seen: new Map(), // crate -> did it notice this one
+    seenTimer: 0,
+    reverseTime: 0, reverseSteer: 0,
+    stuckTime: 0,
+    park: null, garage: null, harass: null,
+  };
+}
+
+function toggleAutopilot(car) {
+  car.autopilot = !car.autopilot;
+  if (car.autopilot) car.ap = makeAutopilot();
+}
+
+function apForwardSpeed(car) {
+  return car.vel.x * Math.cos(car.angle) + car.vel.y * Math.sin(car.angle);
+}
+
+// Throttle that holds a signed forward speed (negative = reverse).
+function apThrottleFor(car, target) {
+  const fwd = apForwardSpeed(car);
+  if (target >= 0) {
+    if (fwd < -4) return 1; // rolling backward: throttle brakes it
+    return fwd < target ? 1 : fwd > target + 25 ? -1 : 0;
+  }
+  if (fwd > 4) return -1; // rolling forward: brake
+  return fwd > target ? -1 : fwd < target - 25 ? 1 : 0;
+}
+
+function apStop(car) {
+  const fwd = apForwardSpeed(car);
+  return Math.abs(fwd) > 4 ? -Math.sign(fwd) : 0;
+}
+
+// Steering that points the nose (or, reversing, the tail) at (tx, ty).
+// Reversing with the wheel turned right swings the nose left, hence the flip.
+function apSteerAt(car, tx, ty, reverse = false) {
+  const want = Math.atan2(ty - car.pos.y, tx - car.pos.x);
+  const err = wrapAngle(want - car.angle - (reverse ? Math.PI : 0));
+  return clamp(err * AP_STEER_GAIN, -1, 1) * (reverse ? -1 : 1);
+}
+
+// Swerve away from a crate or parked car dead ahead -- if it notices it.
+function apAvoid(car, ap, steer) {
+  const fx = Math.cos(car.angle), fy = Math.sin(car.angle);
+  const look = 60 + Math.max(0, apForwardSpeed(car)) * 0.35;
+  const obstacles = [...crates, ...street.parkedCars];
+  for (const o of obstacles) {
+    const ox = o.pos ? o.pos.x : o.x, oy = o.pos ? o.pos.y : o.y;
+    const reach = (o.pos ? CAR.length / 2 : o.r) + CAR.capsuleRadius + 4;
+    const dx = ox - car.pos.x, dy = oy - car.pos.y;
+    const ahead = dx * fx + dy * fy;
+    const side = dy * fx - dx * fy; // > 0: to our right
+    if (ahead <= 0 || ahead > look || Math.abs(side) > reach) continue;
+    if (!ap.seen.has(o)) ap.seen.set(o, Math.random() > AP_BLIND_CHANCE);
+    if (ap.seen.get(o)) return side >= 0 ? -1 : 1;
+  }
+  return steer;
+}
+
+// Drive toward (tx, ty) at up to `cruise`, optionally coming to a stop
+// `stopAt` px short of it. Handles its own clumsy three-point turns and
+// backing out when wedged. Returns the distance left.
+function apDriveTo(car, ap, tx, ty, cruise, { stopAt = -1, avoid = true } = {}) {
+  const dx = tx - car.pos.x, dy = ty - car.pos.y, dist = Math.hypot(dx, dy);
+  const err = wrapAngle(Math.atan2(dy, dx) - car.angle);
+  const speed = Math.hypot(car.vel.x, car.vel.y);
+
+  if (ap.reverseTime > 0) {
+    ap.drive.throttle = apThrottleFor(car, -70);
+    ap.drive.steer = ap.reverseSteer;
+    return dist;
+  }
+  // Target behind and close: back up with opposite lock to swing the nose round.
+  if (Math.abs(err) > 2 && dist < 110 && speed < 60) {
+    ap.reverseTime = 0.6 + Math.random() * 0.4;
+    ap.reverseSteer = err > 0 ? -1 : 1;
+  }
+
+  let target = cruise * clamp(1.15 - Math.abs(err) / 1.5, 0.3, 1);
+  if (stopAt >= 0) {
+    // v = sqrt(2 a d), with an optimistic idea of how hard it can brake
+    target = Math.min(target, Math.sqrt(2 * CAR.brakePower * 0.5 * ap.lateBraking * Math.max(0, dist - stopAt)));
+  }
+  let steer = clamp(err * AP_STEER_GAIN, -1, 1) + Math.sin(ap.wobblePhase) * AP_WOBBLE * ap.sloppy;
+  if (avoid) steer = apAvoid(car, ap, steer);
+  ap.drive.throttle = stopAt >= 0 && dist <= stopAt ? apStop(car) : apThrottleFor(car, target);
+  ap.drive.steer = clamp(steer, -1, 1);
+  return dist;
+}
+
+// Pushing but not moving (wedged on a crate, a wall, the other car): back
+// out with opposite lock and try again on a different line.
+function apCheckStuck(car, ap, dt, pushing) {
+  const speed = Math.hypot(car.vel.x, car.vel.y);
+  if (ap.reverseTime > 0 || !pushing || speed > 8) {
+    ap.stuckTime = 0;
+    return;
+  }
+  ap.stuckTime += dt;
+  if (ap.stuckTime > 0.8) {
+    ap.stuckTime = 0;
+    ap.reverseTime = 0.7 + Math.random() * 0.6;
+    ap.reverseSteer = ap.drive.steer >= 0 ? -1 : 1;
+  }
+}
+
+function apNpcOnScreen(npc) {
+  return npcs.includes(npc) && npc.pos.x > 30 && npc.pos.x < W - 30;
+}
+
+function apPickGoal(car, ap, dt) {
+  if (ap.goal === "garage" && car.damage > 0 && car.score >= REPAIR_COST) return "garage";
+  if (ap.goal === "harass" && ap.harass.time > 0 && apNpcOnScreen(ap.harass.npc)) return "harass";
+  if (car.damage >= ap.garageAt && car.score >= REPAIR_COST) return "garage";
+  if (car.gameState === "mustPark") return "park";
+  // Bored of coins: go bully a passing car instead.
+  const victims = npcs.filter(apNpcOnScreen);
+  if (victims.length && Math.random() < dt / AP_HARASS_MEAN) {
+    ap.harass = { npc: pickOf(victims), time: AP_HARASS_MIN + Math.random() * (AP_HARASS_MAX - AP_HARASS_MIN) };
+    return "harass";
+  }
+  return "coin";
+}
+
+function updateAutopilot(car, dt) {
+  const ap = car.ap;
+  ap.wobblePhase += dt * (1.3 + ap.sloppy);
+  ap.seenTimer -= dt;
+  if (ap.seenTimer <= 0) {
+    ap.seen.clear();
+    ap.seenTimer = AP_SEEN_RESET;
+  }
+  if (ap.reverseTime > 0) ap.reverseTime -= dt;
+
+  const goal = apPickGoal(car, ap, dt);
+  if (goal !== ap.goal) {
+    ap.goal = goal;
+    ap.park = ap.garage = null;
+    if (goal !== "harass") ap.harass = null;
+  }
+
+  if (goal === "coin") {
+    apDriveTo(car, ap, coin.x, coin.y, ap.cruise);
+    apCheckStuck(car, ap, dt, ap.drive.throttle !== 0);
+  } else if (goal === "harass") {
+    apHarass(car, ap, dt);
+  } else if (goal === "garage") {
+    apGarage(car, ap, dt);
+  } else {
+    apPark(car, ap, dt);
+  }
+}
+
+// Ram the chosen NPC, back off, ram it again, until the urge passes.
+function apHarass(car, ap, dt) {
+  const h = ap.harass, npc = h.npc;
+  h.time -= dt;
+  // aim a little ahead of where it's going
+  const tx = npc.pos.x + npc.vel.x * 0.35, ty = npc.pos.y + npc.vel.y * 0.35;
+  apDriveTo(car, ap, tx, ty, AP_HARASS_SPEED, { avoid: false });
+  if (ap.reverseTime <= 0 && Math.hypot(npc.pos.x - car.pos.x, npc.pos.y - car.pos.y) < CAR.length) {
+    ap.reverseTime = 0.5 + Math.random() * 0.4; // got it -- back up for another run
+    ap.reverseSteer = Math.random() < 0.5 ? -1 : 1;
+  }
+  apCheckStuck(car, ap, dt, ap.drive.throttle !== 0);
+}
+
+// Pull onto the garage pad along the road, stop, and wait for the mechanic.
+function apGarage(car, ap, dt) {
+  const g = street.garage;
+  const px = (g.x0 + g.x1) / 2, py = (g.padY0 + g.curbY) / 2;
+  if (!ap.garage) ap.garage = { phase: "approach" };
+  const s = ap.garage;
+  if (s.phase === "approach") {
+    const d = apDriveTo(car, ap, g.x0 - 110, py, 180);
+    if (d < 45) s.phase = "line";
+    apCheckStuck(car, ap, dt, ap.drive.throttle !== 0);
+  } else if (s.phase === "line") {
+    // follow the pad's centerline in and stop in the middle
+    apDriveTo(car, ap, Math.max(car.pos.x + 60, px), py, 120, { stopAt: 0, avoid: false });
+    const dx = px - car.pos.x;
+    if (dx < 8) ap.drive.throttle = apStop(car);
+    if (onGaragePad(car) && Math.hypot(car.vel.x, car.vel.y) < 5) s.phase = "wait";
+    if (dx < -30) s.phase = "approach"; // overshot badly
+  } else {
+    ap.drive.throttle = apStop(car);
+    ap.drive.steer = 0;
+    if (!onGaragePad(car)) s.phase = "approach"; // got shoved off
+  }
+}
+
+// ---- Parallel parking -----------------------------------------------------
+// A scripted S-curve, reversing in the way a driving instructor teaches it:
+// 1. "approach": head for a point out on the road before the spot
+// 2. "line": creep along a line parallel to the parked row (p.gap out from
+//    it), stop past the spot
+// 3. "swing": reverse at full lock, tail toward the curb
+// 4. "counter": reverse at opposite lock until straight
+// 5. "settle": shuffle forward and back, straightening up, until it's
+//    straight and in the middle of the spot, then stop
+// 6. "wait": if that didn't count as parked, "pullout" and try again
+// dir is +1 when it drives past the spot heading right, -1 heading left.
+//
+// The switch from swing to counter is measured on the REAR AXLE, which
+// (unlike the car's center) really does follow the arc: reversing at full
+// lock, the center first swings outward before it comes in. Switching once
+// the rear axle has covered AP_PARK_SWITCH of the gap lands the car on the
+// parked row's line at parking speed (the counter-swing covers more than
+// the swing, since the wheel takes a moment to wind across). Measured
+// headlessly: sideways travel ~= gap, and backward travel ~= 50 + gap px.
+// Rushing it (p.rush) overshoots into the curb -- that's the sloppiness.
+
+const AP_PARK_SWITCH = 0.4;
+const AP_PARK_TRAVEL = 50; // px backward travel of the S-curve, plus the gap
+
+function apParkGeometry(p, spot) {
+  const cx = (spot.x0 + spot.x1) / 2;
+  const d = p.dir;
+  return {
+    cx, d,
+    stageY: street.carCenterY - p.gap,
+    heading: d > 0 ? 0 : Math.PI,
+    entryX: clamp(cx - d * 160, 40, W - 40),
+    stageX: cx + d * (AP_PARK_TRAVEL + p.gap),
+    room: Math.max(3, (spot.x1 - spot.x0 - CAR.length) / 2), // how far off-center the car still fits
+  };
+}
+
+function apChooseSpot(car) {
+  const other = car === car1 ? car2 : car1;
+  // Sometimes it goes for the same spot as the other autopilot. Fight!
+  if (other.autopilot && other.ap.park && Math.random() < 0.45) return other.ap.park.spot;
+  return Math.floor(Math.random() * street.parkingSpots.length);
+}
+
+function apStartPark(car, ap, tries) {
+  const spot = apChooseSpot(car);
+  const s = street.parkingSpots[spot];
+  ap.park = {
+    spot,
+    dir: car.pos.x < (s.x0 + s.x1) / 2 ? 1 : -1,
+    gap: 30 + Math.random() * 10, // how far out from the parked row it lines up
+    rush: 1 + Math.random() * Math.random() * 2.5, // sometimes it floors it in reverse
+    phase: "approach", t: 0, phaseT: 0, tries,
+    rear0: 0, shuffle: 1, shuffleT: 0,
+  };
+}
+
+function apRearY(car) {
+  return car.pos.y - Math.sin(car.angle) * CAR.wheelBase / 2;
+}
+
+function apPark(car, ap, dt) {
+  if (!ap.park || ap.park.spot >= street.parkingSpots.length) apStartPark(car, ap, 0);
+  const p = ap.park;
+  const spot = street.parkingSpots[p.spot];
+  const geo = apParkGeometry(p, spot);
+  const a = wrapAngle(car.angle - geo.heading); // heading error vs. parallel to the row
+  const speed = Math.hypot(car.vel.x, car.vel.y);
+  const setPhase = (phase) => { p.phase = phase; p.phaseT = 0; };
+  p.t += dt;
+  p.phaseT += dt;
+  if (p.t > AP_PARK_TIMEOUT) {
+    apStartPark(car, ap, p.tries + 1);
+    return;
+  }
+
+  if (p.phase === "approach") {
+    // Arriving at the entry point pointing the wrong way, loop round through
+    // a point further back and come at it again.
+    const ex = p.detour ? clamp(geo.entryX - geo.d * 130, 40, W - 40) : geo.entryX;
+    const d = apDriveTo(car, ap, ex, geo.stageY - 50, 160);
+    apCheckStuck(car, ap, dt, ap.drive.throttle !== 0);
+    if (d < 45) {
+      if (p.detour) p.detour = false;
+      else if (Math.abs(a) < 0.9) setPhase("line");
+      else p.detour = true;
+    }
+  } else if (p.phase === "line") {
+    // creep along the line, aiming at a point ahead on it
+    const toStage = (geo.stageX - car.pos.x) * geo.d;
+    const target = Math.min(70, Math.sqrt(2 * 300 * Math.max(0, toStage)));
+    ap.drive.steer = apSteerAt(car, car.pos.x + geo.d * 70, geo.stageY);
+    ap.drive.throttle = toStage > 2 ? apThrottleFor(car, target) : apStop(car);
+    if (toStage <= 2 && speed < 3) {
+      if (Math.abs(a) < 0.25 && Math.abs(car.pos.y - geo.stageY) < 12) {
+        p.rear0 = apRearY(car);
+        setPhase("swing");
+      } else {
+        setPhase("approach"); // lined up badly: go round again
+      }
+    }
+    // pointing the wrong way, wedged, or taking forever: start over
+    if (Math.abs(a) > 1.3 || (p.phaseT > 1.5 && speed < 3 && toStage > 2) || p.phaseT > 8) setPhase("approach");
+  } else if (p.phase === "swing" || p.phase === "counter") {
+    ap.drive.throttle = apThrottleFor(car, -AP_PARK_SPEED * p.rush);
+    if (p.phase === "swing") {
+      ap.drive.steer = geo.d; // reversing, this swings the tail toward the curb
+      if (apRearY(car) - p.rear0 >= p.gap * AP_PARK_SWITCH || Math.abs(a) > 1.1) setPhase("counter");
+    } else {
+      ap.drive.steer = -geo.d;
+      if (a * geo.d >= -0.03 || car.pos.y > street.carCenterY + 4) setPhase("settle");
+    }
+    // backed into something and stopped: see how it looks
+    if ((p.phaseT > 0.5 && speed < 3) || p.phaseT > 5) setPhase("settle");
+  } else if (p.phase === "settle") {
+    // Shuffle forward and back within the spot, steering toward straight
+    // (forward with the wheel toward the curb and backward with it away both
+    // straighten the car up), until it's straight and near the middle.
+    const facing = Math.cos(car.angle) >= 0 ? 1 : -1;
+    const err = wrapAngle((facing > 0 ? 0 : Math.PI) - car.angle);
+    const off = (car.pos.x - geo.cx) * facing; // > 0: past the middle, in the direction it faces
+    if ((Math.abs(err) < 0.1 && Math.abs(off) <= geo.room + 2) || p.phaseT > 6) {
+      ap.drive.throttle = apStop(car);
+      ap.drive.steer = 0;
+      if (speed < 1) setPhase("wait");
+    } else {
+      const was = p.shuffle;
+      if (Math.abs(err) < 0.1) p.shuffle = off > 0 ? -1 : 1; // straight already: just center up
+      else if (p.shuffle > 0 && off > geo.room) p.shuffle = -1;
+      else if (p.shuffle < 0 && off < -geo.room) p.shuffle = 1;
+      else if (p.shuffleT > 0.4 && speed < 2) p.shuffle = -p.shuffle; // bumped a car
+      p.shuffleT = p.shuffle === was ? p.shuffleT + dt : 0;
+      ap.drive.throttle = apThrottleFor(car, p.shuffle * 18);
+      ap.drive.steer = clamp(err * 3, -1, 1) * p.shuffle;
+    }
+  } else if (p.phase === "wait") {
+    ap.drive.throttle = apStop(car);
+    ap.drive.steer = 0;
+    // still not counted as parked (updateCoinRace would have flipped
+    // gameState): pull out and have another go, maybe at another spot
+    if (p.phaseT > 0.8) setPhase("pullout");
+  } else if (p.phase === "pullout") {
+    const facing = Math.cos(car.angle) >= 0 ? 1 : -1;
+    ap.drive.throttle = apThrottleFor(car, 60);
+    ap.drive.steer = apSteerAt(car, car.pos.x + facing * 80, geo.stageY - 30);
+    apCheckStuck(car, ap, dt, true);
+    if (p.phaseT > 1.3) apStartPark(car, ap, p.tries + 1);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Pedestrians (purely cosmetic easter egg)
 // ---------------------------------------------------------------------------
 // Randomly generated people stroll along the sidewalk band (street.curbY ..
@@ -2396,6 +2774,7 @@ function resolveCurb(car) {
 function update(dt) {
   gameTime += dt;
   updateTraffic(dt);
+  for (const car of [car1, car2]) if (car.autopilot) updateAutopilot(car, dt);
 
   const movers = [car1, car2, ...npcs];
   for (const car of movers) stepCar(car, dt);
@@ -3025,14 +3404,30 @@ const titleEl1 = document.getElementById("p1-title");
 const titleEl2 = document.getElementById("p2-title");
 const scoreEl1 = document.getElementById("p1-score");
 const scoreEl2 = document.getElementById("p2-score");
+const autoBtn1 = document.getElementById("p1-auto");
+const autoBtn2 = document.getElementById("p2-auto");
 const hintEl = document.getElementById("hint");
 const HINT_SECONDS = 10;
 
-function updateHud(car, titleEl, scoreEl) {
+for (const [btn, getCar] of [[autoBtn1, () => car1], [autoBtn2, () => car2]]) {
+  // Don't take keyboard focus: Space/Enter would then toggle it mid-game.
+  btn.addEventListener("mousedown", (e) => e.preventDefault());
+  btn.addEventListener("click", () => {
+    initAudio(); // a click counts as the gesture that unlocks audio, too
+    toggleAutopilot(getCar());
+  });
+}
+
+function updateHud(car, titleEl, scoreEl, autoBtn) {
   const title = car.hasDriven ? car.label : `${car.label} — ${car.keyHint}`;
   if (titleEl.textContent !== title) titleEl.textContent = title;
   const score = String(car.score);
   if (scoreEl.textContent !== score) scoreEl.textContent = score;
+  const on = !!car.autopilot;
+  if (autoBtn.classList.contains("on") !== on) {
+    autoBtn.classList.toggle("on", on);
+    autoBtn.setAttribute("aria-pressed", String(on));
+  }
 }
 
 function updateHint() {
@@ -3147,8 +3542,8 @@ function render() {
   drawCar(ctx, car2);
   drawParticles();
 
-  updateHud(car1, titleEl1, scoreEl1);
-  updateHud(car2, titleEl2, scoreEl2);
+  updateHud(car1, titleEl1, scoreEl1, autoBtn1);
+  updateHud(car2, titleEl2, scoreEl2, autoBtn2);
   updateHint();
 }
 
