@@ -65,7 +65,7 @@ A row of parked cars (reusing the same car object shape, just never fed through 
 
 ### Coin race / parallel-park game loop (`updateCoinRace`)
 
-A single shared `coin` (`{x,y}`, module-level) is always present on the map. Eligibility to collect it is per-car, not shared: a car can only pick it up while its own `gameState === "seekCoin"`. Whichever eligible car reaches it first (checked in `car1, car2` order, so simultaneous ties favor P1) scores, flips to `gameState = "mustPark"`, and `spawnCoin()` immediately drops a new coin elsewhere — the *other* car's eligibility never depended on the scorer parking, so it can keep going right away. A car in `"mustPark"` stays locked out of every coin (even ones that spawned after its own pickup) until it independently satisfies `isParked` — stopped (`PARK_SPEED_LIMIT`), aligned with the curb within `PARK_ANGLE_TOLERANCE`, at the parked row's y-offset, centered inside one of `street.parkingSpots` — at which point it flips back to `"seekCoin"` and can grab whatever coin is currently sitting there, and `spawnFirework(car.pos.x, car.pos.y, car.color)` fires as the visible "you parked successfully" cue. This is the key invariant: **each car's own take→park cycle gates only that car**, never the other one. `resetCars` (bound to `R`) resets both scores/states, spawns a fresh coin, and clears `particles`.
+A single shared `coin` (`{x,y}`, module-level) is always present on the map. Eligibility to collect it is per-car, not shared: a car can only pick it up while its own `gameState === "seekCoin"`. Whichever eligible car reaches it first (checked in `car1, car2` order, so simultaneous ties favor P1) scores, flips to `gameState = "mustPark"`, and `spawnCoin()` immediately drops a new coin elsewhere — the *other* car's eligibility never depended on the scorer parking, so it can keep going right away. A car in `"mustPark"` stays locked out of every coin (even ones that spawned after its own pickup) until it independently satisfies `isParked` — stopped (`PARK_SPEED_LIMIT`), aligned with the curb within `PARK_ANGLE_TOLERANCE`, at the parked row's y-offset, centered inside one of `street.parkingSpots` — at which point it flips back to `"seekCoin"` and can grab whatever coin is currently sitting there, and `spawnFirework(car.pos.x, car.pos.y, car.color)` fires as the visible "you parked successfully" cue. This is the key invariant: **each car's own take→park cycle gates only that car**, never the other one. There is no in-game reset (the old `R` key / `resetCars` was removed as UI clutter); reloading the page is the reset.
 
 ### Collision damage (`applyDamage`) and the garage (`updateGarage`)
 
@@ -77,7 +77,7 @@ Damage has two effects:
 
 This applies to every moving car, NPCs included.
 
-The garage lives in `street.garage`, so it's rebuilt on resize along with the rest of the street. The building sits on the sidewalk in the bottom-right corner, with a service pad on the road in front of it. A *player* that stops on the pad (`GARAGE_SPEED_LIMIT`) with any damage and at least `REPAIR_COST` coins pays and is fully repaired (`repairCar`). With no coins, the HUD status says so instead. Coins are the same `car.score` the coin race awards, so repairs compete with score.
+The garage lives in `street.garage`, so it's rebuilt on resize along with the rest of the street. The building sits on the sidewalk in the bottom-right corner, with a service pad on the road in front of it. A *player* that stops on the pad (`GARAGE_SPEED_LIMIT`) with any damage and at least `REPAIR_COST` coins pays and is fully repaired (`repairCar`). With no coins, the pad's border flashes red instead (`garageDenied`). The garage carries no text: the pad shows a wrench (`drawWrench`) next to a coin. Coins are the same `car.score` the coin race awards, so repairs compete with score.
 
 ### NPC traffic (`updateTraffic` / `npcDrive`)
 
@@ -98,7 +98,7 @@ Without these, a car knocked off the road can wait forever behind a player who i
 
 There's only one traffic lane, so `spawnNpc` gives a new car the same direction as any traffic already on screen, and picks a random direction only when the road is empty. This prevents head-on meetings.
 
-`resetTraffic` runs from `setupWorld` and `resetCars`. It sets the spawn timer to 0, so the first car rolls in immediately on start/reset; only later spawns follow the random schedule. On resize, NPCs are shifted by the change in `npcLaneY` so they stay in the lane.
+`resetTraffic` runs from `setupWorld`. It sets the spawn timer to 0, so the first car rolls in immediately on start; only later spawns follow the random schedule. On resize, NPCs are shifted by the change in `npcLaneY` so they stay in the lane.
 
 ### Particles (`spawnFirework` / `updateParticles` / `drawParticles`)
 
@@ -106,8 +106,24 @@ A flat `particles` array (module-level) holds purely cosmetic entries, each with
 
 ### Rendering
 
-`drawCar` draws each car (player or parked) in its own rotated/translated canvas context: wheels first, then the body rectangle, then a cabin/windshield rect to make facing direction readable at a glance. The two front wheels get distinct angles from `ackermannWheelAngles(car.steerCurrent, ...)` rather than sharing one — see the Ackermann section above. Wheels are drawn with a light outline + center stripe (`drawWheel`) specifically so steering direction stays legible at small sizes against the dark asphalt — keep that contrast if retuning colors. `drawStreet` draws the sidewalk, curb line, dashed centerline, and the "P" spot markings, in that order, before crates and cars are drawn on top.
+`drawCar` draws each car (player or parked) in its own rotated/translated canvas context: wheels first, then the body rectangle, then a cabin/windshield rect to make facing direction readable at a glance. The two front wheels get distinct angles from `ackermannWheelAngles(car.steerCurrent, ...)` rather than sharing one — see the Ackermann section above. Wheels are drawn with a light outline + center stripe (`drawWheel`) specifically so steering direction stays legible at small sizes against the dark asphalt — keep that contrast if retuning colors. `drawStreet` draws the sidewalk, curb line, dashed centerline, and the "P" spot markings, in that order. `drawParkingTargets` and `drawGarage` follow, and then crates and cars are drawn on top.
+
+### HUD and on-screen text: keep it minimal
+
+On-screen text was deliberately cut down after feedback that the game felt like an airport full of signs. The rule: **show game state in the world, not as text**.
+- **Players' HUD:** each player gets a small badge with their label and coin count (`updateHud`). The key hint ("P1 — WASD") shows only until that player first drives (`car.hasDriven`, set in `readInput`).
+- **Bottom hint line:** the only instructions. It fades out (`updateHint`, CSS `.hint.faded`) after `HINT_SECONDS` of `gameTime` or at the first coin pickup.
+- **In-world cues instead of status text:**
+  - A player who must park sees every open P spot pulse in their color (`drawParkingTargets`).
+  - A badly damaged player (`damage >= GARAGE_HINT_DAMAGE`, 0.3; it was 0.5, which felt like "almost totalled" before the cue appeared) sees the garage pad pulse in their color. The pad's pulse rect is grown 4px outward so its outline frames the dashed hazard border instead of hiding under it.
+  - A player who can't afford a repair sees the garage pad's border flash red. It's drawn on top of the pulse, so it wins.
+
+  Both pulses use the shared `drawTargetPulse(cars, rects)` helper. With two cars, their pulses run half a cycle apart so the colors alternate. Reuse it for any future "go here" cue rather than inventing a new one.
+
+There's no speedometer and no in-game reset.
+
+Before adding a new text label or HUD line, look for an in-world way to show the same thing.
 
 ### Input
 
-A single global `Set` (`keys`) tracks currently-held keys via `keydown`/`keyup` listeners; `readInput(car)` reads throttle/steer from each car's own key bindings (`car.input`, where each direction is an array of key names so a player can have alternate keys, like P2's IJKL + arrows). Keys are stored lowercased (`"arrowup"`, not `"ArrowUp"`); any new binding also needs adding to `CONTROL_KEYS` so it gets `preventDefault()` (for arrows, that's what stops the page from scrolling). `R` resets both cars to their start positions/orientations (and clears traffic). Key handling calls `preventDefault()` only for the specific keys the game uses, so it doesn't swallow other browser shortcuts.
+A single global `Set` (`keys`) tracks currently-held keys via `keydown`/`keyup` listeners; `readInput(car)` reads throttle/steer from each car's own key bindings (`car.input`, where each direction is an array of key names so a player can have alternate keys, like P2's IJKL + arrows). Keys are stored lowercased (`"arrowup"`, not `"ArrowUp"`); any new binding also needs adding to `CONTROL_KEYS` so it gets `preventDefault()` (for arrows, that's what stops the page from scrolling). Key handling calls `preventDefault()` only for the specific keys the game uses, so it doesn't swallow other browser shortcuts.
