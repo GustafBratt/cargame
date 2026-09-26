@@ -1830,7 +1830,10 @@ function updatePedestrians(dt) {
     if (staring) {
       const toLook = Math.atan2(p.look.y - p.y, p.look.x - p.x);
       p.headAngle = turnToward(p.headAngle, toLook, 7, dt);
-      p.bodyAngle = turnToward(p.bodyAngle, p.facing + clamp(wrapAngle(toLook - p.facing), -0.9, 0.9), 3, dt);
+      // A parent with a stroller keeps hold of it: body turns only a little,
+      // head does the looking.
+      const maxTurn = p.accessory === "stroller" ? 0.45 : 0.9;
+      p.bodyAngle = turnToward(p.bodyAngle, p.facing + clamp(wrapAngle(toLook - p.facing), -maxTurn, maxTurn), 3, dt);
     } else {
       p.headAngle = turnToward(p.headAngle, p.facing, 4, dt);
       p.bodyAngle = turnToward(p.bodyAngle, p.facing, 3, dt);
@@ -1897,12 +1900,25 @@ function drawPedestrian(p) {
   ctx.ellipse(p.x + 2, p.y + 3, 7.5 * s, 7.5 * s, 0, 0, Math.PI * 2);
   ctx.fill();
 
+  // The stroller, and the hands on its handle, stay aligned with the walking
+  // direction (p.facing) -- NOT the body -- so when the parent turns to stare
+  // at a crash, the stroller stays put instead of swinging around with them.
+  const strollerFrame = () => {
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.facing);
+    ctx.scale(s, s);
+  };
+  if (p.accessory === "stroller") {
+    strollerFrame();
+    drawStroller(p);
+    ctx.restore();
+  }
+
   ctx.save();
   ctx.translate(p.x, p.y);
   ctx.rotate(p.bodyAngle);
   ctx.scale(s * bob, s * bob);
-
-  if (p.accessory === "stroller") drawStroller(p);
 
   // feet, stepping out front and back of the body (the visible walk cycle)
   inkEllipse(step * 1.7, -3, 2.5, 1.6, "#3a3035", 1);
@@ -1911,23 +1927,29 @@ function drawPedestrian(p) {
   // shoulders/torso: about twice as wide as the head, as seen from above
   inkEllipse(0, 0, 4.8, 8.6, p.shirt, 1.4);
 
-  // hands: on the stroller handle, holding a leash / umbrella, or swinging
-  if (p.accessory === "stroller") {
-    inkCircle(7, -3.8, 1.5, p.skin, 1);
-    inkCircle(7, 3.8, 1.5, p.skin, 1);
-  } else {
+  // hands: holding a leash / umbrella, or swinging (stroller hands below)
+  if (p.accessory !== "stroller") {
     inkCircle(-step * 1.1, -9.2, 1.6, p.skin, 1);
     inkCircle(p.umbrella ? 3 : step * 1.1, 9.2, 1.6, p.skin, 1);
+  }
+  ctx.restore();
+
+  if (p.accessory === "stroller") {
+    strollerFrame(); // hands stay on the handle
+    inkCircle(7, -3.8, 1.5, p.skin, 1);
+    inkCircle(7, 3.8, 1.5, p.skin, 1);
+    ctx.restore();
   }
 
   // head, in its own rotation (they look around independently of the body)
   ctx.save();
+  ctx.translate(p.x, p.y);
+  ctx.rotate(p.bodyAngle);
+  ctx.scale(s * bob, s * bob);
   ctx.translate(0.6, 0);
   ctx.rotate(p.headAngle - p.bodyAngle);
   ctx.scale(0.88, 0.88); // head a little smaller than the shoulders
   drawPedHead(p);
-  ctx.restore();
-
   ctx.restore();
 
   // leash: from the walker's hand to the dog's collar
