@@ -567,8 +567,8 @@ function setupWorld() {
   car2.score = 0; car2.gameState = "seekCoin";
   car1.label = "P1"; car1.keyHint = "WASD"; car1.hasDriven = false;
   car2.label = "P2"; car2.keyHint = "IJKL / Arrows"; car2.hasDriven = false;
-  spawnCoin();
   particles.length = 0;
+  spawnCoin(); // after clearing particles, so its spawn animation survives
   resetTraffic();
   gameTime = 0;
 }
@@ -599,8 +599,29 @@ function randomCoinPos() {
 
 let coin = null; // shared: only one coin exists at a time, so both cars race for it
 
+// A new coin doesn't just appear: sparks implode onto its spot over
+// COIN_IMPLODE_TIME (a reverse explosion), then it pops in with a flash.
+// It can't be collected until it has popped -- no grabbing an invisible coin.
+const COIN_IMPLODE_TIME = 0.6; // seconds from spawn until the coin appears
+const COIN_POP_TIME = 0.25; // seconds of the overshoot "pop" scale-in after that
+
 function spawnCoin() {
-  coin = randomCoinPos();
+  coin = { ...randomCoinPos(), age: 0, popped: false };
+  spawnImplosion(coin.x, coin.y);
+}
+
+// coin.age drives both the draw (drawCoin) and collectability (updateCoinRace).
+function updateCoin(dt) {
+  coin.age += dt;
+  if (!coin.popped && coin.age >= COIN_IMPLODE_TIME) {
+    coin.popped = true;
+    particles.push({ type: "flash", x: coin.x, y: coin.y, radius: 22, life: 0, maxLife: 0.2 });
+    particles.push({ type: "ring", x: coin.x, y: coin.y, radius: COIN_RADIUS, growSpeed: 120, color: "#ffd54f", life: 0, maxLife: 0.3 });
+  }
+}
+
+function coinCollectable() {
+  return coin.age >= COIN_IMPLODE_TIME;
 }
 
 function isParked(car) {
@@ -657,7 +678,7 @@ function updateGarage() {
 
 function updateCoinRace() {
   for (const car of [car1, car2]) {
-    if (car.gameState !== "seekCoin") continue;
+    if (car.gameState !== "seekCoin" || !coinCollectable()) continue;
     if (Math.hypot(car.pos.x - coin.x, car.pos.y - coin.y) < PICKUP_DIST) {
       car.score++;
       car.gameState = "mustPark";
@@ -725,6 +746,30 @@ function spawnSecondaryPop(x, y, color) {
   }
 }
 
+// Reverse explosion for a new coin: sparks start scattered on a wide ring
+// and spiral inward, accelerating, all arriving at (x, y) exactly
+// COIN_IMPLODE_TIME from now. Start times are staggered (negative initial
+// life = not yet visible) so it reads as a sucking-in rather than one
+// flat ring collapsing; updateCoin adds the flash when they land.
+function spawnImplosion(x, y) {
+  const colors = ["#ffd54f", "#ffe082", "#ffffff", "#ffb300"];
+  const count = 30;
+  for (let i = 0; i < count; i++) {
+    const delay = Math.random() * 0.25;
+    particles.push({
+      type: "implode",
+      tx: x, ty: y,
+      angle: (i / count) * Math.PI * 2 + (Math.random() - 0.5) * 0.4,
+      spin: 0.8 + Math.random() * 0.6, // radians of swirl over the flight
+      r0: 60 + Math.random() * 50,
+      size: 1.2 + Math.random() * 1.4,
+      color: colors[Math.floor(Math.random() * colors.length)],
+      life: -delay,
+      maxLife: COIN_IMPLODE_TIME - delay,
+    });
+  }
+}
+
 function updateParticles(dt) {
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i];
@@ -750,6 +795,8 @@ function updateParticles(dt) {
       p.y += p.vy * dt;
       p.size += p.growSpeed * dt;
     }
+    // "implode" has no velocity to integrate: its position is a pure function
+    // of life/maxLife, computed in drawParticles (implodePos).
     // "flash" and "delayedBurst" hold position and just decay via life/maxLife.
   }
 }
@@ -995,6 +1042,7 @@ function update(dt) {
     for (let j = i + 1; j < movers.length; j++) resolveCarVsCar(movers[i], movers[j]);
   }
 
+  updateCoin(dt);
   updateCoinRace();
   updateGarage();
   for (const car of movers) emitSmoke(car, dt);
@@ -1085,9 +1133,17 @@ function drawTargetPulse(cars, rects) {
   ctx.globalAlpha = 1;
 }
 
+// easeOutBack: 0 -> 1 with a small overshoot past 1 before settling -- the "pop".
+function popScale(u) {
+  const c1 = 1.70158, c3 = c1 + 1;
+  return 1 + c3 * Math.pow(u - 1, 3) + c1 * Math.pow(u - 1, 2);
+}
+
 function drawCoin(coin) {
+  if (coin.age < COIN_IMPLODE_TIME) return; // still imploding, see spawnImplosion
+  const u = Math.min(1, (coin.age - COIN_IMPLODE_TIME) / COIN_POP_TIME);
   const pulse = 1 + 0.08 * Math.sin(performance.now() / 250);
-  const r = COIN_RADIUS * pulse;
+  const r = COIN_RADIUS * pulse * popScale(u);
 
   ctx.save();
   ctx.translate(coin.x, coin.y);
@@ -1320,10 +1376,32 @@ function updateHint() {
   if (gameTime > HINT_SECONDS || anyPickup) hintEl.classList.add("faded");
 }
 
+// Where an "implode" particle is at flight fraction t (0..1): radius shrinks
+// with an accelerating t^2 ease, and the angle swirls as it falls in.
+function implodePos(p, t) {
+  const r = p.r0 * (1 - t * t);
+  const a = p.angle + p.spin * t;
+  return { x: p.tx + Math.cos(a) * r, y: p.ty + Math.sin(a) * r };
+}
+
 function drawParticles() {
   for (const p of particles) {
+    if (p.life < 0) continue; // staggered start, not launched yet
     const t = p.life / p.maxLife;
-    if (p.type === "spark") {
+    if (p.type === "implode") {
+      // A short streak trailing back along the path it came from, fading in
+      // as it speeds up toward the center.
+      const head = implodePos(p, t);
+      const tail = implodePos(p, Math.max(0, t - 0.08));
+      ctx.globalAlpha = Math.min(1, 0.2 + t * 1.2);
+      ctx.strokeStyle = p.color;
+      ctx.lineWidth = p.size;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(tail.x, tail.y);
+      ctx.lineTo(head.x, head.y);
+      ctx.stroke();
+    } else if (p.type === "spark") {
       ctx.globalAlpha = 1 - t;
       ctx.fillStyle = p.color;
       ctx.beginPath();
