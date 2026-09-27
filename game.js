@@ -918,6 +918,14 @@ function stepCar(car, dt) {
     car.vel.x -= (car.vel.x / speed) * p.rollResist * dt;
     car.vel.y -= (car.vel.y / speed) * p.rollResist * dt;
   }
+  // A parked car's handbrake: a shove slides it a little, then it stops dead.
+  if (car.handbrake) {
+    const v = Math.hypot(car.vel.x, car.vel.y);
+    const keep = v > 0 ? Math.max(0, v - HANDBRAKE_DECEL * dt) / v : 0;
+    car.vel.x *= keep;
+    car.vel.y *= keep;
+    car.angularVel *= Math.max(0, 1 - 8 * dt);
+  }
 
   // Clamp forward/reverse top speed along the heading only -- lateral
   // (drift) speed is left alone, it's already grip-limited above.
@@ -1001,10 +1009,6 @@ function capsuleOffsets(angle) {
   ];
 }
 
-function capsuleCenters(pos, angle) {
-  return capsuleOffsets(angle).map((r) => ({ x: pos.x + r.x, y: pos.y + r.y }));
-}
-
 // An off-center impact should spin the car, not just push it -- torque is
 // the lever arm (r, car-center to the capsule circle that got hit) crossed
 // with the velocity change that circle's collision just produced.
@@ -1047,23 +1051,21 @@ function resolveCarVsStaticCircle(car, obstaclePos, obstacleR, key) {
     applyCollisionSpin(car, r, velBefore);
   }
   if (!touched) return;
-  if (hitAt) {
-    applyDamage(car, hit, hitAt);
-    // A parked car (the key; crates have no dents) takes a dent where it was
-    // hit. It never smokes: emitSmoke only runs for moving cars. It's drawn
-    // in the static layer, so that needs a redraw to show the dent. A hit can
-    // touch both ends of its capsule in one step; that's still one dent.
-    if (key.dents && hit > DAMAGE_THRESHOLD && key.lastDentAt !== gameTime) {
-      key.lastDentAt = gameTime;
-      applyDamage(key, hit, contactPoint(obstaclePos, hitAt, obstacleR));
-      staticDirty = true;
-    }
-  }
+  if (hitAt) applyDamage(car, hit, hitAt);
   collisionSound(hit, (hitAt || obstaclePos).x, car, isNewTouch(car, key));
   if (hit >= HIT_SOUND_MIN) pedestriansNotice(hitAt.x, hitAt.y, "crash", hit);
 }
 
 function resolveCarVsCar(carA, carB) {
+  // A parked car takes a hit more like an obstacle than a rolling car: the
+  // damped restitution, so it gets shoved rather than sent flying. Below
+  // DAMAGE_THRESHOLD it doesn't budge at all (handbrake on, it's anchored
+  // like a crate): otherwise every parking nudge, and every neighbor pulling
+  // out, would slowly twist the row out of line.
+  const restitution = carA.handbrake || carB.handbrake ? CAR.obstacleCollisionRestitution : CAR.carCollisionRestitution;
+  const gentle = Math.hypot(carA.vel.x - carB.vel.x, carA.vel.y - carB.vel.y) < DAMAGE_THRESHOLD;
+  const anchoredA = gentle && carA.handbrake && !carB.handbrake;
+  const anchoredB = gentle && carB.handbrake && !carA.handbrake;
   let hit = 0, hitAtA = null, hitAtB = null, touched = false;
   for (const rA of capsuleOffsets(carA.angle)) {
     for (const rB of capsuleOffsets(carB.angle)) {
@@ -1071,7 +1073,9 @@ function resolveCarVsCar(carA, carB) {
       const b = { x: carB.pos.x + rB.x, y: carB.pos.y + rB.y };
       const posBeforeA = { x: a.x, y: a.y }, posBeforeB = { x: b.x, y: b.y };
       const velBeforeA = { x: carA.vel.x, y: carA.vel.y }, velBeforeB = { x: carB.vel.x, y: carB.vel.y };
-      const s = resolveCircles(a, carA.vel, CAR.capsuleRadius, b, carB.vel, CAR.capsuleRadius, false, CAR.carCollisionRestitution);
+      const R = CAR.capsuleRadius;
+      const s = anchoredA ? resolveCircles(b, carB.vel, R, a, null, R, true, restitution)
+        : resolveCircles(a, carA.vel, R, b, carB.vel, R, anchoredB, restitution);
       if (s >= 0) touched = true;
       if (s > hit) {
         hit = s;
@@ -1170,7 +1174,7 @@ function repairCar(car) {
 // Puffs of smoke out the back of the car, at a rate and darkness that scale
 // with damage. Purely cosmetic -- rides the shared particles array.
 function emitSmoke(car, dt) {
-  if (car.damage < SMOKE_DAMAGE_MIN) return;
+  if (car.damage < SMOKE_DAMAGE_MIN || car.handbrake) return; // parked cars never smoke
   const rate = 3 + car.damage * 22; // puffs per second
   if (Math.random() > rate * dt) return;
   const tail = -CAR.length / 2 - 2; // just behind the rear bumper
@@ -1208,40 +1212,64 @@ let particles = []; // cosmetic-only firework sparks/rings, see spawnFirework
 // Bright cartoon paint jobs, but none close to the players' blue/orange.
 const PARKED_COLORS = ["#b9a4e0", "#8fd6b4", "#f28b82", "#f6c85f", "#9ec5d8", "#d99ad0"];
 
-// Builds a row of parked cars along a curb, with a couple of open gaps sized
-// for parallel parking practice (a roomy one and a tight one).
-function buildStreet() {
-  const len = CAR.length;
-  const tightGap = 9; // normal bumper-to-bumper spacing between parked cars
-  const segments = [
-    { t: "car" }, { t: "gap", w: tightGap }, { t: "car" }, { t: "gap", w: tightGap }, { t: "car" },
-    { t: "spot", w: len * 1.7, label: "easy" },
-    { t: "car" }, { t: "gap", w: tightGap }, { t: "car" },
-    { t: "spot", w: len * 1.3, label: "tight" },
-    { t: "car" }, { t: "gap", w: tightGap }, { t: "car" },
-  ];
-  const totalWidth = segments.reduce((sum, s) => sum + (s.t === "car" ? len : s.w), 0);
+// The parking row is a line of painted bays along the curb. Parked cars
+// (see "Parked cars" below) sit centered in bays, so the space a free bay
+// leaves between the bumpers of the cars either side is its own length plus
+// half of each neighbor's slack (its length minus CAR.length). With every
+// bay the same size, that averages out to "medium" -- but the fun is in the
+// choice between fighting for the roomy spot and squeezing into the tight
+// one. So bays come in two sizes: mostly tight, plus about one in
+// ROOMY_EVERY roomy, never two roomy side by side. Between tight neighbors:
+// - a free tight bay leaves 53 + 3.5 + 3.5 = 60 px (1.3 car lengths)
+// - a free roomy bay leaves 71 + 3.5 + 3.5 = 78 px (1.7 car lengths)
+// (a tight bay next to a parked-in roomy one gets its slack: ~70 px).
+// The planner in updateParkers tries to keep one of each free.
+//
+// The bays at each end of the row always stay parked in (bay.end): a free end
+// bay has no car on its open side, so "parking" there is just driving in.
+const BAY_TIGHT = 53, BAY_ROOMY = 71; // px
+const ROOMY_EVERY = 4;
+// How many bays: the row aims to fill PARK_ROW_SHARE of the width, but its
+// right end stays PARK_ROW_GARAGE_GAP clear of the garage pad, so parking
+// maneuvers (which line up past the bay) don't end on the pad.
+const PARK_ROW_SHARE = 0.45;
+const PARK_ROW_GARAGE_GAP = 110; // px
+const PARK_BAYS_MIN = 4;
 
-  const curbY = H * 0.82;
-  const carCenterY = curbY - CAR.width / 2 - 6;
+function buildParkingBays(garageX0) {
+  const avg = (BAY_TIGHT * (ROOMY_EVERY - 1) + BAY_ROOMY) / ROOMY_EVERY;
+  const room = Math.min(W * PARK_ROW_SHARE, 2 * (garageX0 - PARK_ROW_GARAGE_GAP - W / 2));
+  const n = Math.max(PARK_BAYS_MIN, Math.floor(room / avg));
 
-  let x = (W - totalWidth) / 2;
-  const parkedCars = [];
-  const parkingSpots = [];
-  for (const seg of segments) {
-    if (seg.t === "car") {
-      const pc = createCar(x + len / 2, carCenterY, 0, PARKED_COLORS[Math.floor(Math.random() * PARKED_COLORS.length)], null);
-      pc.collisionCircles = capsuleCenters(pc.pos, pc.angle);
-      parkedCars.push(pc);
-      x += len;
-    } else {
-      if (seg.t === "spot") parkingSpots.push({ x0: x, x1: x + seg.w, label: seg.label });
-      x += seg.w;
-    }
+  // Scatter the roomy bays, never next to each other and never at an end.
+  const roomy = new Array(n).fill(false);
+  const want = Math.max(1, Math.round(n / ROOMY_EVERY));
+  const order = [...roomy.keys()].slice(1, -1).sort(() => Math.random() - 0.5);
+  let placed = 0;
+  for (const i of order) {
+    if (placed >= want) break;
+    if (roomy[i - 1] || roomy[i + 1]) continue;
+    roomy[i] = true;
+    placed++;
   }
 
+  const widths = roomy.map((r) => (r ? BAY_ROOMY : BAY_TIGHT));
+  let x = (W - widths.reduce((sum, w) => sum + w, 0)) / 2; // the row is centered
+  return widths.map((w, i) => {
+    const bay = { x0: x, x1: x + w, roomy: roomy[i], end: i === 0 || i === n - 1 };
+    x += w;
+    return bay;
+  });
+}
+
+function buildStreet() {
+  const curbY = H * 0.82;
+  const carCenterY = curbY - CAR.width / 2 - 6;
   const centerlineY = curbY - 90;
   const npcLaneY = centerlineY - CAR.width / 2 - 8; // traffic lane, just above the centerline
+  // Parked cars arrive and leave along this lane, just below the centerline
+  // (and clear of the garage pad).
+  const parkLaneY = centerlineY + CAR.width / 2 + 8;
 
   // Sidewalk band just below the curb (kept clear for pedestrians), lawn
   // below that.
@@ -1260,8 +1288,9 @@ function buildStreet() {
     doorX0: gx0 + 18, doorX1: gx1 - 18,
   };
   garage.doorH = Math.min(18, (garage.bottomY - garage.buildingY0) * 0.3); // roll-up door depth
+  const bays = buildParkingBays(garage.x0);
 
-  return { curbY, carCenterY, centerlineY, npcLaneY, sidewalkBottomY, parkedCars, parkingSpots, garage };
+  return { curbY, carCenterY, centerlineY, npcLaneY, parkLaneY, sidewalkBottomY, bays, garage };
 }
 
 function buildCrates() {
@@ -1289,6 +1318,7 @@ function setupWorld() {
 
   crates = buildCrates();
   street = buildStreet();
+  resetParkers();
 
   car1.score = 0; car1.gameState = "seekCoin";
   car2.score = 0; car2.gameState = "seekCoin";
@@ -1380,7 +1410,29 @@ function isParked(car) {
 
   if (Math.abs(car.pos.y - street.carCenterY) > PARK_Y_TOLERANCE) return false;
 
-  return street.parkingSpots.some((spot) => car.pos.x > spot.x0 + PARK_X_MARGIN && car.pos.x < spot.x1 - PARK_X_MARGIN);
+  return street.bays.some((bay) => car.pos.x > bay.x0 + PARK_X_MARGIN && car.pos.x < bay.x1 - PARK_X_MARGIN);
+}
+
+// Is a car in this bay? It counts if its center is between the bay's marks
+// and it's down in the parking lane, not just driving past. `cars` narrows
+// who counts; the planner ignores the players, see updateParkers.
+function bayOccupied(bay, except = null, cars = [car1, car2, ...parkers]) {
+  return cars.some((c) => c !== except &&
+    c.pos.x > bay.x0 && c.pos.x < bay.x1 && c.pos.y > street.carCenterY - PARK_Y_TOLERANCE - 6);
+}
+
+// The bays open to park in: no car in them. End bays never count (see
+// buildParkingBays). A bay an arriving parked car is heading for is still
+// free -- it keeps its "P", and players can race the car for it.
+function freeBays() {
+  return street.bays.filter((bay) => !bay.end && !bayOccupied(bay));
+}
+
+// The free bays no arriving parked car has claimed (bay.reservedBy): what
+// the parked-car planner works with, so two cars never head for one bay and
+// a car on its way counts as already there.
+function unclaimedBays() {
+  return freeBays().filter((bay) => !bay.reservedBy);
 }
 
 // ---------------------------------------------------------------------------
@@ -1758,6 +1810,17 @@ function npcGotRammed(npc) {
   npc.angryHonkIn = 0.35 + Math.random() * 0.4;
 }
 
+// Counts down a pending angry honk (see npcGotRammed) and sounds it.
+function tickAngryHonk(npc, dt) {
+  if (!(npc.angryHonkIn > 0)) return;
+  npc.angryHonkIn -= dt;
+  if (npc.angryHonkIn <= 0) {
+    playHornSound(npc.pos.x, npc.hornPitch, true);
+    pedestriansNotice(npc.pos.x, npc.pos.y, "honk");
+    npc.lastAngryHonk = gameTime;
+  }
+}
+
 // Sets npc.drive (read by stepCar via readInput) for this step.
 function npcDrive(npc, dt) {
   const forward = { x: Math.cos(npc.angle), y: Math.sin(npc.angle) };
@@ -1772,16 +1835,9 @@ function npcDrive(npc, dt) {
     npc.dazedTime = NPC_DAZE_MIN + Math.random() * (NPC_DAZE_MAX - NPC_DAZE_MIN);
     npc.reverseTime = 0;
   }
-  // A pending angry honk (see npcGotRammed). Ticks before the dazed early
-  // return below -- a rammed car is almost always dazed.
-  if (npc.angryHonkIn > 0) {
-    npc.angryHonkIn -= dt;
-    if (npc.angryHonkIn <= 0) {
-      playHornSound(npc.pos.x, npc.hornPitch, true);
-      pedestriansNotice(npc.pos.x, npc.pos.y, "honk");
-      npc.lastAngryHonk = gameTime;
-    }
-  }
+  // Ticks before the dazed early return below -- a rammed car is almost
+  // always dazed.
+  tickAngryHonk(npc, dt);
   if (npc.dazedTime > 0) {
     npc.dazedTime -= dt;
     npc.stuckTime = 0;
@@ -1803,7 +1859,7 @@ function npcDrive(npc, dt) {
   const targetSpeed = NPC_CRUISE_SPEED + (NPC_LOST_SPEED - NPC_CRUISE_SPEED) * offness;
 
   let blocked = false, blockerSide = 0;
-  for (const other of [car1, car2, ...npcs]) {
+  for (const other of [car1, car2, ...npcs, ...parkers]) {
     if (other === npc) continue;
     const dx = other.pos.x - npc.pos.x, dy = other.pos.y - npc.pos.y;
     const ahead = dx * forward.x + dy * forward.y;
@@ -1883,6 +1939,290 @@ function updateTraffic(dt) {
 }
 
 // ---------------------------------------------------------------------------
+// Parked cars (NPCs that come and go)
+// ---------------------------------------------------------------------------
+// The cars along the curb are real cars (`parkers`), not scenery: they run
+// through stepCar and every collision like any other car, so they can be
+// shoved out of place. Each is in one of three states:
+// - "parked": handbrake on (stepCar bleeds off any push quickly), no input,
+//   and no smoke however dented (emitSmoke skips handbraked cars)
+// - "leaving": backs up a touch, pulls out into street.parkLaneY and drives
+//   off the right edge
+// - "arriving": rolls in from the left along parkLaneY, then parallel parks
+//   into its reserved bay with the autopilot's parking routine (apPark), so
+//   it's exactly as clumsy at it as an autopilot player
+// Traffic on parkLaneY only ever flows right, the way the parked cars face.
+//
+// The planner (updateParkers) keeps PARK_MIN_FREE..PARK_MAX_FREE bays free
+// (empty of parked cars -- players only stop briefly), and otherwise churns
+// the row now and then: a car leaves, or a new one arrives. At most one car
+// is leaving and one arriving at a time, so the lane never jams.
+
+const PARK_MIN_FREE = 1, PARK_MAX_FREE = 3;
+const PARK_START_FREE = 2; // free bays when the game starts (one roomy, one tight)
+const PARK_EVENT_MEAN = 45; // s between random comings and goings (Poisson); it was 12, which kept a car moving in the row most of the time
+const PARK_EVENT_GAP = 10; // s, at least this long between any two events
+const PARKER_CRUISE = 130; // px/s along the lane
+const PARKER_ARRIVE_TIMEOUT = 60; // s to get parked before giving up and driving off
+const HANDBRAKE_DECEL = 900; // px/s^2, how fast a parked car stops sliding after a shove
+
+let parkers = [];
+let parkEventTimer = 0; // counts down to the next random coming or going
+let parkSinceEvent = 0; // s since the last one, see PARK_EVENT_GAP
+
+function makeParker(x, y) {
+  const car = createCar(x, y, 0, pickOf(PARKED_COLORS), null);
+  car.ap = makeAutopilot();
+  car.drive = car.ap.drive; // readInput returns car.drive, which apPark etc. fill in
+  car.hornPitch = 0.85 + Math.random() * 0.33;
+  car.blockedTime = 0;
+  car.nextHonkAt = NPC_HONK_DELAY;
+  car.state = "parked";
+  car.handbrake = true;
+  car.phase = null;
+  car.phaseT = 0;
+  car.t = 0;
+  car.bay = null;
+  return car;
+}
+
+// Two free bays side by side merge into one long gap, which is no choice at
+// all -- so bays next to a free one are the last resort for freeing up.
+function nextToFree(bay, free) {
+  const i = street.bays.indexOf(bay);
+  return [street.bays[i - 1], street.bays[i + 1]].some((b) => b && free.includes(b));
+}
+
+// Fills the row, leaving PARK_START_FREE bays free: a roomy one and a tight
+// one apart from it, if there are both, so the very first park is already a
+// choice.
+function resetParkers() {
+  parkers.length = 0;
+  const free = [];
+  const inner = street.bays.filter((b) => !b.end);
+  const pick = (bays) => {
+    const apart = bays.filter((b) => !free.includes(b) && !nextToFree(b, free));
+    const open = bays.filter((b) => !free.includes(b));
+    if (open.length) free.push(pickOf(apart.length ? apart : open));
+  };
+  pick(inner.filter((b) => b.roomy));
+  pick(inner.filter((b) => !b.roomy));
+  while (free.length < Math.min(PARK_START_FREE, inner.length)) pick(inner);
+  for (const bay of street.bays) {
+    bay.reservedBy = null;
+    if (!free.includes(bay)) parkers.push(makeParker((bay.x0 + bay.x1) / 2, street.carCenterY));
+  }
+  parkEventTimer = Math.random() * PARK_EVENT_MEAN;
+  parkSinceEvent = 0;
+}
+
+function parkerSetState(car, state, phase) {
+  car.state = state;
+  car.phase = phase;
+  car.phaseT = 0;
+  car.t = 0;
+  car.handbrake = state === "parked";
+  car.drive.throttle = car.drive.steer = 0;
+  if (state !== "arriving" && car.bay) {
+    if (car.bay.reservedBy === car) car.bay.reservedBy = null;
+    car.bay = null;
+  }
+}
+
+// The kind of bay (true = roomy) there's no free one of right now, or null
+// if there's a choice of both. Comings and goings lean toward fixing that.
+function missingFreeKind() {
+  const free = unclaimedBays();
+  if (!free.some((b) => b.roomy)) return true;
+  if (!free.some((b) => !b.roomy)) return false;
+  return null;
+}
+
+function bayAt(x) {
+  return street.bays.find((b) => x > b.x0 && x < b.x1) || null;
+}
+
+// A parked car pulls out and drives off. Cars in the end bays stay put.
+// Preferably one from the missing kind of bay (if any), and not next to a
+// free bay; each preference is dropped if nobody fits it.
+function parkerDepart() {
+  const parked = parkers.filter((c) => {
+    const bay = bayAt(c.pos.x);
+    return c.state === "parked" && !(bay && bay.end);
+  });
+  if (!parked.length) return false;
+  const kind = missingFreeKind(), free = unclaimedBays();
+  let pool = parked;
+  const narrow = (keep) => {
+    const kept = pool.filter((c) => {
+      const bay = bayAt(c.pos.x);
+      return bay && keep(bay);
+    });
+    if (kept.length) pool = kept;
+  };
+  if (kind !== null) narrow((bay) => bay.roomy === kind);
+  narrow((bay) => !nextToFree(bay, free));
+  parkerSetState(pickOf(pool), "leaving", "backup");
+  return true;
+}
+
+// Where an arriving car heads: a free bay of whichever kind has more free,
+// so it doesn't take the last roomy (or last tight) one when it can help it.
+function parkerPickBay(bays) {
+  const roomy = bays.filter((b) => b.roomy), tight = bays.filter((b) => !b.roomy);
+  if (roomy.length > tight.length) return pickOf(roomy);
+  if (tight.length > roomy.length) return pickOf(tight);
+  return pickOf(bays);
+}
+
+// A new car rolls in from the left edge, heading for a free bay.
+function parkerArrive() {
+  const bays = unclaimedBays();
+  const x = -CAR.length, y = street.parkLaneY;
+  const clear = [car1, car2, ...npcs, ...parkers].every((c) => Math.hypot(c.pos.x - x, c.pos.y - y) > CAR.length * 2.5);
+  if (!bays.length || !clear) return false;
+  const car = makeParker(x, y);
+  car.vel.x = PARKER_CRUISE;
+  parkerSetState(car, "arriving", "cruise");
+  car.bay = parkerPickBay(bays);
+  car.bay.reservedBy = car;
+  parkers.push(car);
+  return true;
+}
+
+function updateParkers(dt) {
+  // The planner: keep the free-bay count in range, and churn it now and then.
+  parkEventTimer -= dt;
+  parkSinceEvent += dt;
+  // Players don't count here: they park for a moment and drive off again, so
+  // sending a car away every time one takes the last free bay just churned
+  // the row (a parked car stayed only ~1 minute with autopilot players).
+  const free = street.bays.filter((bay) => !bay.end && !bay.reservedBy && !bayOccupied(bay, null, parkers)).length;
+  let want = null;
+  if (free < PARK_MIN_FREE) want = "leave";
+  else if (free > PARK_MAX_FREE) want = "arrive";
+  else if (parkEventTimer <= 0) {
+    const canLeave = free + 1 <= PARK_MAX_FREE;
+    // An arrival mustn't take the last free bay of a kind (one roomy + one
+    // tight free): the planner would just send a car away again to restore it.
+    const openBays = unclaimedBays();
+    const spare = openBays.filter((b) => b.roomy).length >= 2 || openBays.filter((b) => !b.roomy).length >= 2;
+    const canArrive = free - 1 >= PARK_MIN_FREE && (spare || missingFreeKind() !== null);
+    // no roomy (or no tight) bay free: a car leaving can bring the choice back
+    const leaveFirst = canLeave && missingFreeKind() !== null;
+    want = leaveFirst ? "leave" : canLeave && canArrive ? pickOf(["leave", "arrive"]) : canLeave ? "leave" : canArrive ? "arrive" : null;
+    if (!want) parkEventTimer = PARK_EVENT_MEAN; // nothing fits right now; roll again later
+  }
+  if (want && parkSinceEvent >= PARK_EVENT_GAP) {
+    const busy = parkers.some((c) => c.state === (want === "leave" ? "leaving" : "arriving"));
+    if (!busy && (want === "leave" ? parkerDepart() : parkerArrive())) {
+      parkSinceEvent = 0;
+      parkEventTimer = -Math.log(1 - Math.random()) * PARK_EVENT_MEAN;
+    }
+  }
+
+  for (let i = parkers.length - 1; i >= 0; i--) {
+    const car = parkers[i];
+    const off = car.pos.x < -CAR.length * 3 || car.pos.x > W + CAR.length * 2 || car.pos.y < -CAR.length || car.pos.y > H + CAR.length;
+    if (off && car.state !== "arriving") {
+      parkerSetState(car, "gone", null);
+      parkers.splice(i, 1);
+      continue;
+    }
+    car.phaseT += dt;
+    car.t += dt;
+    tickAngryHonk(car, dt);
+    if (car.state === "arriving") parkerArriving(car, dt);
+    else if (car.state === "leaving") parkerLeaving(car, dt);
+    else car.angryHonkIn = 0; // nobody's in a parked car to honk
+  }
+}
+
+function parkerArriving(car, dt) {
+  const ap = car.ap;
+  ap.wobblePhase += dt * (1.3 + ap.sloppy);
+  if (ap.reverseTime > 0) ap.reverseTime -= dt;
+
+  // Someone else took the bay (or the street was rebuilt): pick another free
+  // one, or give up and drive off.
+  if (!street.bays.includes(car.bay) || bayOccupied(car.bay, car) || car.t > PARKER_ARRIVE_TIMEOUT) {
+    if (car.bay && car.bay.reservedBy === car) car.bay.reservedBy = null;
+    const bays = car.t > PARKER_ARRIVE_TIMEOUT ? [] : unclaimedBays();
+    if (!bays.length) {
+      parkerSetState(car, "leaving", "drive");
+      return;
+    }
+    car.bay = parkerPickBay(bays);
+    car.bay.reservedBy = car;
+    ap.park = null;
+    car.phase = "cruise";
+  }
+
+  if (car.phase === "cruise") {
+    // roll along the lane until level with the spot, then park like the autopilot
+    parkerDriveLane(car, PARKER_CRUISE, dt);
+    if (car.pos.x > car.bay.x0 - 220) {
+      apStartPark(car, ap, car.bay, "line");
+      car.phase = "park";
+    }
+  } else {
+    apPark(car, ap, dt);
+    if (isParked(car)) parkerSetState(car, "parked", null);
+  }
+}
+
+function parkerLeaving(car, dt) {
+  const speed = speedOf(car);
+  if (car.phase === "backup") {
+    // back up a touch to get room to swing out
+    car.drive.throttle = apThrottleFor(car, -15);
+    car.drive.steer = 0;
+    if (car.phaseT > 0.8 || (car.phaseT > 0.3 && speed < 2)) {
+      car.phase = "pullout";
+      car.phaseT = 0;
+    }
+  } else if (car.phase === "pullout") {
+    car.drive.throttle = apThrottleFor(car, 35);
+    car.drive.steer = apSteerAt(car, car.pos.x + 70, street.parkLaneY);
+    if (car.pos.y < street.parkLaneY + 10) {
+      car.phase = "drive";
+      car.phaseT = 0;
+    } else if (car.phaseT > 1.5 && speed < 3) {
+      car.phase = "backup"; // wedged against the car in front: back up and try again
+      car.phaseT = 0;
+    }
+  } else {
+    parkerDriveLane(car, PARKER_CRUISE, dt);
+  }
+}
+
+// Follow parkLaneY rightward at `speed`, braking (and honking) for anything
+// in the way.
+function parkerDriveLane(car, speed, dt) {
+  const fx = Math.cos(car.angle), fy = Math.sin(car.angle);
+  const blocked = [car1, car2, ...npcs, ...parkers].some((o) => {
+    if (o === car) return false;
+    const dx = o.pos.x - car.pos.x, dy = o.pos.y - car.pos.y;
+    const ahead = dx * fx + dy * fy;
+    return ahead > 0 && ahead < 70 && Math.abs(dy * fx - dx * fy) < CAR.width + 4;
+  });
+  car.drive.steer = apSteerAt(car, car.pos.x + 90, street.parkLaneY);
+  car.drive.throttle = blocked ? apStop(car) : apThrottleFor(car, speed);
+  // same horn habits as traffic: after NPC_HONK_DELAY, then every few seconds
+  if (!blocked) {
+    car.blockedTime = 0;
+    car.nextHonkAt = NPC_HONK_DELAY;
+    return;
+  }
+  car.blockedTime += dt;
+  if (car.blockedTime >= car.nextHonkAt) {
+    playHornSound(car.pos.x, car.hornPitch);
+    pedestriansNotice(car.pos.x, car.pos.y, "honk");
+    car.nextHonkAt = car.blockedTime + NPC_HONK_REPEAT_MIN + Math.random() * (NPC_HONK_REPEAT_MAX - NPC_HONK_REPEAT_MIN);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Autopilot (a player car driven by a deliberately bad AI)
 // ---------------------------------------------------------------------------
 // Each player's HUD button toggles car.autopilot. The AI then plays the game
@@ -1920,7 +2260,7 @@ function makeAutopilot() {
     seen: new Map(), // obstacle -> did it notice this one
     seenTimer: 0,
     reverseTime: 0, reverseSteer: 0,
-    stuckTime: 0,
+    stuckTime: 0, stuckStreak: 0, lastStuckAt: -99,
     park: null, garage: null, harass: null,
   };
 }
@@ -1962,7 +2302,7 @@ function apSteerAt(car, tx, ty, reverse = false) {
 function apAvoid(car, ap, steer) {
   const fx = Math.cos(car.angle), fy = Math.sin(car.angle);
   const look = 60 + Math.max(0, apForwardSpeed(car)) * 0.35;
-  const obstacles = [...crates, ...street.parkedCars];
+  const obstacles = [...crates, ...parkers];
   for (const o of obstacles) {
     const ox = o.pos ? o.pos.x : o.x, oy = o.pos ? o.pos.y : o.y;
     const reach = (o.pos ? CAR.length / 2 : o.r) + CAR.capsuleRadius + 4;
@@ -1971,7 +2311,12 @@ function apAvoid(car, ap, steer) {
     const side = dy * fx - dx * fy; // > 0: to our right
     if (ahead <= 0 || ahead > look || Math.abs(side) > reach) continue;
     if (!ap.seen.has(o)) ap.seen.set(o, Math.random() > AP_BLIND_CHANCE);
-    if (ap.seen.get(o)) return side >= 0 ? -1 : 1;
+    if (!ap.seen.get(o)) continue;
+    // Down in the parking lane, swerve out toward the road whichever side
+    // the obstacle is on: "away from it" can mean into the curb, wedging the
+    // car in the corner between the curb and a parked car.
+    if (car.pos.y > street.carCenterY - CAR.width) return Math.cos(car.angle) >= 0 ? -1 : 1;
+    return side >= 0 ? -1 : 1;
   }
   return steer;
 }
@@ -1980,8 +2325,12 @@ function apAvoid(car, ap, steer) {
 // three-point turns and backing out when wedged. Returns the distance left.
 function apDriveTo(car, ap, tx, ty, cruise, { avoid = true } = {}) {
   const dx = tx - car.pos.x, dy = ty - car.pos.y, dist = Math.hypot(dx, dy);
-  const err = wrapAngle(Math.atan2(dy, dx) - car.angle);
+  let err = wrapAngle(Math.atan2(dy, dx) - car.angle);
   const speed = speedOf(car);
+  // Turning round on the curb side of the road: always turn toward the road.
+  // Turning the other way points the car into the curb and the parked cars,
+  // where it wedges itself in the corner.
+  if (Math.abs(err) > 2 && car.pos.y > street.centerlineY) err = Math.cos(car.angle) >= 0 ? -Math.PI : Math.PI;
 
   if (ap.reverseTime > 0) {
     ap.drive.throttle = apThrottleFor(car, -70);
@@ -2013,8 +2362,12 @@ function apCheckStuck(car, ap, dt, pushing) {
   ap.stuckTime += dt;
   if (ap.stuckTime > 0.8) {
     ap.stuckTime = 0;
-    ap.reverseTime = 0.7 + Math.random() * 0.6;
-    ap.reverseSteer = ap.drive.steer >= 0 ? -1 : 1;
+    // Stuck again soon after the last escape: the same short back-up would
+    // loop forever, so back out further each time, alternating sides.
+    ap.stuckStreak = gameTime - ap.lastStuckAt < 4 ? ap.stuckStreak + 1 : 0;
+    ap.lastStuckAt = gameTime;
+    ap.reverseTime = Math.min(2.5, 0.7 + Math.random() * 0.6 + ap.stuckStreak * 0.5);
+    ap.reverseSteer = (ap.drive.steer >= 0 ? -1 : 1) * (ap.stuckStreak % 2 ? -1 : 1);
   }
 }
 
@@ -2141,22 +2494,28 @@ function apParkGeometry(p, spot) {
   };
 }
 
+// A random free bay -- or, sometimes, the one the other autopilot is already
+// going for. Fight! It leaves bays an arriving parked car is heading for
+// alone if it can (racing it sends the car off looking for another, which
+// meant traffic in the row most of the time). With no free bay at all, any
+// bay: it'll just bump into whoever's there and pick again once one frees up.
 function apChooseSpot(car) {
   const other = car === car1 ? car2 : car1;
-  // Sometimes it goes for the same spot as the other autopilot. Fight!
-  if (other.autopilot && other.ap.park && Math.random() < 0.45) return other.ap.park.spot;
-  return Math.floor(Math.random() * street.parkingSpots.length);
+  if (other.autopilot && other.ap.park && Math.random() < 0.45) return other.ap.park.bay;
+  const unclaimed = unclaimedBays(), free = freeBays();
+  return pickOf(unclaimed.length ? unclaimed : free.length ? free : street.bays);
 }
 
-function apStartPark(car, ap) {
-  const spot = apChooseSpot(car);
-  const s = street.parkingSpots[spot];
+// Starts a parking attempt at `bay` (a random one if not given), from
+// `phase` -- parked cars arriving along the lane skip the approach.
+function apStartPark(car, ap, bay = null, phase = "approach") {
+  const s = bay || apChooseSpot(car);
   ap.park = {
-    spot,
+    bay: s,
     dir: car.pos.x < (s.x0 + s.x1) / 2 ? 1 : -1,
     gap: 30 + Math.random() * 10, // how far out from the parked row it lines up
     rush: 1 + Math.random() * Math.random() * 2.5, // sometimes it floors it in reverse
-    phase: "approach", t: 0, phaseT: 0,
+    phase, t: 0, phaseT: 0,
     detour: false, rear0: 0, shuffle: 1, shuffleT: 0,
   };
 }
@@ -2166,10 +2525,12 @@ function apRearY(car) {
 }
 
 function apPark(car, ap, dt) {
-  if (!ap.park || ap.park.spot >= street.parkingSpots.length) apStartPark(car, ap);
+  // No attempt yet, the street was rebuilt, or someone else is in the bay:
+  // pick again (only if there's a free one to switch to).
+  if (!ap.park || !street.bays.includes(ap.park.bay) ||
+      (bayOccupied(ap.park.bay, car) && freeBays().length)) apStartPark(car, ap, car.bay || null);
   const p = ap.park;
-  const spot = street.parkingSpots[p.spot];
-  const geo = apParkGeometry(p, spot);
+  const geo = apParkGeometry(p, p.bay);
   const a = wrapAngle(car.angle - geo.heading); // heading error vs. parallel to the row
   const speed = speedOf(car);
   const setPhase = (phase) => { p.phase = phase; p.phaseT = 0; };
@@ -2178,7 +2539,7 @@ function apPark(car, ap, dt) {
   if (p.phase !== "approach") p.t += dt;
   p.phaseT += dt;
   if (p.t > AP_PARK_TIMEOUT) {
-    apStartPark(car, ap);
+    apStartPark(car, ap, car.bay || null);
     return;
   }
 
@@ -2229,7 +2590,10 @@ function apPark(car, ap, dt) {
     const facing = Math.cos(car.angle) >= 0 ? 1 : -1;
     const err = wrapAngle((facing > 0 ? 0 : Math.PI) - car.angle);
     const off = (car.pos.x - geo.cx) * facing; // > 0: past the middle, in the direction it faces
-    if ((Math.abs(err) < 0.1 && Math.abs(off) <= geo.room + 2) || p.phaseT > 6) {
+    // Parked-car NPCs (they have a car.bay) center up more carefully: any
+    // slack they leave on one side eats into the free bay next to them.
+    const tolerance = car.bay ? Math.min(geo.room, 1.5) : geo.room;
+    if ((Math.abs(err) < 0.1 && Math.abs(off) <= tolerance) || p.phaseT > 6) {
       ap.drive.throttle = apStop(car);
       ap.drive.steer = 0;
       if (speed < 1) setPhase("wait");
@@ -2254,7 +2618,7 @@ function apPark(car, ap, dt) {
     ap.drive.throttle = apThrottleFor(car, 60);
     ap.drive.steer = apSteerAt(car, car.pos.x + facing * 80, geo.stageY - 30);
     apCheckStuck(car, ap, dt, true);
-    if (p.phaseT > 1.3) apStartPark(car, ap);
+    if (p.phaseT > 1.3) apStartPark(car, ap, car.bay || null);
   }
 }
 
@@ -2761,6 +3125,7 @@ window.addEventListener("resize", () => {
     crates = buildCrates();
     const oldLaneY = street.npcLaneY, oldCurbY = street.curbY;
     street = buildStreet();
+    resetParkers(); // a fresh parked row for the new layout (cars mid-maneuver just vanish)
     staticDirty = true;
     mechanic = null; // the garage moved: call off any repair in progress (nothing was charged yet); the door rolls shut
 
@@ -2806,9 +3171,10 @@ function resolveCurb(car) {
 function update(dt) {
   gameTime += dt;
   updateTraffic(dt);
+  updateParkers(dt);
   for (const car of [car1, car2]) if (car.autopilot) updateAutopilot(car, dt);
 
-  const movers = [car1, car2, ...npcs];
+  const movers = [car1, car2, ...npcs, ...parkers];
   for (const car of movers) stepCar(car, dt);
 
   // Only the players are fenced in by the arena walls -- traffic enters and
@@ -2819,10 +3185,6 @@ function update(dt) {
   for (const car of movers) {
     resolveCurb(car);
     for (const c of crates) resolveCarVsStaticCircle(car, { x: c.x, y: c.y }, c.r, c);
-    for (const pc of street.parkedCars) {
-      // both ends of a parked car share one contact key: touching it is one touch
-      for (const cc of pc.collisionCircles) resolveCarVsStaticCircle(car, cc, CAR.capsuleRadius, pc);
-    }
   }
   for (let i = 0; i < movers.length; i++) {
     for (let j = i + 1; j < movers.length; j++) resolveCarVsCar(movers[i], movers[j]);
@@ -2994,7 +3356,6 @@ function buildStaticLayer() {
   drawStreetArt(c);
   drawGarageBuilding(c);
   for (const cr of crates) drawCrate(c, cr);
-  for (const pc of street.parkedCars) drawCar(c, pc);
   drawPaperGrain(c);
 }
 
@@ -3022,7 +3383,7 @@ function drawGround(c) {
 }
 
 function drawStreetArt(c) {
-  const { curbY, centerlineY, npcLaneY, parkingSpots } = street;
+  const { curbY, centerlineY, npcLaneY, bays } = street;
 
   // road surface, inked along its top edge
   const roadTop = npcLaneY - CAR.width / 2 - 16;
@@ -3055,10 +3416,10 @@ function drawStreetArt(c) {
   inkLine(c, -5, curbY - 3, W + 5, curbY - 3, 31, 2.5);
   inkLine(c, -5, curbY + 4, W + 5, curbY + 4, 37, 2);
 
-  // parking spots: painted end marks and a big "P"
-  for (const s of parkingSpots) {
-    for (const x of [s.x0, s.x1]) inkShape(c, roundRectPoints(x - 2, curbY - 15, 4, 13, 2, 4), "#ffffff", 1.5);
-    inkText(c, "P", (s.x0 + s.x1) / 2, street.carCenterY, 17, "#ffffff");
+  // parking bays: a painted mark at each end of every bay (the "P" on free
+  // bays is drawn live, by drawParkingTargets, since they come and go)
+  for (const x of [bays[0].x0, ...bays.map((b) => b.x1)]) {
+    inkShape(c, roundRectPoints(x - 2, curbY - 15, 4, 13, 2, 4), "#ffffff", 1.5);
   }
 }
 
@@ -3252,11 +3613,16 @@ function drawCar(c, car) {
 // in "mustPark", every open spot pulses in that player's color. With both
 // players waiting to park, the two pulses run half a cycle apart, so the
 // spots alternate between their colors.
+// A big painted "P" on every free bay, pulsing in the color of any player
+// who must park. Free bays change as parked cars come and go, so this is
+// drawn live rather than in the static layer.
 function drawParkingTargets() {
+  const free = freeBays();
+  for (const b of free) inkText(ctx, "P", (b.x0 + b.x1) / 2, street.carCenterY, 17, "#ffffff");
   const waiting = [car1, car2].filter((c) => c.gameState === "mustPark");
   const y0 = street.carCenterY - CAR.width / 2 - 5;
   const h = street.curbY - 1 - y0;
-  drawTargetPulse(waiting, street.parkingSpots.map((s) => ({ x: s.x0, y: y0, w: s.x1 - s.x0, h })));
+  drawTargetPulse(waiting, free.map((b) => ({ x: b.x0, y: y0, w: b.x1 - b.x0, h })));
 }
 
 // The shared "go here" cue: each rect pulses (tinted fill + outline) in the
@@ -3563,16 +3929,20 @@ function drawParticles() {
 }
 
 function render() {
+  // A window with no size yet (e.g. a tab loaded while hidden): drawing a
+  // zero-size layer throws, which would kill the frame loop for good.
+  if (!W || !H) return;
   if (staticDirty) {
     buildStaticLayer();
     staticDirty = false;
   }
-  ctx.drawImage(staticLayer, 0, 0); // ground, street, garage building, crates, parked cars
+  ctx.drawImage(staticLayer, 0, 0); // ground, street, garage building, crates
   drawParkingTargets();
   drawGaragePad();
   drawGarageDoor();
   drawPedestrians();
   drawMechanic();
+  for (const pc of parkers) drawCar(ctx, pc);
   for (const n of npcs) drawCar(ctx, n);
   if (coin) drawCoin(coin);
   drawCar(ctx, car1);
