@@ -112,7 +112,7 @@ AI cars (`npcs`, module-level) spawn as a Poisson process (`NPC_SPAWN_MEAN`, ~10
 Headless measurements: recovery takes ~3–8.5s back to the lane (it was ~1–3.5s); undisturbed cars still hold the lane exactly.
 
 Blocking and getting unstuck:
-- **Braking:** they brake for any car within `NPC_BRAKE_DIST` in their path, never reversing into a queue. In the lane they wait behind a blocker. Off the road (`lost`) they creep around it instead. Waiting there loops forever, because the lane point they aim for can sit right behind the blocker.
+- **Braking:** they brake for any car or caravan (`trafficPoints`) within `NPC_BRAKE_DIST` in their path, never reversing into a queue. In the lane they wait behind a blocker. Off the road (`lost`) they creep around it instead. Waiting there loops forever, because the lane point they aim for can sit right behind the blocker.
 - **Stopped too long** (1.5s wedged, 3s waiting behind a car): they back up at *full* opposite lock for 1s and retry. It has to be full lock: the lazy steering gain alone backs out nearly straight and drives right back into the same spot.
 
 Without these, a car knocked off the road can wait forever behind a player who isn't moving. That was reproduced headlessly while tuning.
@@ -120,6 +120,24 @@ Without these, a car knocked off the road can wait forever behind a player who i
 There's only one traffic lane, so `spawnNpc` gives a new car the same direction as any traffic already on screen, and picks a random direction only when the road is empty. This prevents head-on meetings.
 
 `resetTraffic` runs from `setupWorld`. It sets the spawn timer to 0, so the first car rolls in immediately on start; only later spawns follow the random schedule. On resize, NPCs are shifted by the change in `npcLaneY` so they stay in the lane.
+
+### Caravans (`updateCaravan`, `resolveCaravanCollisions`)
+
+A physics playground for now: `setupWorld` attaches a caravan to both players (`attachCaravan`), and there's no gameplay around it yet. Parking with one can't succeed, since no gap fits a car plus a caravan, and the autopilot doesn't know it's towing. Every length is in `CARAVAN`.
+
+**Kinematics.** The caravan's only wheels are one axle, which rolls along the caravan but not sideways. So each step `updateCaravan` points the caravan from its axle (`car.caravan.axle`) at the hitch's new position (`hitchPoint`, `CARAVAN.hitchBack` behind the car's center), and re-places the axle `CARAVAN.axleBack` behind the hitch. That one rule gives both behaviors with no special cases:
+- **Forward:** the caravan trails and straightens itself out. From a 40° kink it's straight within about 190 px.
+- **Reversing:** the hitch angle grows. With the wheel straight, a 3° kink became a full jackknife in about 4 s. Steering against the swing (the "wrong" way) holds it straight: never worse than 9° in the test, while the intuitive way jackknifes.
+
+It runs after the cars' own collisions each step, then `resolveCaravanCollisions` pushes back.
+
+**Jackknife** (`clampJackknife`): the hitch angle stops at `CARAVAN.jackknife` (1.2 rad, ~69°), with one crunch sound on reaching it. **Reversing deeper into it jams the rig** (`updateCaravan`): the car's rear corner is against the drawbar and the caravan's wheels can't slide sideways, so the step's move is undone (`car.prevPos`/`prevAngle`, saved in `update` before `stepCar`) and the car stops. Two things get out: driving forward, or reversing with the front wheels turned at least `CARAVAN.unjamSteer` (half) of full lock *the right way*, opposite in sign to the hitch angle. That's realistic: at the limit, full lock swings the car round toward the caravan just faster than reversing folds it (car yaw ≈ 0.020 rad/px of travel against the fold's ≈ 0.018). The bicycle model can't show it on its own from a standstill, because its tires barely grip sideways below `lowSpeedGripRef`, so the car slides straight back instead of swinging, hence the explicit rule. Measured: straight or wrong-way wheel, still jammed after 4s. Right way, it reverses out, the fold easing 69° → 66° → 57° → 20° over 3s, and held too long it folds the other way. The first version had no escape but forward, and a full stop felt bad. Clamping the angle alone, with no jam, let the car reverse on regardless, dragging the caravan sideways. That's where the body's front corner meets the car's rear corner with the 18 px drawbar (`tongue`). At 12 px they met at ~58°, and the first 80° limit drew the caravan overlapping the car. A full-lock turn *forward* at crawl speed also reaches the limit, as a real one would.
+
+**Collisions:** two circles (`CARAVAN.circles`, `radius`) against walls, the curb, crates, every other car, and the other player's caravan. `pushCaravan` splits each push. The part across the caravan swivels it about the hitch. The part along it moves the whole rig, and the matching part of the velocity change goes to the car, so reversing dead-on into a crate stops the car. Parked cars stay anchored against gentle bumps, as in `resolveCarVsCar`. Caravan hits make sounds and turn pedestrians' heads, but do no damage and leave no dents yet. Traffic and parked cars driving along the lane brake for caravans: `trafficPoints` lists every car plus both caravan circles, and it's used by `npcDrive`, `parkerDriveLane` and both spawn-clearance checks. Before it existed, NPCs drove straight into caravans.
+
+**Load:** towing scales engine and reverse power by `CARAVAN_POWER` (0.75) and top speed by `CARAVAN_TOP_SPEED` (0.8) in `stepCar`, on top of any damage.
+
+**Drawing** (`drawCaravan`, `caravanArt`): drawn under the players' cars, in the same ink style. A cream roof with a skylight and vents, a band of the car's color across the front, an A-frame drawbar to the hitch ball, and the axle's wheels half under the body.
 
 ### Parked cars (`updateParkers`)
 

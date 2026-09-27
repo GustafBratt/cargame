@@ -901,7 +901,8 @@ function stepCar(car, dt) {
   // as top speed left it below rolling resistance and the car couldn't move
   // at all. Brakes are left alone: a wrecked car should still be able to stop.
   const health = carHealth(car);
-  const power = 1 - DAMAGE_POWER_LOSS * (1 - health);
+  const tow = car.caravan ? CARAVAN_POWER : 1; // towing a caravan: the engine has more to pull
+  const power = (1 - DAMAGE_POWER_LOSS * (1 - health)) * tow;
   let longAccel = 0;
   if (throttle > 0) {
     longAccel = p.enginePower * power;
@@ -933,8 +934,8 @@ function stepCar(car, dt) {
   const latAfter = car.vel.x * right.x + car.vel.y * right.y;
   // Damage caps top speed, but never below a crawl, so a wreck can still park.
   const fwdClamped = clamp(fwdAfter,
-    -Math.max(p.maxReverseSpeed * health, DAMAGED_MIN_REVERSE),
-    Math.max(p.maxSpeed * health, DAMAGED_MIN_SPEED));
+    -Math.max(p.maxReverseSpeed * health * (car.caravan ? CARAVAN_TOP_SPEED : 1), DAMAGED_MIN_REVERSE),
+    Math.max(p.maxSpeed * health * (car.caravan ? CARAVAN_TOP_SPEED : 1), DAMAGED_MIN_SPEED));
   car.vel.x = forward.x * fwdClamped + right.x * latAfter;
   car.vel.y = forward.y * fwdClamped + right.y * latAfter;
 
@@ -1309,7 +1310,7 @@ function buildCrates() {
 }
 
 function setupWorld() {
-  car1 = createCar(W * 0.35, H * 0.5, -Math.PI / 2, "#4fc3ff", {
+  car1 = createCar(W * 0.35, H * 0.5, Math.PI / 2, "#4fc3ff", {
     up: ["w"], down: ["s"], left: ["a"], right: ["d"],
   });
   car2 = createCar(W * 0.65, H * 0.5, Math.PI / 2, "#ffa64f", {
@@ -1324,6 +1325,8 @@ function setupWorld() {
   car2.score = 0; car2.gameState = "seekCoin";
   car1.label = "P1"; car1.keyHint = "WASD"; car1.hasDriven = false;
   car2.label = "P2"; car2.keyHint = "IJKL / Arrows"; car2.hasDriven = false;
+  attachCaravan(car1); // caravan-driving branch: every player tows a caravan
+  attachCaravan(car2);
   particles.length = 0;
   spawnCoin(); // after clearing particles, so its spawn animation survives
   resetTraffic();
@@ -1777,7 +1780,7 @@ function spawnNpc() {
   const dir = npcs.length ? npcs[0].dir : Math.random() < 0.5 ? 1 : -1;
   const x = dir > 0 ? -CAR.length : W + CAR.length;
   const y = street.npcLaneY;
-  const clear = [car1, car2, ...npcs].every((c) => Math.hypot(c.pos.x - x, c.pos.y - y) > CAR.length * 2.5);
+  const clear = trafficPoints(null).every((p) => Math.hypot(p.x - x, p.y - y) > CAR.length * 2.5);
   if (!clear) return false;
 
   const color = NPC_COLORS[Math.floor(Math.random() * NPC_COLORS.length)];
@@ -1859,9 +1862,8 @@ function npcDrive(npc, dt) {
   const targetSpeed = NPC_CRUISE_SPEED + (NPC_LOST_SPEED - NPC_CRUISE_SPEED) * offness;
 
   let blocked = false, blockerSide = 0;
-  for (const other of [car1, car2, ...npcs, ...parkers]) {
-    if (other === npc) continue;
-    const dx = other.pos.x - npc.pos.x, dy = other.pos.y - npc.pos.y;
+  for (const p of trafficPoints(npc)) {
+    const dx = p.x - npc.pos.x, dy = p.y - npc.pos.y;
     const ahead = dx * forward.x + dy * forward.y;
     const side = dy * forward.x - dx * forward.y; // > 0: blocker is to our right
     if (ahead > 0 && ahead < NPC_BRAKE_DIST && Math.abs(side) < CAR.width + 6) {
@@ -1936,6 +1938,211 @@ function updateTraffic(dt) {
   }
 
   for (const n of npcs) npcDrive(n, dt);
+}
+
+// ---------------------------------------------------------------------------
+// Caravans (a physics playground: on this branch every player tows one)
+// ---------------------------------------------------------------------------
+// The caravan's only wheels are one axle, which rolls along the caravan but
+// not sideways, so the caravan simply follows its hitch: each step the axle
+// is pulled (or, reversing, pushed) along the line toward the hitch's new
+// position, keeping its distance (updateCaravan). That one rule gives both
+// behaviors for free:
+// - forward, the caravan trails behind and straightens itself out
+// - reversing, any angle between car and caravan GROWS -- the famous
+//   instability, so you have to steer the "wrong" way to aim the caravan
+// Past CARAVAN.jackknife the car's rear corner meets the drawbar: the angle
+// stops there (with a crunch), and the caravan gets dragged round with it.
+//
+// Collisions (resolveCaravanCollisions): the caravan's two circles collide
+// with walls, the curb, crates and every other car. A push along the drawbar
+// shoves the whole rig (car included, and it stops the car's motion into the
+// obstacle); a push across it swivels the caravan about the hitch.
+//
+// The caravan adds load: less power and a lower top speed (stepCar).
+
+const CARAVAN = {
+  hitchBack: CAR.length / 2 + 4, // the hitch ball sits this far behind the car's center
+  tongue: 18, // drawbar: hitch to the front of the body
+  length: 52,
+  width: 26, // a bit wider than the car, like the real thing
+  axleBack: 48, // hitch to axle: a little behind the body's middle (44), for nose weight
+  radius: 13, // collision circles (two, filling the body)
+  // The most the caravan can swing relative to the car: ~69 deg, where the
+  // body's front corner meets the car's rear corner (with this drawbar).
+  jackknife: 1.2,
+  unjamSteer: 0.5, // fraction of full lock, turned the right way, that lets a jackknifed rig reverse
+};
+CARAVAN.circles = [CARAVAN.tongue + CARAVAN.radius, CARAVAN.tongue + CARAVAN.length - CARAVAN.radius]; // px behind the hitch
+const CARAVAN_POWER = 0.75; // engine and reverse power while towing
+const CARAVAN_TOP_SPEED = 0.8; // top speed while towing
+
+// Everything a driver should brake for, as points: every car's center,
+// plus both circles of any caravan (traffic used to see only cars, and drove
+// straight into caravans). `except` is the driver itself.
+function trafficPoints(except) {
+  const pts = [];
+  for (const c of [car1, car2, ...npcs, ...parkers]) {
+    if (c === except) continue;
+    pts.push(c.pos);
+    if (c.caravan) for (const s of CARAVAN.circles) pts.push(caravanPoint(c, s));
+  }
+  return pts;
+}
+
+function hitchPoint(car) {
+  return { x: car.pos.x - Math.cos(car.angle) * CARAVAN.hitchBack, y: car.pos.y - Math.sin(car.angle) * CARAVAN.hitchBack };
+}
+
+// The point `s` px behind the hitch, along the caravan.
+function caravanPoint(car, s) {
+  const h = hitchPoint(car), a = car.caravan.angle;
+  return { x: h.x - Math.cos(a) * s, y: h.y - Math.sin(a) * s };
+}
+
+function attachCaravan(car) {
+  car.caravan = { angle: car.angle, axle: null, seed: Math.random() * 1000, jackknifed: false };
+  placeCaravanAxle(car);
+}
+
+// Puts the axle where the caravan's angle says it is (after the angle was
+// set directly, or the whole rig was moved).
+function placeCaravanAxle(car) {
+  car.caravan.axle = caravanPoint(car, CARAVAN.axleBack);
+}
+
+function updateCaravan(car) {
+  const cv = car.caravan;
+  const aim = () => {
+    const h = hitchPoint(car);
+    return Math.atan2(h.y - cv.axle.y, h.x - cv.axle.x);
+  };
+  cv.angle = aim();
+  // Jammed: folded to the limit and reversing deeper into it. The car's rear
+  // corner is against the drawbar and the caravan's wheels can't slide
+  // sideways, so the rig locks up -- undo this step's move and stop the car.
+  // Driving forward gets out, and so does reversing with the front wheels
+  // turned well over the right way: at the limit, full lock swings the car
+  // round toward the caravan just faster than reversing folds it, so a real
+  // rig creeps out of the fold. (The bicycle model can't show that by itself
+  // from a standstill: its tires barely grip sideways at crawl speed, see
+  // lowSpeedGripRef, so the car slides straight back instead of swinging.
+  // Hence the explicit rule.) Clamping alone, with no jam, let the car
+  // reverse on regardless, dragging the caravan sideways.
+  const hitchAngle = wrapAngle(cv.angle - car.angle);
+  const reversing = car.vel.x * Math.cos(car.angle) + car.vel.y * Math.sin(car.angle) < 0;
+  // reversing, the car swings toward the caravan's side when the wheels turn
+  // away from it: steer opposite in sign to the hitch angle
+  const steeringOut = car.steerCurrent * Math.sign(hitchAngle) < -CARAVAN.unjamSteer * CAR.maxSteer;
+  if (reversing && !steeringOut && Math.abs(hitchAngle) > CARAVAN.jackknife && car.prevPos) {
+    car.pos.x = car.prevPos.x;
+    car.pos.y = car.prevPos.y;
+    car.angle = car.prevAngle;
+    car.vel.x = car.vel.y = 0;
+    car.angularVel = 0;
+    cv.angle = aim();
+    // keep the contact "touching" while jammed, so the crunch plays once
+    collisionSound(0, hitchPoint(car).x, car, isNewTouch(car, "jackknife"));
+  }
+  clampJackknife(car);
+  placeCaravanAxle(car);
+}
+
+// The car's rear corner meets the drawbar: the hitch angle can't go further.
+function clampJackknife(car) {
+  const cv = car.caravan;
+  const hitchAngle = wrapAngle(cv.angle - car.angle);
+  const over = Math.abs(hitchAngle) > CARAVAN.jackknife;
+  if (over) {
+    cv.angle = car.angle + Math.sign(hitchAngle) * CARAVAN.jackknife;
+    if (!cv.jackknifed) {
+      const h = hitchPoint(car);
+      collisionSound(Math.max(HIT_SOUND_MIN, speedOf(car)), h.x, car, isNewTouch(car, "jackknife"));
+    }
+  }
+  cv.jackknifed = over;
+}
+
+// Applies a push `p` (world px) that a collision gave the caravan circle `s`
+// px behind the hitch. The part across the caravan swivels it about the
+// hitch; the part along it moves the whole rig. `dv` is the velocity change
+// the collision gave the circle: its along-the-caravan part goes to the car.
+function pushCaravan(car, s, p, dv) {
+  const cv = car.caravan;
+  const tx = Math.cos(cv.angle), ty = Math.sin(cv.angle);
+  const along = p.x * tx + p.y * ty;
+  // d(point)/d(angle) for a point s behind the hitch is s * (sin a, -cos a)
+  cv.angle += (p.x * ty - p.y * tx) / s;
+  car.pos.x += tx * along;
+  car.pos.y += ty * along;
+  const dvAlong = dv.x * tx + dv.y * ty;
+  car.vel.x += tx * dvAlong;
+  car.vel.y += ty * dvAlong;
+  clampJackknife(car);
+  placeCaravanAxle(car);
+}
+
+function resolveCaravanCollisions(car) {
+  const r = CARAVAN.radius;
+  for (const s of CARAVAN.circles) {
+    // walls and curb: clamp the circle inside, bounce what was going out
+    const c = caravanPoint(car, s);
+    const push = { x: 0, y: 0 };
+    if (c.x - r < 0) push.x = r - c.x;
+    else if (c.x + r > W) push.x = W - r - c.x;
+    if (c.y - r < 0) push.y = r - c.y;
+    else if (c.y + r > street.curbY) push.y = street.curbY - r - c.y;
+    if (push.x || push.y) {
+      const n = Math.hypot(push.x, push.y), nx = push.x / n, ny = push.y / n;
+      const vn = car.vel.x * nx + car.vel.y * ny; // < 0: heading into it
+      const dv = vn < 0 ? { x: -1.4 * vn * nx, y: -1.4 * vn * ny } : { x: 0, y: 0 };
+      pushCaravan(car, s, push, dv);
+      caravanHitSound(car, Math.max(0, -vn), { x: c.x - nx * r, y: c.y - ny * r }, push.y < 0 ? "curb" : "wall");
+    }
+
+    // crates: static circles
+    for (const cr of crates) {
+      const cc = caravanPoint(car, s), before = { x: cc.x, y: cc.y };
+      const v = { x: car.vel.x, y: car.vel.y };
+      const hit = resolveCircles(cc, v, r, { x: cr.x, y: cr.y }, null, cr.r, true, CAR.obstacleCollisionRestitution);
+      if (hit < 0) continue;
+      pushCaravan(car, s, { x: cc.x - before.x, y: cc.y - before.y }, { x: v.x - car.vel.x, y: v.y - car.vel.y });
+      caravanHitSound(car, hit, cc, cr);
+    }
+
+    // every other car's capsule, and the other player's caravan
+    for (const other of [car1, car2, ...npcs, ...parkers]) {
+      if (other === car) continue;
+      const targets = capsuleOffsets(other.angle).map((o) => ({ x: other.pos.x + o.x, y: other.pos.y + o.y, r: CAR.capsuleRadius, s: null }));
+      if (other.caravan) for (const os of CARAVAN.circles) targets.push({ ...caravanPoint(other, os), r, s: os });
+      for (const t of targets) {
+        const cc = caravanPoint(car, s), before = { x: cc.x, y: cc.y };
+        const tb = { x: t.x, y: t.y };
+        const v = { x: car.vel.x, y: car.vel.y };
+        const ov = { x: other.vel.x, y: other.vel.y };
+        // a parked car doesn't budge for a gentle bump (see resolveCarVsCar)
+        const anchored = other.handbrake && Math.hypot(v.x - ov.x, v.y - ov.y) < DAMAGE_THRESHOLD;
+        const hit = resolveCircles(cc, v, r, tb, ov, t.r, anchored, CAR.obstacleCollisionRestitution);
+        if (hit < 0) continue;
+        pushCaravan(car, s, { x: cc.x - before.x, y: cc.y - before.y }, { x: v.x - car.vel.x, y: v.y - car.vel.y });
+        if (!anchored) {
+          const op = { x: tb.x - t.x, y: tb.y - t.y }, odv = { x: ov.x - other.vel.x, y: ov.y - other.vel.y };
+          if (t.s !== null) pushCaravan(other, t.s, op, odv);
+          else {
+            other.pos.x += op.x; other.pos.y += op.y;
+            other.vel.x += odv.x; other.vel.y += odv.y;
+          }
+        }
+        caravanHitSound(car, hit, cc, other);
+        if (hit >= HIT_SOUND_MIN && other.drive && !other.handbrake) npcGotRammed(other);
+      }
+    }
+  }
+}
+
+function caravanHitSound(car, speed, at, key) {
+  collisionSound(speed, at.x, car, isNewTouch(car, key));
+  if (speed >= HIT_SOUND_MIN) pedestriansNotice(at.x, at.y, "crash", speed);
 }
 
 // ---------------------------------------------------------------------------
@@ -2079,7 +2286,7 @@ function parkerPickBay(bays) {
 function parkerArrive() {
   const bays = unclaimedBays();
   const x = -CAR.length, y = street.parkLaneY;
-  const clear = [car1, car2, ...npcs, ...parkers].every((c) => Math.hypot(c.pos.x - x, c.pos.y - y) > CAR.length * 2.5);
+  const clear = trafficPoints(null).every((p) => Math.hypot(p.x - x, p.y - y) > CAR.length * 2.5);
   if (!bays.length || !clear) return false;
   const car = makeParker(x, y);
   car.vel.x = PARKER_CRUISE;
@@ -2200,9 +2407,8 @@ function parkerLeaving(car, dt) {
 // in the way.
 function parkerDriveLane(car, speed, dt) {
   const fx = Math.cos(car.angle), fy = Math.sin(car.angle);
-  const blocked = [car1, car2, ...npcs, ...parkers].some((o) => {
-    if (o === car) return false;
-    const dx = o.pos.x - car.pos.x, dy = o.pos.y - car.pos.y;
+  const blocked = trafficPoints(car).some((p) => {
+    const dx = p.x - car.pos.x, dy = p.y - car.pos.y;
     const ahead = dx * fx + dy * fy;
     return ahead > 0 && ahead < 70 && Math.abs(dy * fx - dx * fy) < CAR.width + 4;
   });
@@ -3140,6 +3346,7 @@ window.addEventListener("resize", () => {
     for (const car of [car1, car2]) {
       car.pos.x = clamp(car.pos.x, CAR.wallRadius, W - CAR.wallRadius);
       car.pos.y = clamp(car.pos.y, CAR.wallRadius, street.curbY - CAR.wallRadius);
+      if (car.caravan) placeCaravanAxle(car);
     }
 
     if (coin) {
@@ -3175,6 +3382,11 @@ function update(dt) {
   for (const car of [car1, car2]) if (car.autopilot) updateAutopilot(car, dt);
 
   const movers = [car1, car2, ...npcs, ...parkers];
+  for (const car of [car1, car2]) {
+    // where the car was before this step, for a jammed caravan to undo the move
+    car.prevPos = { x: car.pos.x, y: car.pos.y };
+    car.prevAngle = car.angle;
+  }
   for (const car of movers) stepCar(car, dt);
 
   // Only the players are fenced in by the arena walls -- traffic enters and
@@ -3189,6 +3401,8 @@ function update(dt) {
   for (let i = 0; i < movers.length; i++) {
     for (let j = i + 1; j < movers.length; j++) resolveCarVsCar(movers[i], movers[j]);
   }
+  for (const car of [car1, car2]) if (car.caravan) updateCaravan(car);
+  for (const car of [car1, car2]) if (car.caravan) resolveCaravanCollisions(car);
 
   updateCoin(dt);
   updateCoinRace();
@@ -3646,6 +3860,59 @@ function drawTargetPulse(cars, rects) {
   ctx.globalAlpha = 1;
 }
 
+// A caravan, top-down, in the same ink style as the cars: cream roof with a
+// skylight and roof vents, a band of the car's color across the front, an
+// A-frame drawbar to the hitch ball, and its one axle's wheels peeking out
+// the sides. Drawn in a frame centered on the body, +x toward the hitch.
+function caravanArt(cv) {
+  if (cv.art) return cv.art;
+  const L = CARAVAN.length, Wd = CARAVAN.width, s = cv.seed;
+  cv.art = {
+    body: wobble(roundRectPoints(-L / 2, -Wd / 2, L, Wd, 7, 5), s, 0.7),
+    front: wobble(roundRectPoints(L / 2 - 9, -Wd / 2 + 2, 7, Wd - 4, 3, 4), s + 1, 0.3),
+    skylight: wobble(roundRectPoints(-6, -5, 14, 10, 3, 4), s + 2, 0.3),
+  };
+  return cv.art;
+}
+
+function drawCaravan(c, car) {
+  const cv = car.caravan, art = caravanArt(cv);
+  const L = CARAVAN.length, Wd = CARAVAN.width;
+  const center = caravanPoint(car, CARAVAN.tongue + L / 2);
+  const hitchX = L / 2 + CARAVAN.tongue, axleX = hitchX - CARAVAN.axleBack;
+
+  c.save();
+  c.translate(center.x + 3, center.y + 4);
+  c.rotate(cv.angle);
+  tracePath(c, art.body);
+  c.fillStyle = PAL.shadow;
+  c.fill();
+  c.restore();
+
+  c.save();
+  c.translate(center.x, center.y);
+  c.rotate(cv.angle);
+  // A-frame drawbar and hitch ball
+  inkLine(c, L / 2 - 2, -7, hitchX, 0, cv.seed + 3, 2.2, INK, 0.3);
+  inkLine(c, L / 2 - 2, 7, hitchX, 0, cv.seed + 4, 2.2, INK, 0.3);
+  c.beginPath();
+  c.arc(hitchX, 0, 2.6, 0, Math.PI * 2);
+  c.fillStyle = PAL.tire;
+  c.fill();
+  c.strokeStyle = INK;
+  c.lineWidth = 1.2;
+  c.stroke();
+  // wheels half under the body
+  drawWheel(c, axleX, -Wd / 2, 0);
+  drawWheel(c, axleX, Wd / 2, 0);
+
+  inkShape(c, art.body, "#f7f0dc", 2.5);
+  inkShape(c, art.front, car.color, 1.5);
+  inkShape(c, art.skylight, PAL.glass, 1.5);
+  for (const x of [-L / 2 + 8, -L / 2 + 15]) inkShape(c, roundRectPoints(x - 2.5, -3, 5, 6, 1.5, 3), "#d9cfb6", 1.2);
+  c.restore();
+}
+
 // easeOutBack: 0 -> 1 with a small overshoot past 1 before settling -- the "pop".
 function popScale(u) {
   const c1 = 1.70158, c3 = c1 + 1;
@@ -3945,6 +4212,7 @@ function render() {
   for (const pc of parkers) drawCar(ctx, pc);
   for (const n of npcs) drawCar(ctx, n);
   if (coin) drawCoin(coin);
+  for (const car of [car1, car2]) if (car.caravan) drawCaravan(ctx, car);
   drawCar(ctx, car1);
   drawCar(ctx, car2);
   drawParticles();
