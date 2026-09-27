@@ -764,6 +764,10 @@ function clamp(v, lo, hi) {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
+function speedOf(car) {
+  return Math.hypot(car.vel.x, car.vel.y);
+}
+
 function readInput(car) {
   if (car.drive) return car.drive; // AI-controlled traffic, see npcDrive
   if (car.autopilot) return car.ap.drive; // a player on autopilot, see updateAutopilot
@@ -830,7 +834,7 @@ function stepCar(car, dt) {
   const right = { x: -forward.y, y: forward.x };
 
   const forwardSpeed = car.vel.x * forward.x + car.vel.y * forward.y;
-  const speed = Math.hypot(car.vel.x, car.vel.y);
+  const speed = speedOf(car);
 
   // The steering rack can't snap to full lock instantly -- car.steerCurrent
   // rate-limits how fast it chases the raw input target, same as a real
@@ -1195,9 +1199,9 @@ let npcs = []; // AI traffic cars, see updateTraffic
 let npcSpawnTimer = 0;
 let gameTime = 0; // seconds of simulation since setupWorld, see updateHint
 // The pre-drawn static scene (see buildStaticLayer) needs redrawing -- set
-// whenever street/crates are (re)built; render() does the actual rebuild,
-// since the render code's constants aren't initialized yet when setupWorld
-// first runs.
+// whenever street/crates are (re)built or a parked car gets a dent; render()
+// does the actual rebuild, since the render code's constants aren't
+// initialized yet when setupWorld first runs.
 let staticDirty = true;
 let particles = []; // cosmetic-only firework sparks/rings, see spawnFirework
 
@@ -1366,7 +1370,7 @@ function coinCollectable() {
 }
 
 function isParked(car) {
-  const speed = Math.hypot(car.vel.x, car.vel.y);
+  const speed = speedOf(car);
   if (speed > PARK_SPEED_LIMIT) return false;
 
   let a = car.angle % Math.PI;
@@ -1399,7 +1403,7 @@ function onGaragePad(car) {
 // Stopped on the pad, damaged, but broke -- drawGarage flashes the pad red.
 function garageDenied(car) {
   return car.damage > 0 && car.score < REPAIR_COST && onGaragePad(car) &&
-    Math.hypot(car.vel.x, car.vel.y) <= GARAGE_SPEED_LIMIT;
+    speedOf(car) <= GARAGE_SPEED_LIMIT;
 }
 
 // Sends the mechanic out to the first eligible car. One car at a time: a
@@ -1408,7 +1412,7 @@ function updateGarage() {
   if (mechanic) return;
   for (const car of [car1, car2]) {
     if (car.damage <= 0 || !onGaragePad(car)) continue;
-    if (Math.hypot(car.vel.x, car.vel.y) > GARAGE_SPEED_LIMIT) continue;
+    if (speedOf(car) > GARAGE_SPEED_LIMIT) continue;
     if (car.score < REPAIR_COST) continue;
     mechanic = makeMechanic(car);
     break;
@@ -1484,7 +1488,7 @@ function updateMechanic(dt) {
 
   const m = mechanic, car = m.car;
   m.t += dt;
-  const carStillThere = onGaragePad(car) && Math.hypot(car.vel.x, car.vel.y) <= GARAGE_SPEED_LIMIT * 2;
+  const carStillThere = onGaragePad(car) && speedOf(car) <= GARAGE_SPEED_LIMIT * 2;
 
   if (m.state === "opening") {
     if (garageDoorOpen >= 1) m.state = "walkOut";
@@ -1850,7 +1854,7 @@ function npcDrive(npc, dt) {
   // waiting on a car that isn't moving out of the way: back up for a moment,
   // then try again on a different line. Waiting behind a car gets more
   // patience than being wedged.
-  const speed = Math.hypot(npc.vel.x, npc.vel.y);
+  const speed = speedOf(npc);
   if (npc.reverseTime <= 0 && speed < 5) {
     npc.stuckTime += dt;
     if (npc.stuckTime > (blocked ? 3 : 1.5)) {
@@ -1884,8 +1888,8 @@ function updateTraffic(dt) {
 // Each player's HUD button toggles car.autopilot. The AI then plays the game
 // for them: chases coins, parallel parks, and visits the garage when badly
 // dented. It plays it BADLY on purpose:
-// - it drives too fast, steers with a wobble, and brakes late
-// - it doesn't always notice a crate in its path (AP_BLIND_CHANCE)
+// - it drives too fast and steers with a wobble
+// - it doesn't always notice a crate or parked car in its path (AP_BLIND_CHANCE)
 // - it picks a random parking spot, and sometimes the one the other
 //   autopilot is already going for, so they fight over it
 // - its parking is a scripted S-curve that works only when it doesn't
@@ -1897,8 +1901,8 @@ function updateTraffic(dt) {
 const AP_CRUISE_MIN = 170, AP_CRUISE_MAX = 250; // px/s chasing coins (rolled per activation)
 const AP_STEER_GAIN = 2.4; // steer per radian of heading error
 const AP_WOBBLE = 0.3; // steering wander amplitude, times the per-activation sloppiness
-const AP_BLIND_CHANCE = 0.4; // chance of not seeing a crate in its path, rolled per encounter
-const AP_SEEN_RESET = 2.5; // s until crates it saw (or missed) get re-rolled
+const AP_BLIND_CHANCE = 0.4; // chance of not seeing a crate or parked car in its path, rolled per encounter
+const AP_SEEN_RESET = 2.5; // s until obstacles it saw (or missed) get re-rolled
 const AP_HARASS_MEAN = 18; // s, average time chasing coins before it gets bored and bullies traffic
 const AP_HARASS_MIN = 5, AP_HARASS_MAX = 10; // s of harassment
 const AP_HARASS_SPEED = 280;
@@ -1911,10 +1915,9 @@ function makeAutopilot() {
     goal: null,
     cruise: AP_CRUISE_MIN + Math.random() * (AP_CRUISE_MAX - AP_CRUISE_MIN),
     sloppy: 0.5 + Math.random() * 0.8,
-    lateBraking: 1 + Math.random() * 0.8, // overestimates its brakes by this much
     garageAt: 0.35 + Math.random() * 0.35, // damage that sends it to the garage
     wobblePhase: Math.random() * 10,
-    seen: new Map(), // crate -> did it notice this one
+    seen: new Map(), // obstacle -> did it notice this one
     seenTimer: 0,
     reverseTime: 0, reverseSteer: 0,
     stuckTime: 0,
@@ -1973,13 +1976,12 @@ function apAvoid(car, ap, steer) {
   return steer;
 }
 
-// Drive toward (tx, ty) at up to `cruise`, optionally coming to a stop
-// `stopAt` px short of it. Handles its own clumsy three-point turns and
-// backing out when wedged. Returns the distance left.
-function apDriveTo(car, ap, tx, ty, cruise, { stopAt = -1, avoid = true } = {}) {
+// Drive toward (tx, ty) at up to `cruise`. Handles its own clumsy
+// three-point turns and backing out when wedged. Returns the distance left.
+function apDriveTo(car, ap, tx, ty, cruise, { avoid = true } = {}) {
   const dx = tx - car.pos.x, dy = ty - car.pos.y, dist = Math.hypot(dx, dy);
   const err = wrapAngle(Math.atan2(dy, dx) - car.angle);
-  const speed = Math.hypot(car.vel.x, car.vel.y);
+  const speed = speedOf(car);
 
   if (ap.reverseTime > 0) {
     ap.drive.throttle = apThrottleFor(car, -70);
@@ -1992,14 +1994,10 @@ function apDriveTo(car, ap, tx, ty, cruise, { stopAt = -1, avoid = true } = {}) 
     ap.reverseSteer = err > 0 ? -1 : 1;
   }
 
-  let target = cruise * clamp(1.15 - Math.abs(err) / 1.5, 0.3, 1);
-  if (stopAt >= 0) {
-    // v = sqrt(2 a d), with an optimistic idea of how hard it can brake
-    target = Math.min(target, Math.sqrt(2 * CAR.brakePower * 0.5 * ap.lateBraking * Math.max(0, dist - stopAt)));
-  }
+  const target = cruise * clamp(1.15 - Math.abs(err) / 1.5, 0.3, 1);
   let steer = clamp(err * AP_STEER_GAIN, -1, 1) + Math.sin(ap.wobblePhase) * AP_WOBBLE * ap.sloppy;
   if (avoid) steer = apAvoid(car, ap, steer);
-  ap.drive.throttle = stopAt >= 0 && dist <= stopAt ? apStop(car) : apThrottleFor(car, target);
+  ap.drive.throttle = apThrottleFor(car, target);
   ap.drive.steer = clamp(steer, -1, 1);
   return dist;
 }
@@ -2007,7 +2005,7 @@ function apDriveTo(car, ap, tx, ty, cruise, { stopAt = -1, avoid = true } = {}) 
 // Pushing but not moving (wedged on a crate, a wall, the other car): back
 // out with opposite lock and try again on a different line.
 function apCheckStuck(car, ap, dt, pushing) {
-  const speed = Math.hypot(car.vel.x, car.vel.y);
+  const speed = speedOf(car);
   if (ap.reverseTime > 0 || !pushing || speed > 8) {
     ap.stuckTime = 0;
     return;
@@ -2092,11 +2090,12 @@ function apGarage(car, ap, dt) {
     if (d < 45) s.phase = "line";
     apCheckStuck(car, ap, dt, ap.drive.throttle !== 0);
   } else if (s.phase === "line") {
-    // follow the pad's centerline in and stop in the middle
-    apDriveTo(car, ap, Math.max(car.pos.x + 60, px), py, 120, { stopAt: 0, avoid: false });
+    // follow the pad's centerline in, easing off to stop in the middle
     const dx = px - car.pos.x;
-    if (dx < 8) ap.drive.throttle = apStop(car);
-    if (onGaragePad(car) && Math.hypot(car.vel.x, car.vel.y) < 5) s.phase = "wait";
+    const target = Math.min(120, Math.sqrt(2 * 300 * Math.max(0, dx)));
+    ap.drive.steer = apSteerAt(car, car.pos.x + 60, py);
+    ap.drive.throttle = dx > 8 ? apThrottleFor(car, target) : apStop(car);
+    if (onGaragePad(car) && speedOf(car) < 5) s.phase = "wait";
     if (dx < -30) s.phase = "approach"; // overshot badly
   } else {
     ap.drive.throttle = apStop(car);
@@ -2149,7 +2148,7 @@ function apChooseSpot(car) {
   return Math.floor(Math.random() * street.parkingSpots.length);
 }
 
-function apStartPark(car, ap, tries) {
+function apStartPark(car, ap) {
   const spot = apChooseSpot(car);
   const s = street.parkingSpots[spot];
   ap.park = {
@@ -2157,8 +2156,8 @@ function apStartPark(car, ap, tries) {
     dir: car.pos.x < (s.x0 + s.x1) / 2 ? 1 : -1,
     gap: 30 + Math.random() * 10, // how far out from the parked row it lines up
     rush: 1 + Math.random() * Math.random() * 2.5, // sometimes it floors it in reverse
-    phase: "approach", t: 0, phaseT: 0, tries,
-    rear0: 0, shuffle: 1, shuffleT: 0,
+    phase: "approach", t: 0, phaseT: 0,
+    detour: false, rear0: 0, shuffle: 1, shuffleT: 0,
   };
 }
 
@@ -2167,19 +2166,19 @@ function apRearY(car) {
 }
 
 function apPark(car, ap, dt) {
-  if (!ap.park || ap.park.spot >= street.parkingSpots.length) apStartPark(car, ap, 0);
+  if (!ap.park || ap.park.spot >= street.parkingSpots.length) apStartPark(car, ap);
   const p = ap.park;
   const spot = street.parkingSpots[p.spot];
   const geo = apParkGeometry(p, spot);
   const a = wrapAngle(car.angle - geo.heading); // heading error vs. parallel to the row
-  const speed = Math.hypot(car.vel.x, car.vel.y);
+  const speed = speedOf(car);
   const setPhase = (phase) => { p.phase = phase; p.phaseT = 0; };
   // The timeout covers the maneuver, not the drive over: a badly damaged car
   // crawling at its minimum speed can take longer than that just to arrive.
   if (p.phase !== "approach") p.t += dt;
   p.phaseT += dt;
   if (p.t > AP_PARK_TIMEOUT) {
-    apStartPark(car, ap, p.tries + 1);
+    apStartPark(car, ap);
     return;
   }
 
@@ -2208,8 +2207,10 @@ function apPark(car, ap, dt) {
         setPhase("approach"); // lined up badly: go round again
       }
     }
-    // pointing the wrong way, wedged, or taking forever: start over
-    if (Math.abs(a) > 1.3 || (p.phaseT > 1.5 && speed < 3 && toStage > 2) || p.phaseT > 20) setPhase("approach"); // generous: a wreck creeps along at 35 px/s
+    // Pointing the wrong way, wedged, or taking forever: start over. The time
+    // limit is generous because a wreck creeps along at DAMAGED_MIN_SPEED.
+    const wedged = p.phaseT > 1.5 && speed < 3 && toStage > 2;
+    if (Math.abs(a) > 1.3 || wedged || p.phaseT > 20) setPhase("approach");
   } else if (p.phase === "swing" || p.phase === "counter") {
     ap.drive.throttle = apThrottleFor(car, -AP_PARK_SPEED * p.rush);
     if (p.phase === "swing") {
@@ -2253,7 +2254,7 @@ function apPark(car, ap, dt) {
     ap.drive.throttle = apThrottleFor(car, 60);
     ap.drive.steer = apSteerAt(car, car.pos.x + facing * 80, geo.stageY - 30);
     apCheckStuck(car, ap, dt, true);
-    if (p.phaseT > 1.3) apStartPark(car, ap, p.tries + 1);
+    if (p.phaseT > 1.3) apStartPark(car, ap);
   }
 }
 
@@ -2771,10 +2772,10 @@ window.addEventListener("resize", () => {
       if (p.dog) p.dog.y += street.curbY - oldCurbY;
     }
 
-    car1.pos.x = clamp(car1.pos.x, CAR.wallRadius, W - CAR.wallRadius);
-    car1.pos.y = clamp(car1.pos.y, CAR.wallRadius, street.curbY - CAR.wallRadius);
-    car2.pos.x = clamp(car2.pos.x, CAR.wallRadius, W - CAR.wallRadius);
-    car2.pos.y = clamp(car2.pos.y, CAR.wallRadius, street.curbY - CAR.wallRadius);
+    for (const car of [car1, car2]) {
+      car.pos.x = clamp(car.pos.x, CAR.wallRadius, W - CAR.wallRadius);
+      car.pos.y = clamp(car.pos.y, CAR.wallRadius, street.curbY - CAR.wallRadius);
+    }
 
     if (coin) {
       coin.x = clamp(coin.x, 40, W - 40);
