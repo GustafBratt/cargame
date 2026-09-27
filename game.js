@@ -892,14 +892,17 @@ function stepCar(car, dt) {
   // a force purely along the heading, applied at the rear axle (which sits
   // on that same heading line), produces zero torque either way, so it's
   // simplest to just add it straight to the CG.
-  // Collision damage saps the engine (brakes are left alone -- a wrecked car
-  // should still be able to stop).
+  // Collision damage lowers the top speed (the clamp below) and saps the
+  // engine, but only by half as much -- at full damage, cutting power as hard
+  // as top speed left it below rolling resistance and the car couldn't move
+  // at all. Brakes are left alone: a wrecked car should still be able to stop.
   const health = carHealth(car);
+  const power = 1 - DAMAGE_POWER_LOSS * (1 - health);
   let longAccel = 0;
   if (throttle > 0) {
-    longAccel = p.enginePower * health;
+    longAccel = p.enginePower * power;
   } else if (throttle < 0) {
-    longAccel = forwardSpeed > 1 ? -p.brakePower : -p.reversePower * health;
+    longAccel = forwardSpeed > 1 ? -p.brakePower : -p.reversePower * power;
   }
   car.vel.x += forward.x * longAccel * dt;
   car.vel.y += forward.y * longAccel * dt;
@@ -916,7 +919,10 @@ function stepCar(car, dt) {
   // (drift) speed is left alone, it's already grip-limited above.
   const fwdAfter = car.vel.x * forward.x + car.vel.y * forward.y;
   const latAfter = car.vel.x * right.x + car.vel.y * right.y;
-  const fwdClamped = clamp(fwdAfter, -p.maxReverseSpeed * health, p.maxSpeed * health);
+  // Damage caps top speed, but never below a crawl, so a wreck can still park.
+  const fwdClamped = clamp(fwdAfter,
+    -Math.max(p.maxReverseSpeed * health, DAMAGED_MIN_REVERSE),
+    Math.max(p.maxSpeed * health, DAMAGED_MIN_SPEED));
   car.vel.x = forward.x * fwdClamped + right.x * latAfter;
   car.vel.y = forward.y * fwdClamped + right.y * latAfter;
 
@@ -1037,7 +1043,18 @@ function resolveCarVsStaticCircle(car, obstaclePos, obstacleR, key) {
     applyCollisionSpin(car, r, velBefore);
   }
   if (!touched) return;
-  if (hitAt) applyDamage(car, hit, hitAt);
+  if (hitAt) {
+    applyDamage(car, hit, hitAt);
+    // A parked car (the key; crates have no dents) takes a dent where it was
+    // hit. It never smokes: emitSmoke only runs for moving cars. It's drawn
+    // in the static layer, so that needs a redraw to show the dent. A hit can
+    // touch both ends of its capsule in one step; that's still one dent.
+    if (key.dents && hit > DAMAGE_THRESHOLD && key.lastDentAt !== gameTime) {
+      key.lastDentAt = gameTime;
+      applyDamage(key, hit, contactPoint(obstaclePos, hitAt, obstacleR));
+      staticDirty = true;
+    }
+  }
   collisionSound(hit, (hitAt || obstaclePos).x, car, isNewTouch(car, key));
   if (hit >= HIT_SOUND_MIN) pedestriansNotice(hitAt.x, hitAt.y, "crash", hit);
 }
@@ -1102,8 +1119,20 @@ function boundaryHit(car, speed, point, key) {
 // resets it.
 
 const DAMAGE_THRESHOLD = 70; // px/s closing speed; softer contact (parking nudges, curb scrapes) is free
-const DAMAGE_PER_SPEED = 1 / 1200; // damage per px/s of closing speed above the threshold
-const DAMAGE_SLOWDOWN = 0.6; // at full damage, engine power and top speed drop to 40%
+const DAMAGE_PER_SPEED = 1 / 600; // damage per px/s of closing speed above the threshold (doubled from 1/1200: cars felt too robust)
+const DAMAGE_SLOWDOWN = 1; // at full damage, top speed drops all the way to the crawl floors below
+// Floors under the damaged top speed: parking only needs crawl speeds
+// (the autopilot reverses in at ~28 px/s), so capping above them lets damage
+// slow a car right down without ever making it unable to park.
+const DAMAGED_MIN_SPEED = 35; // px/s forward
+const DAMAGED_MIN_REVERSE = 30; // px/s reverse
+// < 1 front-loads the slowdown: the first hits cost the most speed (at 0.5,
+// damage 0.25 already halves top speed), and the crawl floors above keep a
+// wreck able to limp to the garage and park.
+const DAMAGE_SLOWDOWN_CURVE = 0.5;
+// Engine/reverse power loses only this fraction of what top speed loses, so a
+// wreck keeps enough power to beat rolling resistance (see stepCar).
+const DAMAGE_POWER_LOSS = 0.5;
 const MAX_DENTS = 14;
 const SMOKE_DAMAGE_MIN = 0.12; // below this, a car is dented but not smoking yet
 
@@ -1126,7 +1155,7 @@ function applyDamage(car, impactSpeed, worldPoint) {
 
 // Engine-power / top-speed multiplier for a car's current damage.
 function carHealth(car) {
-  return 1 - DAMAGE_SLOWDOWN * car.damage;
+  return 1 - DAMAGE_SLOWDOWN * Math.pow(car.damage, DAMAGE_SLOWDOWN_CURVE);
 }
 
 function repairCar(car) {
@@ -2145,7 +2174,9 @@ function apPark(car, ap, dt) {
   const a = wrapAngle(car.angle - geo.heading); // heading error vs. parallel to the row
   const speed = Math.hypot(car.vel.x, car.vel.y);
   const setPhase = (phase) => { p.phase = phase; p.phaseT = 0; };
-  p.t += dt;
+  // The timeout covers the maneuver, not the drive over: a badly damaged car
+  // crawling at its minimum speed can take longer than that just to arrive.
+  if (p.phase !== "approach") p.t += dt;
   p.phaseT += dt;
   if (p.t > AP_PARK_TIMEOUT) {
     apStartPark(car, ap, p.tries + 1);
@@ -2178,7 +2209,7 @@ function apPark(car, ap, dt) {
       }
     }
     // pointing the wrong way, wedged, or taking forever: start over
-    if (Math.abs(a) > 1.3 || (p.phaseT > 1.5 && speed < 3 && toStage > 2) || p.phaseT > 8) setPhase("approach");
+    if (Math.abs(a) > 1.3 || (p.phaseT > 1.5 && speed < 3 && toStage > 2) || p.phaseT > 20) setPhase("approach"); // generous: a wreck creeps along at 35 px/s
   } else if (p.phase === "swing" || p.phase === "counter") {
     ap.drive.throttle = apThrottleFor(car, -AP_PARK_SPEED * p.rush);
     if (p.phase === "swing") {
@@ -2950,8 +2981,13 @@ function inkText(c, text, x, y, size, fill) {
 const staticLayer = document.createElement("canvas");
 
 function buildStaticLayer() {
-  staticLayer.width = W;
-  staticLayer.height = H;
+  // Re-creating the canvas is most of a rebuild's cost, so only do it when
+  // the size changed -- a dent on a parked car redraws in place (drawGround
+  // paints over the whole canvas first).
+  if (staticLayer.width !== W || staticLayer.height !== H) {
+    staticLayer.width = W;
+    staticLayer.height = H;
+  }
   const c = staticLayer.getContext("2d");
   drawGround(c);
   drawStreetArt(c);
