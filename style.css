@@ -33,10 +33,13 @@ canvas {
 
 /* Each player's HUD is a small badge: "P1" (plus key hint until they first
    drive) and a coin count, in the player's color. */
+/* Two rows: the badge proper, then "Next: ..." under it. The badge is as
+   wide as its longer row -- a wrapping single row was sized as if it were
+   all on one line, which left a blank patch at the end of the top row. */
 .hud-panel {
   display: flex;
-  align-items: center;
-  gap: 10px;
+  flex-direction: column;
+  gap: 1px;
   background: var(--paper);
   border: 3px solid var(--ink);
   border-radius: 12px;
@@ -71,6 +74,22 @@ canvas {
   border: 2px solid var(--ink);
   box-sizing: border-box;
 }
+
+/* Pain level and the coin about to be taken ("2:1"), then what's next
+   ("Next: Park"). */
+.hud-pain {
+  font-size: 16px;
+  font-weight: 900;
+}
+
+.hud-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* "Next: ..." is set in the same type as the player label (.hud-title) */
+.hud-p2 .hud-next { text-align: right; }
 
 /* Autopilot toggle: a little cartoon push button in the badge, filled with
    the player's color while the AI is driving. The HUD ignores the mouse,
