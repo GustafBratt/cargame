@@ -901,7 +901,8 @@ function stepCar(car, dt) {
   // as top speed left it below rolling resistance and the car couldn't move
   // at all. Brakes are left alone: a wrecked car should still be able to stop.
   const health = carHealth(car);
-  const power = 1 - DAMAGE_POWER_LOSS * (1 - health);
+  const tow = car.caravan ? CARAVAN_POWER : 1; // towing a caravan: the engine has more to pull
+  const power = (1 - DAMAGE_POWER_LOSS * (1 - health)) * tow;
   let longAccel = 0;
   if (throttle > 0) {
     longAccel = p.enginePower * power;
@@ -933,8 +934,8 @@ function stepCar(car, dt) {
   const latAfter = car.vel.x * right.x + car.vel.y * right.y;
   // Damage caps top speed, but never below a crawl, so a wreck can still park.
   const fwdClamped = clamp(fwdAfter,
-    -Math.max(p.maxReverseSpeed * health, DAMAGED_MIN_REVERSE),
-    Math.max(p.maxSpeed * health, DAMAGED_MIN_SPEED));
+    -Math.max(p.maxReverseSpeed * health * (car.caravan ? CARAVAN_TOP_SPEED : 1), DAMAGED_MIN_REVERSE),
+    Math.max(p.maxSpeed * health * (car.caravan ? CARAVAN_TOP_SPEED : 1), DAMAGED_MIN_SPEED));
   car.vel.x = forward.x * fwdClamped + right.x * latAfter;
   car.vel.y = forward.y * fwdClamped + right.y * latAfter;
 
@@ -1169,6 +1170,7 @@ function carHealth(car) {
 function repairCar(car) {
   car.damage = 0;
   car.dents.length = 0;
+  if (car.caravan) car.caravan.dents.length = 0; // the mechanic fixes the whole rig
 }
 
 // Puffs of smoke out the back of the car, at a rate and darkness that scale
@@ -1309,7 +1311,7 @@ function buildCrates() {
 }
 
 function setupWorld() {
-  car1 = createCar(W * 0.35, H * 0.5, -Math.PI / 2, "#4fc3ff", {
+  car1 = createCar(W * 0.35, H * 0.5, Math.PI / 2, "#4fc3ff", {
     up: ["w"], down: ["s"], left: ["a"], right: ["d"],
   });
   car2 = createCar(W * 0.65, H * 0.5, Math.PI / 2, "#ffa64f", {
@@ -1320,12 +1322,18 @@ function setupWorld() {
   street = buildStreet();
   resetParkers();
 
-  car1.score = 0; car1.gameState = "seekCoin";
-  car2.score = 0; car2.gameState = "seekCoin";
-  car1.label = "P1"; car1.keyHint = "WASD"; car1.hasDriven = false;
-  car2.label = "P2"; car2.keyHint = "IJKL / Arrows"; car2.hasDriven = false;
+  for (const car of [car1, car2]) {
+    car.score = 0;
+    car.gameState = "seekCoin";
+    car.level = 1; // the ladder of pain, see coinCaught
+    car.levelCoins = 0;
+    car.caravanDue = false; // see caravanAppears
+    car.hasDriven = false;
+  }
+  car1.label = "P1"; car1.keyHint = "WASD";
+  car2.label = "P2"; car2.keyHint = "IJKL / Arrows";
   particles.length = 0;
-  spawnCoin(); // after clearing particles, so its spawn animation survives
+  coin = null; // the first coin waits until both players have moved, see updateCoin
   resetTraffic();
   resetPedestrians();
   mechanic = null;
@@ -1386,7 +1394,13 @@ function spawnCoin() {
 }
 
 // coin.age drives both the draw (drawCoin) and collectability (updateCoinRace).
+// There's no coin at the start: the race only begins once both players are
+// ready -- they've driven (car.hasDriven) or switched on their autopilot.
 function updateCoin(dt) {
+  if (!coin) {
+    if ([car1, car2].every((c) => c.hasDriven || c.autopilot)) spawnCoin();
+    return;
+  }
   coin.age += dt;
   if (!coin.popped && coin.age >= COIN_IMPLODE_TIME) {
     coin.popped = true;
@@ -1396,7 +1410,7 @@ function updateCoin(dt) {
 }
 
 function coinCollectable() {
-  return coin.age >= COIN_IMPLODE_TIME;
+  return coin !== null && coin.age >= COIN_IMPLODE_TIME;
 }
 
 function isParked(car) {
@@ -1432,7 +1446,75 @@ function freeBays() {
 // the parked-car planner works with, so two cars never head for one bay and
 // a car on its way counts as already there.
 function unclaimedBays() {
-  return freeBays().filter((bay) => !bay.reservedBy);
+  return freeBays().filter((bay) => !bay.reservedBy && !bay.caravanSpace);
+}
+
+// ---- The caravan space ----------------------------------------------------
+// While any player tows a caravan (pain level 3), the parked cars keep one
+// run of adjacent bays clear that a car plus caravan fits into with
+// CARAVAN_SPACE_MARGIN to spare. A car + caravan is ~120 px, and two tight
+// bays leave only ~113, so it's usually three bays. Its bays are marked
+// bay.caravanSpace: they still show a "P" and anyone can use them, but the
+// planner doesn't count them, no arriving car heads for them, and any
+// parked car in them is sent away first.
+const CARAVAN_SPACE_MARGIN = 40; // px of gap beyond the rig's length
+
+function rigLength() {
+  return CAR.length / 2 + CARAVAN.hitchBack + CARAVAN.tongue + CARAVAN.length;
+}
+
+// The bumper-to-bumper gap bays i..j leave when free, with cars parked
+// centered in the bays either side.
+function runGap(i, j) {
+  const b = street.bays;
+  let gap = 0;
+  for (let k = i; k <= j; k++) gap += b[k].x1 - b[k].x0;
+  for (const n of [b[i - 1], b[j + 1]]) if (n) gap += (n.x1 - n.x0 - CAR.length) / 2;
+  return gap;
+}
+
+// Picks the run to keep clear: the shortest one that fits the rig (the
+// longest there is, on a window too narrow for any to fit), preferring the
+// fewest parked cars to send away.
+function chooseCaravanSpace() {
+  const b = street.bays, need = rigLength() + CARAVAN_SPACE_MARGIN;
+  const inner = b.map((_, i) => i).filter((i) => !b[i].end);
+  let best = null;
+  for (let len = 1; len <= inner.length && !best; len++) {
+    const runs = [];
+    for (let i = inner[0]; i + len - 1 <= inner[inner.length - 1]; i++) {
+      if (len < inner.length && runGap(i, i + len - 1) < need) continue;
+      const cars = parkers.filter((c) => c.state === "parked" && c.pos.x > b[i].x0 && c.pos.x < b[i + len - 1].x1).length;
+      runs.push({ i, j: i + len - 1, cars });
+    }
+    if (runs.length) {
+      const fewest = Math.min(...runs.map((r) => r.cars));
+      best = pickOf(runs.filter((r) => r.cars === fewest));
+    }
+  }
+  return best;
+}
+
+function updateCaravanSpace() {
+  const wanted = [car1, car2].some((c) => c.caravan || c.caravanDue);
+  const current = street.bays.filter((bay) => bay.caravanSpace);
+  if (!wanted) {
+    for (const bay of current) bay.caravanSpace = false;
+    return;
+  }
+  if (current.length) return;
+  const run = chooseCaravanSpace();
+  if (!run) return;
+  for (let k = run.i; k <= run.j; k++) street.bays[k].caravanSpace = true;
+}
+
+// A parked car standing in the caravan space, if any: they're sent away
+// first, and without waiting out PARK_EVENT_GAP.
+function parkerInCaravanSpace() {
+  return parkers.find((c) => {
+    const bay = bayAt(c.pos.x);
+    return c.state === "parked" && bay && bay.caravanSpace;
+  }) || null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1604,20 +1686,105 @@ function updateCoinRace() {
     if (car.gameState !== "seekCoin" || !coinCollectable()) continue;
     if (Math.hypot(car.pos.x - coin.x, car.pos.y - coin.y) < PICKUP_DIST) {
       car.score++;
-      car.gameState = "mustPark";
       playCoinPickupSound(car.pos.x);
       spawnCoin();
+      coinCaught(car);
+      // level 1 just collects; from level 2 on, every coin needs a park
+      if (car.level >= 2) car.gameState = "mustPark";
       break;
     }
   }
 
   for (const car of [car1, car2]) {
-    if (car.gameState === "mustPark" && isParked(car)) {
+    if (car.gameState === "mustPark" && parkedForLevel(car)) {
       car.gameState = "seekCoin";
       spawnFirework(car.pos.x, car.pos.y, car.color);
       playParkedSound(car.pos.x);
     }
   }
+}
+
+// ---- The ladder of pain ---------------------------------------------------
+// Each player climbs on their own, COINS_PER_LEVEL coins per level:
+// 1. just fetch coins
+// 2. parallel park after every coin
+// 3. a caravan appears, and every coin needs car AND caravan parked; the
+//    parked cars keep a long enough space free for it (see updateParkers)
+// The climb counts coins as they're caught: the 3rd coin of a level moves
+// the player up, and that coin's task already follows the new level (the
+// 3rd level-1 coin needs a park; the caravan appears on the 3rd level-2 coin,
+// and that coin is parked with it). The counter is separate from car.score
+// (the coins in hand), so paying the garage doesn't set anyone back.
+// PAIN_MAX_LEVEL is the top for now.
+const COINS_PER_LEVEL = 3;
+const PAIN_MAX_LEVEL = 3;
+
+function coinCaught(car) {
+  car.levelCoins++;
+  if (car.levelCoins < COINS_PER_LEVEL || car.level >= PAIN_MAX_LEVEL) return;
+  car.level++;
+  car.levelCoins = 0;
+  // a bigger celebration than a park: a burst on the car and one each side
+  for (const dx of [-40, 0, 40]) spawnFirework(car.pos.x + dx, car.pos.y - Math.abs(dx) * 0.5, car.color);
+  playRepairSound(car.pos.x);
+  if (car.level >= 3 && !car.caravan && !caravanAppears(car)) car.caravanDue = true;
+}
+
+// The caravan pops in behind the car, right where the coin was caught, with
+// the coin's implosion, a flash and a ring in the player's color. Straight
+// behind is blocked? Then it appears folded to whichever side is clear. And
+// if nowhere is (a coin in the crate grid: spawned there, it would wedge
+// between two crates, pushed equally both ways along its length and never
+// freed), it's due (car.caravanDue) and appears the moment there's room --
+// usually a second later, once the player has driven on.
+const CARAVAN_APPEAR_FOLDS = [0, 0.4, -0.4, 0.8, -0.8, 1.1, -1.1]; // rad, tried in order
+
+function updateCaravanDue() {
+  for (const car of [car1, car2]) {
+    if (car.caravanDue && caravanAppears(car)) car.caravanDue = false;
+  }
+}
+
+// Returns whether it appeared.
+function caravanAppears(car) {
+  attachCaravan(car);
+  const r = CARAVAN.radius + 3;
+  const others = [car1, car2, ...npcs, ...parkers].filter((c) => c !== car);
+  const clear = () => CARAVAN.circles.every((s) => {
+    const p = caravanPoint(car, s);
+    return p.x > r && p.x < W - r && p.y > r && p.y < street.curbY - r &&
+      crates.every((cr) => Math.hypot(p.x - cr.x, p.y - cr.y) > r + cr.r) &&
+      others.every((o) => capsuleOffsets(o.angle).every((q) => Math.hypot(p.x - o.pos.x - q.x, p.y - o.pos.y - q.y) > r + CAR.capsuleRadius));
+  });
+  const fold = CARAVAN_APPEAR_FOLDS.find((f) => {
+    car.caravan.angle = car.angle + f;
+    return clear();
+  });
+  if (fold === undefined) {
+    car.caravan = null;
+    return false;
+  }
+  car.caravan.angle = car.angle + fold;
+  placeCaravanAxle(car);
+  const mid = caravanPoint(car, CARAVAN.tongue + CARAVAN.length / 2);
+  spawnImplosion(mid.x, mid.y);
+  particles.push({ type: "flash", x: mid.x, y: mid.y, radius: 34, life: 0, maxLife: 0.25 });
+  particles.push({ type: "ring", x: mid.x, y: mid.y, radius: 10, growSpeed: 160, color: car.color, life: 0, maxLife: 0.4 });
+  playCoinSpawnSound(mid.x);
+  return true;
+}
+
+// Parked, for this player's level: with a caravan, it has to be straight,
+// down in the parking lane and within the row too.
+function parkedForLevel(car) {
+  if (!isParked(car) || car.caravanDue) return false;
+  if (!car.caravan) return true;
+  let a = car.caravan.angle % Math.PI;
+  if (a < 0) a += Math.PI;
+  if (Math.min(a, Math.PI - a) > PARK_ANGLE_TOLERANCE) return false;
+  const mid = caravanPoint(car, CARAVAN.tongue + CARAVAN.length / 2);
+  const bays = street.bays;
+  return Math.abs(mid.y - street.carCenterY) <= PARK_Y_TOLERANCE && mid.x > bays[0].x0 && mid.x < bays[bays.length - 1].x1;
 }
 
 // A proper celebration fireworks burst, fired at the moment a parking
@@ -1777,7 +1944,7 @@ function spawnNpc() {
   const dir = npcs.length ? npcs[0].dir : Math.random() < 0.5 ? 1 : -1;
   const x = dir > 0 ? -CAR.length : W + CAR.length;
   const y = street.npcLaneY;
-  const clear = [car1, car2, ...npcs].every((c) => Math.hypot(c.pos.x - x, c.pos.y - y) > CAR.length * 2.5);
+  const clear = trafficPoints(null).every((p) => Math.hypot(p.x - x, p.y - y) > CAR.length * 2.5);
   if (!clear) return false;
 
   const color = NPC_COLORS[Math.floor(Math.random() * NPC_COLORS.length)];
@@ -1859,9 +2026,8 @@ function npcDrive(npc, dt) {
   const targetSpeed = NPC_CRUISE_SPEED + (NPC_LOST_SPEED - NPC_CRUISE_SPEED) * offness;
 
   let blocked = false, blockerSide = 0;
-  for (const other of [car1, car2, ...npcs, ...parkers]) {
-    if (other === npc) continue;
-    const dx = other.pos.x - npc.pos.x, dy = other.pos.y - npc.pos.y;
+  for (const p of trafficPoints(npc)) {
+    const dx = p.x - npc.pos.x, dy = p.y - npc.pos.y;
     const ahead = dx * forward.x + dy * forward.y;
     const side = dy * forward.x - dx * forward.y; // > 0: blocker is to our right
     if (ahead > 0 && ahead < NPC_BRAKE_DIST && Math.abs(side) < CAR.width + 6) {
@@ -1936,6 +2102,236 @@ function updateTraffic(dt) {
   }
 
   for (const n of npcs) npcDrive(n, dt);
+}
+
+// ---------------------------------------------------------------------------
+// Caravans (a physics playground: on this branch every player tows one)
+// ---------------------------------------------------------------------------
+// The caravan's only wheels are one axle, which rolls along the caravan but
+// not sideways, so the caravan simply follows its hitch: each step the axle
+// is pulled (or, reversing, pushed) along the line toward the hitch's new
+// position, keeping its distance (updateCaravan). That one rule gives both
+// behaviors for free:
+// - forward, the caravan trails behind and straightens itself out
+// - reversing, any angle between car and caravan GROWS -- the famous
+//   instability, so you have to steer the "wrong" way to aim the caravan
+// Past CARAVAN.jackknife the car's rear corner meets the drawbar: the angle
+// stops there (with a crunch), and the caravan gets dragged round with it.
+//
+// Collisions (resolveCaravanCollisions): the caravan's two circles collide
+// with walls, the curb, crates and every other car. A push along the drawbar
+// shoves the whole rig (car included, and it stops the car's motion into the
+// obstacle); a push across it swivels the caravan about the hitch.
+//
+// The caravan adds load: less power and a lower top speed (stepCar).
+
+const CARAVAN = {
+  hitchBack: CAR.length / 2 + 4, // the hitch ball sits this far behind the car's center
+  tongue: 18, // drawbar: hitch to the front of the body
+  length: 52,
+  width: 26, // a bit wider than the car, like the real thing
+  axleBack: 48, // hitch to axle: a little behind the body's middle (44), for nose weight
+  radius: 13, // collision circles (two, filling the body)
+  // The most the caravan can swing relative to the car: ~69 deg, where the
+  // body's front corner meets the car's rear corner (with this drawbar).
+  jackknife: 1.2,
+  unjamSteer: 0.5, // fraction of full lock, turned the right way, that lets a jackknifed rig reverse
+};
+CARAVAN.circles = [CARAVAN.tongue + CARAVAN.radius, CARAVAN.tongue + CARAVAN.length - CARAVAN.radius]; // px behind the hitch
+const CARAVAN_POWER = 0.75; // engine and reverse power while towing
+const CARAVAN_TOP_SPEED = 0.8; // top speed while towing
+
+// Everything a driver should brake for, as points: every car's center,
+// plus both circles of any caravan (traffic used to see only cars, and drove
+// straight into caravans). `except` is the driver itself.
+function trafficPoints(except) {
+  const pts = [];
+  for (const c of [car1, car2, ...npcs, ...parkers]) {
+    if (c === except) continue;
+    pts.push(c.pos);
+    if (c.caravan) for (const s of CARAVAN.circles) pts.push(caravanPoint(c, s));
+  }
+  return pts;
+}
+
+function hitchPoint(car) {
+  return { x: car.pos.x - Math.cos(car.angle) * CARAVAN.hitchBack, y: car.pos.y - Math.sin(car.angle) * CARAVAN.hitchBack };
+}
+
+// The point `s` px behind the hitch, along the caravan.
+function caravanPoint(car, s) {
+  const h = hitchPoint(car), a = car.caravan.angle;
+  return { x: h.x - Math.cos(a) * s, y: h.y - Math.sin(a) * s };
+}
+
+function attachCaravan(car) {
+  car.caravan = { angle: car.angle, axle: null, seed: Math.random() * 1000, jackknifed: false, dents: [] };
+  placeCaravanAxle(car);
+}
+
+// Puts the axle where the caravan's angle says it is (after the angle was
+// set directly, or the whole rig was moved).
+function placeCaravanAxle(car) {
+  car.caravan.axle = caravanPoint(car, CARAVAN.axleBack);
+}
+
+function updateCaravan(car) {
+  const cv = car.caravan;
+  const aim = () => {
+    const h = hitchPoint(car);
+    return Math.atan2(h.y - cv.axle.y, h.x - cv.axle.x);
+  };
+  cv.angle = aim();
+  // Jammed: folded to the limit and reversing deeper into it. The car's rear
+  // corner is against the drawbar and the caravan's wheels can't slide
+  // sideways, so the rig locks up -- undo this step's move and stop the car.
+  // Driving forward gets out, and so does reversing with the front wheels
+  // turned well over the right way: at the limit, full lock swings the car
+  // round toward the caravan just faster than reversing folds it, so a real
+  // rig creeps out of the fold. (The bicycle model can't show that by itself
+  // from a standstill: its tires barely grip sideways at crawl speed, see
+  // lowSpeedGripRef, so the car slides straight back instead of swinging.
+  // Hence the explicit rule.) Clamping alone, with no jam, let the car
+  // reverse on regardless, dragging the caravan sideways.
+  const hitchAngle = wrapAngle(cv.angle - car.angle);
+  const reversing = car.vel.x * Math.cos(car.angle) + car.vel.y * Math.sin(car.angle) < 0;
+  // reversing, the car swings toward the caravan's side when the wheels turn
+  // away from it: steer opposite in sign to the hitch angle
+  const steeringOut = car.steerCurrent * Math.sign(hitchAngle) < -CARAVAN.unjamSteer * CAR.maxSteer;
+  if (reversing && !steeringOut && Math.abs(hitchAngle) > CARAVAN.jackknife && car.prevPos) {
+    car.pos.x = car.prevPos.x;
+    car.pos.y = car.prevPos.y;
+    car.angle = car.prevAngle;
+    car.vel.x = car.vel.y = 0;
+    car.angularVel = 0;
+    cv.angle = aim();
+    // keep the contact "touching" while jammed, so the crunch plays once
+    collisionSound(0, hitchPoint(car).x, car, isNewTouch(car, "jackknife"));
+  }
+  clampJackknife(car);
+  placeCaravanAxle(car);
+}
+
+// The car's rear corner meets the drawbar: the hitch angle can't go further.
+function clampJackknife(car) {
+  const cv = car.caravan;
+  const hitchAngle = wrapAngle(cv.angle - car.angle);
+  const over = Math.abs(hitchAngle) > CARAVAN.jackknife;
+  if (over) {
+    cv.angle = car.angle + Math.sign(hitchAngle) * CARAVAN.jackknife;
+    if (!cv.jackknifed) {
+      const h = hitchPoint(car);
+      collisionSound(Math.max(HIT_SOUND_MIN, speedOf(car)), h.x, car, isNewTouch(car, "jackknife"));
+    }
+  }
+  cv.jackknifed = over;
+}
+
+// Applies a push `p` (world px) that a collision gave the caravan circle `s`
+// px behind the hitch. The part across the caravan swivels it about the
+// hitch; the part along it moves the whole rig. `dv` is the velocity change
+// the collision gave the circle: its along-the-caravan part goes to the car.
+function pushCaravan(car, s, p, dv) {
+  const cv = car.caravan;
+  const tx = Math.cos(cv.angle), ty = Math.sin(cv.angle);
+  const along = p.x * tx + p.y * ty;
+  // d(point)/d(angle) for a point s behind the hitch is s * (sin a, -cos a)
+  cv.angle += (p.x * ty - p.y * tx) / s;
+  car.pos.x += tx * along;
+  car.pos.y += ty * along;
+  const dvAlong = dv.x * tx + dv.y * ty;
+  car.vel.x += tx * dvAlong;
+  car.vel.y += ty * dvAlong;
+  clampJackknife(car);
+  placeCaravanAxle(car);
+}
+
+function resolveCaravanCollisions(car) {
+  const r = CARAVAN.radius;
+  for (const s of CARAVAN.circles) {
+    // walls and curb: clamp the circle inside, bounce what was going out
+    const c = caravanPoint(car, s);
+    const push = { x: 0, y: 0 };
+    if (c.x - r < 0) push.x = r - c.x;
+    else if (c.x + r > W) push.x = W - r - c.x;
+    if (c.y - r < 0) push.y = r - c.y;
+    else if (c.y + r > street.curbY) push.y = street.curbY - r - c.y;
+    if (push.x || push.y) {
+      const n = Math.hypot(push.x, push.y), nx = push.x / n, ny = push.y / n;
+      const vn = car.vel.x * nx + car.vel.y * ny; // < 0: heading into it
+      const dv = vn < 0 ? { x: -1.4 * vn * nx, y: -1.4 * vn * ny } : { x: 0, y: 0 };
+      pushCaravan(car, s, push, dv);
+      const at = { x: c.x - nx * r, y: c.y - ny * r };
+      dentCaravan(car, Math.max(0, -vn), at);
+      caravanHitSound(car, Math.max(0, -vn), at, push.y < 0 ? "curb" : "wall");
+    }
+
+    // crates: static circles
+    for (const cr of crates) {
+      const cc = caravanPoint(car, s), before = { x: cc.x, y: cc.y };
+      const v = { x: car.vel.x, y: car.vel.y };
+      const hit = resolveCircles(cc, v, r, { x: cr.x, y: cr.y }, null, cr.r, true, CAR.obstacleCollisionRestitution);
+      if (hit < 0) continue;
+      pushCaravan(car, s, { x: cc.x - before.x, y: cc.y - before.y }, { x: v.x - car.vel.x, y: v.y - car.vel.y });
+      dentCaravan(car, hit, contactPoint(cc, cr, r));
+      caravanHitSound(car, hit, cc, cr);
+    }
+
+    // every other car's capsule, and the other player's caravan
+    for (const other of [car1, car2, ...npcs, ...parkers]) {
+      if (other === car) continue;
+      const targets = capsuleOffsets(other.angle).map((o) => ({ x: other.pos.x + o.x, y: other.pos.y + o.y, r: CAR.capsuleRadius, s: null }));
+      if (other.caravan) for (const os of CARAVAN.circles) targets.push({ ...caravanPoint(other, os), r, s: os });
+      for (const t of targets) {
+        const cc = caravanPoint(car, s), before = { x: cc.x, y: cc.y };
+        const tb = { x: t.x, y: t.y };
+        const v = { x: car.vel.x, y: car.vel.y };
+        const ov = { x: other.vel.x, y: other.vel.y };
+        // a parked car doesn't budge for a gentle bump (see resolveCarVsCar)
+        const anchored = other.handbrake && Math.hypot(v.x - ov.x, v.y - ov.y) < DAMAGE_THRESHOLD;
+        const hit = resolveCircles(cc, v, r, tb, ov, t.r, anchored, CAR.obstacleCollisionRestitution);
+        if (hit < 0) continue;
+        pushCaravan(car, s, { x: cc.x - before.x, y: cc.y - before.y }, { x: v.x - car.vel.x, y: v.y - car.vel.y });
+        if (!anchored) {
+          const op = { x: tb.x - t.x, y: tb.y - t.y }, odv = { x: ov.x - other.vel.x, y: ov.y - other.vel.y };
+          if (t.s !== null) pushCaravan(other, t.s, op, odv);
+          else {
+            other.pos.x += op.x; other.pos.y += op.y;
+            other.vel.x += odv.x; other.vel.y += odv.y;
+          }
+        }
+        // both sides of the hit get a dent: this caravan, and the other car or caravan
+        dentCaravan(car, hit, contactPoint(cc, tb, r));
+        if (t.s !== null) dentCaravan(other, hit, contactPoint(tb, cc, t.r));
+        else applyDamage(other, hit, contactPoint(tb, cc, t.r));
+        caravanHitSound(car, hit, cc, other);
+        if (hit >= HIT_SOUND_MIN && other.drive && !other.handbrake) npcGotRammed(other);
+      }
+    }
+  }
+}
+
+// A hit on the caravan above DAMAGE_THRESHOLD leaves a dent where it landed,
+// like applyDamage does on cars: stored in the caravan's own frame (centered
+// on the body, +x toward the hitch) so it moves with it, clamped onto the
+// body, bigger for harder hits. Looks only: the caravan has no health.
+function dentCaravan(car, speed, at) {
+  const excess = speed - DAMAGE_THRESHOLD;
+  if (excess <= 0) return;
+  const cv = car.caravan, L = CARAVAN.length, Wd = CARAVAN.width;
+  const mid = caravanPoint(car, CARAVAN.tongue + L / 2);
+  const dx = at.x - mid.x, dy = at.y - mid.y, cos = Math.cos(cv.angle), sin = Math.sin(cv.angle);
+  cv.dents.push({
+    x: clamp(dx * cos + dy * sin, -L / 2, L / 2),
+    y: clamp(-dx * sin + dy * cos, -Wd / 2, Wd / 2),
+    r: clamp(4 + excess / 35, 4, 10),
+  });
+  if (cv.dents.length > MAX_DENTS) cv.dents.shift();
+}
+
+function caravanHitSound(car, speed, at, key) {
+  collisionSound(speed, at.x, car, isNewTouch(car, key));
+  if (speed >= HIT_SOUND_MIN) pedestriansNotice(at.x, at.y, "crash", speed);
 }
 
 // ---------------------------------------------------------------------------
@@ -2079,7 +2475,7 @@ function parkerPickBay(bays) {
 function parkerArrive() {
   const bays = unclaimedBays();
   const x = -CAR.length, y = street.parkLaneY;
-  const clear = [car1, car2, ...npcs, ...parkers].every((c) => Math.hypot(c.pos.x - x, c.pos.y - y) > CAR.length * 2.5);
+  const clear = trafficPoints(null).every((p) => Math.hypot(p.x - x, p.y - y) > CAR.length * 2.5);
   if (!bays.length || !clear) return false;
   const car = makeParker(x, y);
   car.vel.x = PARKER_CRUISE;
@@ -2091,13 +2487,21 @@ function parkerArrive() {
 }
 
 function updateParkers(dt) {
-  // The planner: keep the free-bay count in range, and churn it now and then.
+  // The planner. First, the caravan space: clearing it comes before
+  // anything else, one car at a time.
   parkEventTimer -= dt;
   parkSinceEvent += dt;
+  updateCaravanSpace();
+  const blocker = parkerInCaravanSpace();
+  if (blocker && !parkers.some((c) => c.state === "leaving")) {
+    parkerSetState(blocker, "leaving", "backup");
+    parkSinceEvent = 0;
+  }
+  // Then keep the free-bay count in range, and churn it now and then.
   // Players don't count here: they park for a moment and drive off again, so
   // sending a car away every time one takes the last free bay just churned
   // the row (a parked car stayed only ~1 minute with autopilot players).
-  const free = street.bays.filter((bay) => !bay.end && !bay.reservedBy && !bayOccupied(bay, null, parkers)).length;
+  const free = street.bays.filter((bay) => !bay.end && !bay.caravanSpace && !bay.reservedBy && !bayOccupied(bay, null, parkers)).length;
   let want = null;
   if (free < PARK_MIN_FREE) want = "leave";
   else if (free > PARK_MAX_FREE) want = "arrive";
@@ -2145,7 +2549,7 @@ function parkerArriving(car, dt) {
 
   // Someone else took the bay (or the street was rebuilt): pick another free
   // one, or give up and drive off.
-  if (!street.bays.includes(car.bay) || bayOccupied(car.bay, car) || car.t > PARKER_ARRIVE_TIMEOUT) {
+  if (!street.bays.includes(car.bay) || bayOccupied(car.bay, car) || car.bay.caravanSpace || car.t > PARKER_ARRIVE_TIMEOUT) {
     if (car.bay && car.bay.reservedBy === car) car.bay.reservedBy = null;
     const bays = car.t > PARKER_ARRIVE_TIMEOUT ? [] : unclaimedBays();
     if (!bays.length) {
@@ -2200,9 +2604,8 @@ function parkerLeaving(car, dt) {
 // in the way.
 function parkerDriveLane(car, speed, dt) {
   const fx = Math.cos(car.angle), fy = Math.sin(car.angle);
-  const blocked = [car1, car2, ...npcs, ...parkers].some((o) => {
-    if (o === car) return false;
-    const dx = o.pos.x - car.pos.x, dy = o.pos.y - car.pos.y;
+  const blocked = trafficPoints(car).some((p) => {
+    const dx = p.x - car.pos.x, dy = p.y - car.pos.y;
     const ahead = dx * fx + dy * fy;
     return ahead > 0 && ahead < 70 && Math.abs(dy * fx - dx * fy) < CAR.width + 4;
   });
@@ -2305,12 +2708,16 @@ function apAvoid(car, ap, steer) {
   const obstacles = [...crates, ...parkers];
   for (const o of obstacles) {
     const ox = o.pos ? o.pos.x : o.x, oy = o.pos ? o.pos.y : o.y;
-    const reach = (o.pos ? CAR.length / 2 : o.r) + CAR.capsuleRadius + 4;
+    // towing, it gives obstacles more room: the caravan cuts inside the turn
+    const reach = (o.pos ? CAR.length / 2 : o.r) + CAR.capsuleRadius + (car.caravan ? 14 : 4);
     const dx = ox - car.pos.x, dy = oy - car.pos.y;
     const ahead = dx * fx + dy * fy;
     const side = dy * fx - dx * fy; // > 0: to our right
     if (ahead <= 0 || ahead > look || Math.abs(side) > reach) continue;
-    if (!ap.seen.has(o)) ap.seen.set(o, Math.random() > AP_BLIND_CHANCE);
+    // Not noticing a crate is part of the bad-driver charm -- but not while
+    // towing: a bump spins the car and throws the caravan to the jackknife
+    // limit, so a towing autopilot always sees them.
+    if (!ap.seen.has(o)) ap.seen.set(o, car.caravan ? true : Math.random() > AP_BLIND_CHANCE);
     if (!ap.seen.get(o)) continue;
     // Down in the parking lane, swerve out toward the road whichever side
     // the obstacle is on: "away from it" can mean into the curb, wedging the
@@ -2333,12 +2740,14 @@ function apDriveTo(car, ap, tx, ty, cruise, { avoid = true } = {}) {
   if (Math.abs(err) > 2 && car.pos.y > street.centerlineY) err = Math.cos(car.angle) >= 0 ? -Math.PI : Math.PI;
 
   if (ap.reverseTime > 0) {
-    ap.drive.throttle = apThrottleFor(car, -70);
-    ap.drive.steer = ap.reverseSteer;
+    // towing, it backs up slowly and steers the caravan straight behind
+    ap.drive.throttle = apThrottleFor(car, car.caravan ? -40 : -70);
+    ap.drive.steer = car.caravan ? apCaravanReverseSteer(car) : ap.reverseSteer;
     return dist;
   }
-  // Target behind and close: back up with opposite lock to swing the nose round.
-  if (Math.abs(err) > 2 && dist < 110 && speed < 60) {
+  // Target behind and close: back up with opposite lock to swing the nose
+  // round. Not with a caravan: that folds it up; it loops round forward.
+  if (!car.caravan && Math.abs(err) > 2 && dist < 110 && speed < 60) {
     ap.reverseTime = 0.6 + Math.random() * 0.4;
     ap.reverseSteer = err > 0 ? -1 : 1;
   }
@@ -2347,7 +2756,7 @@ function apDriveTo(car, ap, tx, ty, cruise, { avoid = true } = {}) {
   let steer = clamp(err * AP_STEER_GAIN, -1, 1) + Math.sin(ap.wobblePhase) * AP_WOBBLE * ap.sloppy;
   if (avoid) steer = apAvoid(car, ap, steer);
   ap.drive.throttle = apThrottleFor(car, target);
-  ap.drive.steer = clamp(steer, -1, 1);
+  ap.drive.steer = apCaravanForwardSteer(car, clamp(steer, -1, 1));
   return dist;
 }
 
@@ -2389,6 +2798,128 @@ function apPickGoal(car, ap, dt) {
   return "coin";
 }
 
+// ---- Towing a caravan -----------------------------------------------------
+// Reversing, the caravan swings the opposite way to the steering, and any
+// angle grows. So an autopilot reversing with a caravan steers against the
+// swing: steer = -gain * (hitch angle - the angle it wants). That holds a
+// straight reverse (the caravan tests: never worse than 9 deg from a kink,
+// where the other sign jackknifes), and it's also the right way out of a
+// jackknife (see updateCaravan's unjam rule). Before this it reversed as if
+// there were no caravan, full lock the "natural" way, folding it at once.
+const AP_CARAVAN_REVERSE_GAIN = 4;
+
+function apCaravanReverseSteer(car, wantHitch = 0) {
+  const hitch = wrapAngle(car.caravan.angle - car.angle);
+  return clamp(-AP_CARAVAN_REVERSE_GAIN * (hitch - wantHitch), -1, 1);
+}
+
+// Going forward, a tight slow turn folds the caravan too: circling at full
+// lock it swings to the jackknife limit and stays there (the first caravan
+// parking version orbited its approach point like that, 0 parks in 12).
+// So past AP_CARAVAN_MAX_FOLD, steering that would swing it further is eased
+// off, all the way to straight by AP_CARAVAN_MAX_FOLD + 0.3, and the caravan
+// catches up. (Forward, steering the same sign as the hitch angle closes it.)
+const AP_CARAVAN_MAX_FOLD = 0.8; // rad, ~46 deg
+
+function apCaravanForwardSteer(car, steer) {
+  if (!car.caravan) return steer;
+  const hitch = wrapAngle(car.caravan.angle - car.angle);
+  if (Math.abs(hitch) <= AP_CARAVAN_MAX_FOLD || Math.sign(steer) === Math.sign(hitch)) return steer;
+  return steer * clamp((AP_CARAVAN_MAX_FOLD + 0.3 - Math.abs(hitch)) / 0.3, 0, 1);
+}
+
+// Parking with a caravan: into the caravan space (or else the longest run of
+// free bays), always driving in forward, heading right like the parked cars.
+// It never needs to reverse: the space is long enough to drive straight in.
+// 1. "approach": head for a point well before the space, out on the road
+// 2. "line": follow a line AP_CARAVAN_LINE_GAP out from the parked row --
+//    chasing a point ahead on it lines the rig up by itself, turning it
+//    round in a wide loop if it has to. Past the start of the space, lined
+//    up (car and caravan straight, on the line), it goes in; otherwise it
+//    goes round again
+// 3. "in": chase a point AP_CARAVAN_LOOKAHEAD ahead on the parked row's
+//    line -- a smooth merge toward the curb, with the caravan cutting in
+//    behind -- and stop a little short of the car ahead
+// 4. "check": stopped; if that didn't count, "leave" forward and go round
+const AP_CARAVAN_LINE_GAP = 32; // px out from the parked row's line
+const AP_CARAVAN_TURN_AT = 0; // px past the start of the space: start easing in
+const AP_CARAVAN_LOOKAHEAD = 30; // px ahead on the curb line it steers for
+const AP_CARAVAN_IN_SPEED = 35; // px/s easing in
+const AP_CARAVAN_STOP_SHORT = 10; // px left before the car ahead: room to pull out again
+
+// The space to park the rig in, as bay bounds {x0, x1}: the caravan space, or
+// else the longest run of adjacent free bays.
+function apCaravanSpace() {
+  const b = street.bays;
+  const marked = b.filter((bay) => bay.caravanSpace);
+  if (marked.length) return { x0: marked[0].x0, x1: marked[marked.length - 1].x1 };
+  let best = null;
+  for (let i = 0; i < b.length; i++) {
+    if (b[i].end || bayOccupied(b[i])) continue;
+    let j = i;
+    while (j + 1 < b.length && !b[j + 1].end && !bayOccupied(b[j + 1])) j++;
+    if (!best || b[j].x1 - b[i].x0 > best.x1 - best.x0) best = { x0: b[i].x0, x1: b[j].x1 };
+    i = j;
+  }
+  return best;
+}
+
+function apParkCaravan(car, ap, dt) {
+  const space = apCaravanSpace();
+  if (!space) {
+    // nowhere to go yet: circle out on the road
+    apDriveTo(car, ap, W / 2, street.npcLaneY - 60, 120);
+    return;
+  }
+  if (!ap.cpark) ap.cpark = { phase: "approach", t: 0 };
+  const p = ap.cpark;
+  const setPhase = (phase) => { p.phase = phase; p.t = 0; };
+  p.t += dt;
+  const speed = speedOf(car);
+  const lineY = street.carCenterY - AP_CARAVAN_LINE_GAP;
+  const a = wrapAngle(car.angle); // 0 = heading right, along the row
+  const hitch = wrapAngle(car.caravan.angle - car.angle);
+  const front = car.pos.x + CAR.length / 2;
+  const stopAt = space.x1 - AP_CARAVAN_STOP_SHORT;
+
+  if (p.phase === "approach") {
+    const d = apDriveTo(car, ap, clamp(space.x0 - 260, 80, W - 80), lineY - 50, 150);
+    apCheckStuck(car, ap, dt, ap.drive.throttle !== 0);
+    if (d < 90) setPhase("line");
+  } else if (p.phase === "line") {
+    // Pointing the wrong way (say, arriving from the right), it turns round
+    // toward the road, never toward the curb: turning the other way wedged
+    // its nose against the parked car at the end of the row.
+    const err = wrapAngle(Math.atan2(lineY - car.pos.y, 90) - car.angle);
+    const steer = Math.abs(err) > 1.6 ? (Math.cos(car.angle) >= 0 ? -1 : 1) : apSteerAt(car, car.pos.x + 90, lineY);
+    ap.drive.steer = apCaravanForwardSteer(car, steer);
+    ap.drive.throttle = apThrottleFor(car, 70);
+    apCheckStuck(car, ap, dt, true);
+    if (car.pos.x > space.x0 + AP_CARAVAN_TURN_AT) {
+      const linedUp = Math.abs(a) < 0.35 && Math.abs(hitch) < 0.3 && Math.abs(car.pos.y - lineY) < 14;
+      setPhase(linedUp ? "in" : "leave");
+    }
+    if (p.t > 20) setPhase("approach");
+  } else if (p.phase === "in") {
+    ap.drive.steer = apCaravanForwardSteer(car, apSteerAt(car, car.pos.x + AP_CARAVAN_LOOKAHEAD, street.carCenterY + 1));
+    const left = stopAt - front;
+    ap.drive.throttle = left > 2 ? apThrottleFor(car, Math.min(AP_CARAVAN_IN_SPEED, 6 + left)) : apStop(car);
+    if ((left <= 2 && speed < 2) || (p.t > 0.6 && speed < 2) || p.t > 12) setPhase("check");
+  } else if (p.phase === "check") {
+    ap.drive.throttle = apStop(car);
+    ap.drive.steer = 0;
+    // still not counted as parked after a moment (the coin race would have
+    // moved it on): pull out and go round again
+    if (p.t > 0.8) setPhase("leave");
+  } else if (p.phase === "leave") {
+    // pull out forward, then loop back round to the start
+    ap.drive.throttle = apThrottleFor(car, 70);
+    ap.drive.steer = apCaravanForwardSteer(car, apSteerAt(car, car.pos.x + 90, lineY - 50));
+    apCheckStuck(car, ap, dt, true);
+    if (p.t > 2.5) setPhase("approach");
+  }
+}
+
 function updateAutopilot(car, dt) {
   const ap = car.ap;
   ap.wobblePhase += dt * (1.3 + ap.sloppy);
@@ -2402,17 +2933,23 @@ function updateAutopilot(car, dt) {
   const goal = apPickGoal(car, ap, dt);
   if (goal !== ap.goal) {
     ap.goal = goal;
-    ap.park = ap.garage = null;
+    ap.park = ap.garage = ap.cpark = null;
     if (goal !== "harass") ap.harass = null;
   }
 
-  if (goal === "coin") {
+  if (goal === "coin" && !coin) {
+    // waiting for the other player to move before the first coin appears
+    ap.drive.throttle = apStop(car);
+    ap.drive.steer = 0;
+  } else if (goal === "coin") {
     apDriveTo(car, ap, coin.x, coin.y, ap.cruise);
     apCheckStuck(car, ap, dt, ap.drive.throttle !== 0);
   } else if (goal === "harass") {
     apHarass(car, ap, dt);
   } else if (goal === "garage") {
     apGarage(car, ap, dt);
+  } else if (car.caravan) {
+    apParkCaravan(car, ap, dt);
   } else {
     apPark(car, ap, dt);
   }
@@ -3140,6 +3677,7 @@ window.addEventListener("resize", () => {
     for (const car of [car1, car2]) {
       car.pos.x = clamp(car.pos.x, CAR.wallRadius, W - CAR.wallRadius);
       car.pos.y = clamp(car.pos.y, CAR.wallRadius, street.curbY - CAR.wallRadius);
+      if (car.caravan) placeCaravanAxle(car);
     }
 
     if (coin) {
@@ -3175,6 +3713,11 @@ function update(dt) {
   for (const car of [car1, car2]) if (car.autopilot) updateAutopilot(car, dt);
 
   const movers = [car1, car2, ...npcs, ...parkers];
+  for (const car of [car1, car2]) {
+    // where the car was before this step, for a jammed caravan to undo the move
+    car.prevPos = { x: car.pos.x, y: car.pos.y };
+    car.prevAngle = car.angle;
+  }
   for (const car of movers) stepCar(car, dt);
 
   // Only the players are fenced in by the arena walls -- traffic enters and
@@ -3189,9 +3732,12 @@ function update(dt) {
   for (let i = 0; i < movers.length; i++) {
     for (let j = i + 1; j < movers.length; j++) resolveCarVsCar(movers[i], movers[j]);
   }
+  for (const car of [car1, car2]) if (car.caravan) updateCaravan(car);
+  for (const car of [car1, car2]) if (car.caravan) resolveCaravanCollisions(car);
 
   updateCoin(dt);
   updateCoinRace();
+  updateCaravanDue();
   updateGarage();
   updateMechanic(dt);
   for (const car of movers) emitSmoke(car, dt);
@@ -3586,24 +4132,28 @@ function drawCar(c, car) {
     c.stroke();
   }
 
-  // collision dents: a dark bruise with ink crack lines, clipped to the body
-  if (car.dents.length) {
-    c.save();
-    tracePath(c, art.body);
-    c.clip();
-    for (const d of car.dents) {
-      const seed = d.x * 13.1 + d.y * 7.7;
-      tracePath(c, wobble(roundRectPoints(d.x - d.r, d.y - d.r, d.r * 2, d.r * 2, d.r, 3), seed, d.r * 0.15));
-      c.fillStyle = "rgba(35,31,46,0.28)";
-      c.fill();
-      for (let k = 0; k < 3; k++) {
-        const a = hash01(seed + k) * Math.PI * 2, len = d.r * (0.7 + 0.5 * hash01(seed + k + 9));
-        inkLine(c, d.x, d.y, d.x + Math.cos(a) * len, d.y + Math.sin(a) * len, seed + k, 1.2, INK, 0.4);
-      }
-    }
-    c.restore();
-  }
+  drawDents(c, art.body, car.dents);
+  c.restore();
+}
 
+// Collision dents: a dark bruise with ink crack lines, clipped to the body
+// outline. In the body's own (already transformed) frame; shared by cars and
+// caravans.
+function drawDents(c, body, dents) {
+  if (!dents.length) return;
+  c.save();
+  tracePath(c, body);
+  c.clip();
+  for (const d of dents) {
+    const seed = d.x * 13.1 + d.y * 7.7;
+    tracePath(c, wobble(roundRectPoints(d.x - d.r, d.y - d.r, d.r * 2, d.r * 2, d.r, 3), seed, d.r * 0.15));
+    c.fillStyle = "rgba(35,31,46,0.28)";
+    c.fill();
+    for (let k = 0; k < 3; k++) {
+      const a = hash01(seed + k) * Math.PI * 2, len = d.r * (0.7 + 0.5 * hash01(seed + k + 9));
+      inkLine(c, d.x, d.y, d.x + Math.cos(a) * len, d.y + Math.sin(a) * len, seed + k, 1.2, INK, 0.4);
+    }
+  }
   c.restore();
 }
 
@@ -3613,21 +4163,18 @@ function drawCar(c, car) {
 // in "mustPark", every open spot pulses in that player's color. With both
 // players waiting to park, the two pulses run half a cycle apart, so the
 // spots alternate between their colors.
-// A big painted "P" on every free bay, pulsing in the color of any player
-// who must park. Free bays change as parked cars come and go, so this is
-// drawn live rather than in the static layer.
+// A big painted "P" on every free bay. Free bays change as parked cars come
+// and go, so this is drawn live rather than in the static layer. They used
+// to pulse in the color of any player who must park; that went, on request,
+// when the HUD started saying "Next: Park".
 function drawParkingTargets() {
-  const free = freeBays();
-  for (const b of free) inkText(ctx, "P", (b.x0 + b.x1) / 2, street.carCenterY, 17, "#ffffff");
-  const waiting = [car1, car2].filter((c) => c.gameState === "mustPark");
-  const y0 = street.carCenterY - CAR.width / 2 - 5;
-  const h = street.curbY - 1 - y0;
-  drawTargetPulse(waiting, free.map((b) => ({ x: b.x0, y: y0, w: b.x1 - b.x0, h })));
+  for (const b of freeBays()) inkText(ctx, "P", (b.x0 + b.x1) / 2, street.carCenterY, 17, "#ffffff");
 }
 
 // The shared "go here" cue: each rect pulses (tinted fill + outline) in the
 // color of every car in `cars`. With two cars, their pulses run half a cycle
-// apart so the colors alternate. Used for the parking spots and the garage.
+// apart so the colors alternate. Used for the garage pad (the parking bays
+// used it too, until the HUD started saying "Next: Park").
 function drawTargetPulse(cars, rects) {
   if (!cars.length) return;
   const now = performance.now() / 1000;
@@ -3644,6 +4191,60 @@ function drawTargetPulse(cars, rects) {
     }
   });
   ctx.globalAlpha = 1;
+}
+
+// A caravan, top-down, in the same ink style as the cars: cream roof with a
+// skylight and roof vents, a band of the car's color across the front, an
+// A-frame drawbar to the hitch ball, and its one axle's wheels peeking out
+// the sides. Drawn in a frame centered on the body, +x toward the hitch.
+function caravanArt(cv) {
+  if (cv.art) return cv.art;
+  const L = CARAVAN.length, Wd = CARAVAN.width, s = cv.seed;
+  cv.art = {
+    body: wobble(roundRectPoints(-L / 2, -Wd / 2, L, Wd, 7, 5), s, 0.7),
+    front: wobble(roundRectPoints(L / 2 - 9, -Wd / 2 + 2, 7, Wd - 4, 3, 4), s + 1, 0.3),
+    skylight: wobble(roundRectPoints(-6, -5, 14, 10, 3, 4), s + 2, 0.3),
+  };
+  return cv.art;
+}
+
+function drawCaravan(c, car) {
+  const cv = car.caravan, art = caravanArt(cv);
+  const L = CARAVAN.length, Wd = CARAVAN.width;
+  const center = caravanPoint(car, CARAVAN.tongue + L / 2);
+  const hitchX = L / 2 + CARAVAN.tongue, axleX = hitchX - CARAVAN.axleBack;
+
+  c.save();
+  c.translate(center.x + 3, center.y + 4);
+  c.rotate(cv.angle);
+  tracePath(c, art.body);
+  c.fillStyle = PAL.shadow;
+  c.fill();
+  c.restore();
+
+  c.save();
+  c.translate(center.x, center.y);
+  c.rotate(cv.angle);
+  // A-frame drawbar and hitch ball
+  inkLine(c, L / 2 - 2, -7, hitchX, 0, cv.seed + 3, 2.2, INK, 0.3);
+  inkLine(c, L / 2 - 2, 7, hitchX, 0, cv.seed + 4, 2.2, INK, 0.3);
+  c.beginPath();
+  c.arc(hitchX, 0, 2.6, 0, Math.PI * 2);
+  c.fillStyle = PAL.tire;
+  c.fill();
+  c.strokeStyle = INK;
+  c.lineWidth = 1.2;
+  c.stroke();
+  // wheels half under the body
+  drawWheel(c, axleX, -Wd / 2, 0);
+  drawWheel(c, axleX, Wd / 2, 0);
+
+  inkShape(c, art.body, "#f7f0dc", 2.5);
+  inkShape(c, art.front, car.color, 1.5);
+  inkShape(c, art.skylight, PAL.glass, 1.5);
+  for (const x of [-L / 2 + 8, -L / 2 + 15]) inkShape(c, roundRectPoints(x - 2.5, -3, 5, 6, 1.5, 3), "#d9cfb6", 1.2);
+  drawDents(c, art.body, cv.dents);
+  c.restore();
 }
 
 // easeOutBack: 0 -> 1 with a small overshoot past 1 before settling -- the "pop".
@@ -3807,6 +4408,10 @@ const titleEl1 = document.getElementById("p1-title");
 const titleEl2 = document.getElementById("p2-title");
 const scoreEl1 = document.getElementById("p1-score");
 const scoreEl2 = document.getElementById("p2-score");
+const painEl1 = document.getElementById("p1-pain");
+const painEl2 = document.getElementById("p2-pain");
+const nextEl1 = document.getElementById("p1-next");
+const nextEl2 = document.getElementById("p2-next");
 const autoBtn1 = document.getElementById("p1-auto");
 const autoBtn2 = document.getElementById("p2-auto");
 const hintEl = document.getElementById("hint");
@@ -3821,11 +4426,17 @@ for (const [btn, getCar] of [[autoBtn1, () => car1], [autoBtn2, () => car2]]) {
   });
 }
 
-function updateHud(car, titleEl, scoreEl, autoBtn) {
+function updateHud(car, titleEl, scoreEl, autoBtn, painEl, nextEl) {
   const title = car.hasDriven ? car.label : `${car.label} — ${car.keyHint}`;
   if (titleEl.textContent !== title) titleEl.textContent = title;
   const score = String(car.score);
   if (scoreEl.textContent !== score) scoreEl.textContent = score;
+  // "<pain level>:<the coin about to be taken>", counting from 1: "2:1" is
+  // level 2, going for its first coin. At the top level it keeps counting.
+  const pain = `${car.level}:${car.levelCoins + 1}`;
+  if (painEl.textContent !== pain) painEl.textContent = pain;
+  const next = car.gameState === "mustPark" ? "Next: Park" : "Next: Coin";
+  if (nextEl.textContent !== next) nextEl.textContent = next;
   const on = !!car.autopilot;
   if (autoBtn.classList.contains("on") !== on) {
     autoBtn.classList.toggle("on", on);
@@ -3945,12 +4556,13 @@ function render() {
   for (const pc of parkers) drawCar(ctx, pc);
   for (const n of npcs) drawCar(ctx, n);
   if (coin) drawCoin(coin);
+  for (const car of [car1, car2]) if (car.caravan) drawCaravan(ctx, car);
   drawCar(ctx, car1);
   drawCar(ctx, car2);
   drawParticles();
 
-  updateHud(car1, titleEl1, scoreEl1, autoBtn1);
-  updateHud(car2, titleEl2, scoreEl2, autoBtn2);
+  updateHud(car1, titleEl1, scoreEl1, autoBtn1, painEl1, nextEl1);
+  updateHud(car2, titleEl2, scoreEl2, autoBtn2, painEl2, nextEl2);
   updateHint();
 }
 
