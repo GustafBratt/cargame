@@ -502,7 +502,7 @@ function isPlayer(car) {
   return car === car1 || car === car2;
 }
 
-// Records that `car` is touching `key` (a crate/parked-car/other-car object,
+// Records that `car` is touching `key` (a campsite rig or another car,
 // or "wall"/"curb") this step; returns true if it's a new touch.
 function isNewTouch(car, key) {
   if (!car.contacts) car.contacts = new Map();
@@ -729,7 +729,7 @@ const CAR = {
   // elastic (for equal masses head-on, ALL of the striking object's kinetic
   // energy transfers to the one it hit). Car-vs-car is kept high on purpose
   // -- ramming a stationary car should visibly send it flying, not just
-  // nudge it -- while car-vs-obstacle (crates, parked cars) stays lower/more
+  // nudge it -- while car-vs-obstacle (the campsite's rigs, parked cars) stays lower/more
   // damped, since those aren't meant to go rocketing off.
   carCollisionRestitution: 0.85,
   obstacleCollisionRestitution: 0.5,
@@ -1031,8 +1031,8 @@ function contactPoint(from, toward, radius) {
   return { x: from.x + (dx / d) * radius, y: from.y + (dy / d) * radius };
 }
 
-// Collides a car's capsule against a single static circle (a crate, or one
-// end of a parked car's capsule), feeding the resulting push/impulse back
+// Collides a car's capsule against a single static circle (one of a
+// campsite rig's circles), feeding the resulting push/impulse back
 // into the car's actual pos/vel (each capsule circle is a fixed offset from
 // the car center, so a pure translation of the center moves both).
 // `key` identifies the obstacle for contact-sound tracking (isNewTouch).
@@ -1061,7 +1061,7 @@ function resolveCarVsCar(carA, carB) {
   // A parked car takes a hit more like an obstacle than a rolling car: the
   // damped restitution, so it gets shoved rather than sent flying. Below
   // DAMAGE_THRESHOLD it doesn't budge at all (handbrake on, it's anchored
-  // like a crate): otherwise every parking nudge, and every neighbor pulling
+  // like scenery): otherwise every parking nudge, and every neighbor pulling
   // out, would slowly twist the row out of line.
   const restitution = carA.handbrake || carB.handbrake ? CAR.obstacleCollisionRestitution : CAR.carCollisionRestitution;
   const gentle = Math.hypot(carA.vel.x - carB.vel.x, carA.vel.y - carB.vel.y) < DAMAGE_THRESHOLD;
@@ -1197,15 +1197,15 @@ function emitSmoke(car, dt) {
 }
 
 // ---------------------------------------------------------------------------
-// World: cars + static crates + parking street
+// World: cars + the campsite + parking street
 // ---------------------------------------------------------------------------
 
-let car1, car2, crates, street;
+let car1, car2, campsite, street;
 let npcs = []; // AI traffic cars, see updateTraffic
 let npcSpawnTimer = 0;
 let gameTime = 0; // seconds of simulation since setupWorld, see updateHint
 // The pre-drawn static scene (see buildStaticLayer) needs redrawing -- set
-// whenever street/crates are (re)built or a parked car gets a dent; render()
+// whenever street/campsite are (re)built or a parked car gets a dent; render()
 // does the actual rebuild, since the render code's constants aren't
 // initialized yet when setupWorld first runs.
 let staticDirty = true;
@@ -1295,19 +1295,70 @@ function buildStreet() {
   return { curbY, carCenterY, centerlineY, npcLaneY, parkLaneY, sidewalkBottomY, bays, garage };
 }
 
-function buildCrates() {
-  const crates = [];
-  const cols = 4, rows = 3;
-  for (let i = 0; i < cols; i++) {
-    for (let j = 0; j < rows; j++) {
-      crates.push({
-        x: W * 0.5 + (i - (cols - 1) / 2) * 90,
-        y: H * 0.15 + j * 70,
-        r: 16,
-      });
-    }
+// ---- The campsite ---------------------------------------------------------
+// Along the top of the lot: a strip of grass with a row of camping pitches
+// (gravel pads) opening downward onto the open lot. Every pitch but
+// CAMP_FREE holds a static car + caravan rig, parked the way campers do:
+// caravan backed in at the back, car in front facing out. The free pitches
+// always have rigs either side (never at the ends, never next to each
+// other). In game phase 4 players must park in one after every coin -- and
+// the only way to end up facing out, caravan in the back, is to reverse in.
+// The rigs are scenery: they never move, and collide as static circles
+// (campsite.circles: both capsule circles of the car, both caravan circles),
+// the same way the crates that used to stand here did.
+// A bush closes off the back of every pitch (also in campsite.circles). With
+// the back open, a rig could drive in forward from above and end up facing
+// out without ever reversing. Neighboring bushes leave a gap narrower than a
+// car, and the bush stops just short of a backed-in caravan.
+const CAMP_PITCH_W = 56; // px: a caravan is 26 wide, so ~43 px to spare between the neighbors' caravans
+const CAMP_PITCH_D = 140; // px: the rig is ~120 long, car front to caravan back
+const CAMP_FREE = 2;
+// px from the top of the canvas to the back of the pitches: below the HUD
+// badges, and far enough down that a car can still drive round above the
+// bushes (at 78, cars scraped along the top wall there)
+const CAMP_TOP = 112;
+const CAMP_SHARE = 0.5; // of the width the row of pitches aims to fill
+const CAMP_BUSH_R = 17; // px: two bushes leave 56 - 34 = 22 px between them, under a car's 24
+const CAMP_BUSH_Y = -6; // px from the back of the pitches to the bushes' centers
+const CAMP_COLORS = ["#f28b82", "#8fd6b4", "#b9a4e0", "#f6c85f", "#9ec5d8", "#d99ad0", "#ffffff"];
+
+function buildCampsite() {
+  const n = clamp(Math.floor((W * CAMP_SHARE) / CAMP_PITCH_W), 5, 14);
+  const x0 = (W - n * CAMP_PITCH_W) / 2;
+  const y0 = CAMP_TOP, y1 = CAMP_TOP + CAMP_PITCH_D;
+  const pitches = [];
+  for (let i = 0; i < n; i++) pitches.push({ x0: x0 + i * CAMP_PITCH_W, x1: x0 + (i + 1) * CAMP_PITCH_W, y0, y1, free: false });
+
+  // the free ones: inner pitches, not next to each other
+  const order = pitches.map((_, i) => i).slice(1, -1).sort(() => Math.random() - 0.5);
+  let freed = 0;
+  for (const i of order) {
+    if (freed >= CAMP_FREE) break;
+    if (pitches[i - 1].free || pitches[i + 1].free) continue;
+    pitches[i].free = true;
+    freed++;
   }
-  return crates;
+
+  const rigs = [], circles = [];
+  for (const p of pitches) {
+    if (p.free) continue;
+    // car in front facing out (down), its front bumper a little inside the pitch
+    const rig = createCar((p.x0 + p.x1) / 2, y1 - 6 - CAR.length / 2, Math.PI / 2, pickOf(CAMP_COLORS), null);
+    attachCaravan(rig); // straight behind: up into the pitch
+    rigs.push(rig);
+    for (const o of capsuleOffsets(rig.angle)) circles.push({ x: rig.pos.x + o.x, y: rig.pos.y + o.y, r: CAR.capsuleRadius, key: rig });
+    for (const cs of CARAVAN.circles) circles.push({ ...caravanPoint(rig, cs), r: CARAVAN.radius, key: rig });
+  }
+  // a bush at the back of every pitch, so nobody drives in from above
+  const bushes = pitches.map((p) => ({ x: (p.x0 + p.x1) / 2, y: y0 + CAMP_BUSH_Y, r: CAMP_BUSH_R }));
+  for (const b of bushes) circles.push({ ...b, key: b });
+  // the grass strip the pitches sit on (drawCampsite), also kept clear of coins
+  const area = { x0: x0 - 18, x1: x0 + n * CAMP_PITCH_W + 18, y0: y0 + CAMP_BUSH_Y - CAMP_BUSH_R - 4, y1: y1 + 6 };
+  return { pitches, rigs, bushes, circles, area };
+}
+
+function freePitches() {
+  return campsite.pitches.filter((p) => p.free);
 }
 
 function setupWorld() {
@@ -1318,15 +1369,15 @@ function setupWorld() {
     up: ["i", "arrowup"], down: ["k", "arrowdown"], left: ["j", "arrowleft"], right: ["l", "arrowright"],
   });
 
-  crates = buildCrates();
+  campsite = buildCampsite();
   street = buildStreet();
   resetParkers();
 
   for (const car of [car1, car2]) {
     car.score = 0;
     car.gameState = "seekCoin";
-    car.level = 1; // the ladder of pain, see coinCaught
-    car.levelCoins = 0;
+    car.gamePhase = 1; // the game phases, see coinCaught
+    car.phaseCoins = 0;
     car.caravanDue = false; // see caravanAppears
     car.hasDriven = false;
   }
@@ -1357,26 +1408,19 @@ const PARK_Y_TOLERANCE = 13;
 const PARK_ANGLE_TOLERANCE = 0.3; // radians (~17deg), either direction along the curb
 const PARK_X_MARGIN = 2; // px inset from the spot's painted edges the center must clear
 
-// How far a coin's edge must stay from a crate's square (so the coin and its
-// glow never overlap a box). Deliberately small: coins may spawn in the
-// lanes BETWEEN the crates in the grid (38px+ wide, a car is 24px), which
-// the old rule (56px from every crate center) ruled out almost entirely.
-const COIN_CRATE_GAP = 5;
-
-// Distance from (x, y) to the nearest point of crate c's drawn square.
-function distToCrate(x, y, c) {
-  const dx = Math.max(Math.abs(x - c.x) - c.r, 0);
-  const dy = Math.max(Math.abs(y - c.y) - c.r, 0);
-  return Math.hypot(dx, dy);
-}
+// Coins keep this far clear of the campsite's grass strip: nobody should
+// have to thread a caravan between the parked rigs for a coin.
+const COIN_CAMP_GAP = 30;
 
 function randomCoinPos() {
-  for (let attempt = 0; attempt < 30; attempt++) {
+  const a = campsite.area;
+  for (let attempt = 0; attempt < 40; attempt++) {
     const x = 60 + Math.random() * (W - 120);
     const y = 60 + Math.random() * Math.max(40, street.curbY - 150 - 60);
-    if (crates.every((c) => distToCrate(x, y, c) > COIN_RADIUS + COIN_CRATE_GAP)) return { x, y };
+    const inCamp = x > a.x0 - COIN_CAMP_GAP && x < a.x1 + COIN_CAMP_GAP && y < a.y1 + COIN_CAMP_GAP;
+    if (!inCamp) return { x, y };
   }
-  return { x: W / 2, y: H * 0.3 };
+  return { x: W / 2, y: (campsite.area.y1 + street.curbY - 150) / 2 };
 }
 
 let coin = null; // shared: only one coin exists at a time, so both cars race for it
@@ -1450,7 +1494,7 @@ function unclaimedBays() {
 }
 
 // ---- The caravan space ----------------------------------------------------
-// While any player tows a caravan (pain level 3), the parked cars keep one
+// While any player tows a caravan (game phase 3), the parked cars keep one
 // run of adjacent bays clear that a car plus caravan fits into with
 // CARAVAN_SPACE_MARGIN to spare. A car + caravan is ~120 px, and two tight
 // bays leave only ~113, so it's usually three bays. Its bays are marked
@@ -1478,11 +1522,16 @@ function runGap(i, j) {
 // fewest parked cars to send away.
 function chooseCaravanSpace() {
   const b = street.bays, need = rigLength() + CARAVAN_SPACE_MARGIN;
-  const inner = b.map((_, i) => i).filter((i) => !b[i].end);
+  // not in, or next to, a caravan space there already is
+  const taken = (i) => [b[i - 1], b[i], b[i + 1]].some((bay) => bay && bay.caravanSpace);
+  const inner = b.map((_, i) => i).filter((i) => !b[i].end && !taken(i));
   let best = null;
   for (let len = 1; len <= inner.length && !best; len++) {
     const runs = [];
     for (let i = inner[0]; i + len - 1 <= inner[inner.length - 1]; i++) {
+      let open = true;
+      for (let k = i; k < i + len; k++) if (!inner.includes(k)) open = false;
+      if (!open) continue;
       if (len < inner.length && runGap(i, i + len - 1) < need) continue;
       const cars = parkers.filter((c) => c.state === "parked" && c.pos.x > b[i].x0 && c.pos.x < b[i + len - 1].x1).length;
       runs.push({ i, j: i + len - 1, cars });
@@ -1495,17 +1544,23 @@ function chooseCaravanSpace() {
   return best;
 }
 
+// One caravan space per phase-3 player with a caravan (from phase 4 on,
+// they park at the campsite). Each space's bays share an id in
+// bay.caravanSpace (1 or 2). With just one space, two rigs going for it
+// jammed each other for good: both stuck at 3:3 for a whole 15-minute game.
 function updateCaravanSpace() {
-  const wanted = [car1, car2].some((c) => c.caravan || c.caravanDue);
-  const current = street.bays.filter((bay) => bay.caravanSpace);
-  if (!wanted) {
-    for (const bay of current) bay.caravanSpace = false;
+  const wanted = [car1, car2].filter((c) => (c.caravan || c.caravanDue) && c.gamePhase === 3).length;
+  const ids = [...new Set(street.bays.map((bay) => bay.caravanSpace).filter(Boolean))];
+  if (ids.length > wanted) {
+    const drop = Math.max(...ids);
+    for (const bay of street.bays) if (bay.caravanSpace === drop) bay.caravanSpace = 0;
     return;
   }
-  if (current.length) return;
+  if (ids.length === wanted) return;
   const run = chooseCaravanSpace();
-  if (!run) return;
-  for (let k = run.i; k <= run.j; k++) street.bays[k].caravanSpace = true;
+  if (!run) return; // no room for another: they share
+  const id = ids.includes(1) ? 2 : 1;
+  for (let k = run.i; k <= run.j; k++) street.bays[k].caravanSpace = id;
 }
 
 // A parked car standing in the caravan space, if any: they're sent away
@@ -1689,14 +1744,14 @@ function updateCoinRace() {
       playCoinPickupSound(car.pos.x);
       spawnCoin();
       coinCaught(car);
-      // level 1 just collects; from level 2 on, every coin needs a park
-      if (car.level >= 2) car.gameState = "mustPark";
+      // phase 1 just collects; from phase 2 on, every coin needs a park
+      if (car.gamePhase >= 2) car.gameState = "mustPark";
       break;
     }
   }
 
   for (const car of [car1, car2]) {
-    if (car.gameState === "mustPark" && parkedForLevel(car)) {
+    if (car.gameState === "mustPark" && parkedForPhase(car)) {
       car.gameState = "seekCoin";
       spawnFirework(car.pos.x, car.pos.y, car.color);
       playParkedSound(car.pos.x);
@@ -1704,38 +1759,42 @@ function updateCoinRace() {
   }
 }
 
-// ---- The ladder of pain ---------------------------------------------------
-// Each player climbs on their own, COINS_PER_LEVEL coins per level:
+// ---- Game phases ----------------------------------------------------------
+// Each player moves through the phases on their own, COINS_PER_PHASE coins
+// per phase:
 // 1. just fetch coins
 // 2. parallel park after every coin
 // 3. a caravan appears, and every coin needs car AND caravan parked; the
 //    parked cars keep a long enough space free for it (see updateParkers)
-// The climb counts coins as they're caught: the 3rd coin of a level moves
-// the player up, and that coin's task already follows the new level (the
-// 3rd level-1 coin needs a park; the caravan appears on the 3rd level-2 coin,
+// Progress counts coins as they're caught: the 3rd coin of a phase moves the
+// player on, and that coin's task already follows the new phase (the 3rd
+// phase-1 coin needs a park; the caravan appears on the 3rd phase-2 coin,
 // and that coin is parked with it). The counter is separate from car.score
 // (the coins in hand), so paying the garage doesn't set anyone back.
-// PAIN_MAX_LEVEL is the top for now.
-const COINS_PER_LEVEL = 3;
-const PAIN_MAX_LEVEL = 3;
+// 4. the campsite: every coin needs the rig reversed into a free pitch
+// Planned: phase 5, reversing the caravan through a maze. LAST_PHASE is the
+// last one built.
+const COINS_PER_PHASE = 3;
+const LAST_PHASE = 4;
 
 function coinCaught(car) {
-  car.levelCoins++;
-  if (car.levelCoins < COINS_PER_LEVEL || car.level >= PAIN_MAX_LEVEL) return;
-  car.level++;
-  car.levelCoins = 0;
+  car.phaseCoins++;
+  if (car.phaseCoins < COINS_PER_PHASE || car.gamePhase >= LAST_PHASE) return;
+  car.gamePhase++;
+  car.phaseCoins = 0;
   // a bigger celebration than a park: a burst on the car and one each side
   for (const dx of [-40, 0, 40]) spawnFirework(car.pos.x + dx, car.pos.y - Math.abs(dx) * 0.5, car.color);
   playRepairSound(car.pos.x);
-  if (car.level >= 3 && !car.caravan && !caravanAppears(car)) car.caravanDue = true;
+  if (car.gamePhase >= 3 && !car.caravan && !caravanAppears(car)) car.caravanDue = true;
 }
 
 // The caravan pops in behind the car, right where the coin was caught, with
 // the coin's implosion, a flash and a ring in the player's color. Straight
 // behind is blocked? Then it appears folded to whichever side is clear. And
-// if nowhere is (a coin in the crate grid: spawned there, it would wedge
-// between two crates, pushed equally both ways along its length and never
-// freed), it's due (car.caravanDue) and appears the moment there's room --
+// if nowhere is (with the old crate grid, a coin caught between the crates:
+// spawned there, it wedged between two of them, pushed equally both ways
+// along its length and never freed), it's due (car.caravanDue) and appears
+// the moment there's room --
 // usually a second later, once the player has driven on.
 const CARAVAN_APPEAR_FOLDS = [0, 0.4, -0.4, 0.8, -0.8, 1.1, -1.1]; // rad, tried in order
 
@@ -1753,7 +1812,7 @@ function caravanAppears(car) {
   const clear = () => CARAVAN.circles.every((s) => {
     const p = caravanPoint(car, s);
     return p.x > r && p.x < W - r && p.y > r && p.y < street.curbY - r &&
-      crates.every((cr) => Math.hypot(p.x - cr.x, p.y - cr.y) > r + cr.r) &&
+      campsite.circles.every((cr) => Math.hypot(p.x - cr.x, p.y - cr.y) > r + cr.r) &&
       others.every((o) => capsuleOffsets(o.angle).every((q) => Math.hypot(p.x - o.pos.x - q.x, p.y - o.pos.y - q.y) > r + CAR.capsuleRadius));
   });
   const fold = CARAVAN_APPEAR_FOLDS.find((f) => {
@@ -1774,9 +1833,49 @@ function caravanAppears(car) {
   return true;
 }
 
-// Parked, for this player's level: with a caravan, it has to be straight,
+// Parked in a free campsite pitch (game phase 4): stopped, car and caravan
+// both straight and facing out (down, toward the open lot), the caravan's
+// middle inside the pitch and the car at most a little out of it. Facing out
+// with the caravan in the back is only possible by reversing in: a pitch has
+// no room to turn round in.
+// A pitch's gravel pad, as drawn: the rig has to be on it.
+function pitchPad(p) {
+  return { x0: p.x0 + 4, x1: p.x1 - 4, y0: p.y0 + 2, y1: p.y1 + 4 };
+}
+
+// Are all four corners of a box (center, heading, half length and width) inside rect?
+function boxInRect(cx, cy, angle, hl, hw, r) {
+  const fx = Math.cos(angle), fy = Math.sin(angle);
+  for (const [a, b] of [[1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+    const x = cx + fx * hl * a - fy * hw * b, y = cy + fy * hl * a + fx * hw * b;
+    if (x < r.x0 || x > r.x1 || y < r.y0 || y > r.y1) return false;
+  }
+  return true;
+}
+
+// Camped: stopped, car and caravan both facing out, and both bodies wholly
+// on a free pitch's gravel, nothing on the grass. (The first rule only
+// wanted the caravan's middle in the pitch and the car's center near it,
+// which the user found "way too forgiving".) The pad is 48 x 142 px, the
+// rig 26 x 120: ~11 px to spare either side, 22 px lengthwise.
+function parkedInCamp(car) {
+  if (!car.caravan || speedOf(car) > PARK_SPEED_LIMIT) return false;
+  const out = Math.PI / 2;
+  if (Math.abs(wrapAngle(car.angle - out)) > PARK_ANGLE_TOLERANCE) return false;
+  if (Math.abs(wrapAngle(car.caravan.angle - out)) > PARK_ANGLE_TOLERANCE) return false;
+  const mid = caravanPoint(car, CARAVAN.tongue + CARAVAN.length / 2);
+  return freePitches().some((p) => {
+    const pad = pitchPad(p);
+    return boxInRect(car.pos.x, car.pos.y, car.angle, CAR.length / 2, CAR.width / 2, pad) &&
+      boxInRect(mid.x, mid.y, car.caravan.angle, CARAVAN.length / 2, CARAVAN.width / 2, pad);
+  });
+}
+
+// Parked, for this player's phase: in phase 4, in a campsite pitch (above).
+// Before that, at the curb -- and with a caravan, it has to be straight,
 // down in the parking lane and within the row too.
-function parkedForLevel(car) {
+function parkedForPhase(car) {
+  if (car.gamePhase >= 4) return parkedInCamp(car);
   if (!isParked(car) || car.caravanDue) return false;
   if (!car.caravan) return true;
   let a = car.caravan.angle % Math.PI;
@@ -2072,7 +2171,7 @@ function npcDrive(npc, dt) {
     throttle = forwardSpeed < targetSpeed ? 1 : 0;
   }
 
-  // Stopped for too long -- wedged against something (a crate, the curb), or
+  // Stopped for too long -- wedged against something (a campsite rig, the curb), or
   // waiting on a car that isn't moving out of the way: back up for a moment,
   // then try again on a different line. Waiting behind a car gets more
   // patience than being wedged.
@@ -2119,7 +2218,7 @@ function updateTraffic(dt) {
 // stops there (with a crunch), and the caravan gets dragged round with it.
 //
 // Collisions (resolveCaravanCollisions): the caravan's two circles collide
-// with walls, the curb, crates and every other car. A push along the drawbar
+// with walls, the curb, the campsite's rigs and every other car. A push along the drawbar
 // shoves the whole rig (car included, and it stops the car's motion into the
 // obstacle); a push across it swivels the caravan about the hitch.
 //
@@ -2266,15 +2365,15 @@ function resolveCaravanCollisions(car) {
       caravanHitSound(car, Math.max(0, -vn), at, push.y < 0 ? "curb" : "wall");
     }
 
-    // crates: static circles
-    for (const cr of crates) {
+    // the campsite's parked rigs: static circles
+    for (const cr of campsite.circles) {
       const cc = caravanPoint(car, s), before = { x: cc.x, y: cc.y };
       const v = { x: car.vel.x, y: car.vel.y };
       const hit = resolveCircles(cc, v, r, { x: cr.x, y: cr.y }, null, cr.r, true, CAR.obstacleCollisionRestitution);
       if (hit < 0) continue;
       pushCaravan(car, s, { x: cc.x - before.x, y: cc.y - before.y }, { x: v.x - car.vel.x, y: v.y - car.vel.y });
       dentCaravan(car, hit, contactPoint(cc, cr, r));
-      caravanHitSound(car, hit, cc, cr);
+      caravanHitSound(car, hit, cc, cr.key);
     }
 
     // every other car's capsule, and the other player's caravan
@@ -2632,7 +2731,7 @@ function parkerDriveLane(car, speed, dt) {
 // for them: chases coins, parallel parks, and visits the garage when badly
 // dented. It plays it BADLY on purpose:
 // - it drives too fast and steers with a wobble
-// - it doesn't always notice a crate or parked car in its path (AP_BLIND_CHANCE)
+// - it doesn't always notice a campsite rig or parked car in its path (AP_BLIND_CHANCE)
 // - it picks a random parking spot, and sometimes the one the other
 //   autopilot is already going for, so they fight over it
 // - its parking is a scripted S-curve that works only when it doesn't
@@ -2644,7 +2743,7 @@ function parkerDriveLane(car, speed, dt) {
 const AP_CRUISE_MIN = 170, AP_CRUISE_MAX = 250; // px/s chasing coins (rolled per activation)
 const AP_STEER_GAIN = 2.4; // steer per radian of heading error
 const AP_WOBBLE = 0.3; // steering wander amplitude, times the per-activation sloppiness
-const AP_BLIND_CHANCE = 0.4; // chance of not seeing a crate or parked car in its path, rolled per encounter
+const AP_BLIND_CHANCE = 0.4; // chance of not seeing a campsite rig or parked car in its path, rolled per encounter
 const AP_SEEN_RESET = 2.5; // s until obstacles it saw (or missed) get re-rolled
 const AP_HARASS_MEAN = 18; // s, average time chasing coins before it gets bored and bullies traffic
 const AP_HARASS_MIN = 5, AP_HARASS_MAX = 10; // s of harassment
@@ -2671,6 +2770,7 @@ function makeAutopilot() {
 function toggleAutopilot(car) {
   car.autopilot = !car.autopilot;
   if (car.autopilot) car.ap = makeAutopilot();
+  else if (car.towedBack) apEndTow(car); // switched off mid-reverse: back to normal driving
 }
 
 function apForwardSpeed(car) {
@@ -2701,11 +2801,11 @@ function apSteerAt(car, tx, ty, reverse = false) {
   return clamp(err * AP_STEER_GAIN, -1, 1) * (reverse ? -1 : 1);
 }
 
-// Swerve away from a crate or parked car dead ahead -- if it notices it.
+// Swerve away from a campsite rig or parked car dead ahead -- if it notices it.
 function apAvoid(car, ap, steer) {
   const fx = Math.cos(car.angle), fy = Math.sin(car.angle);
   const look = 60 + Math.max(0, apForwardSpeed(car)) * 0.35;
-  const obstacles = [...crates, ...parkers];
+  const obstacles = [...campsite.circles, ...parkers];
   for (const o of obstacles) {
     const ox = o.pos ? o.pos.x : o.x, oy = o.pos ? o.pos.y : o.y;
     // towing, it gives obstacles more room: the caravan cuts inside the turn
@@ -2714,7 +2814,7 @@ function apAvoid(car, ap, steer) {
     const ahead = dx * fx + dy * fy;
     const side = dy * fx - dx * fy; // > 0: to our right
     if (ahead <= 0 || ahead > look || Math.abs(side) > reach) continue;
-    // Not noticing a crate is part of the bad-driver charm -- but not while
+    // Not noticing an obstacle is part of the bad-driver charm -- but not while
     // towing: a bump spins the car and throws the caravan to the jackknife
     // limit, so a towing autopilot always sees them.
     if (!ap.seen.has(o)) ap.seen.set(o, car.caravan ? true : Math.random() > AP_BLIND_CHANCE);
@@ -2738,6 +2838,9 @@ function apDriveTo(car, ap, tx, ty, cruise, { avoid = true } = {}) {
   // Turning the other way points the car into the curb and the parked cars,
   // where it wedges itself in the corner.
   if (Math.abs(err) > 2 && car.pos.y > street.centerlineY) err = Math.cos(car.angle) >= 0 ? -Math.PI : Math.PI;
+  // Likewise below the campsite: turn round downward, into the open lot --
+  // turning up took it round the end of the campsite into the top corner.
+  else if (Math.abs(err) > 2 && car.pos.y < campsite.area.y1 + 160) err = Math.cos(car.angle) >= 0 ? Math.PI : -Math.PI;
 
   if (ap.reverseTime > 0) {
     // towing, it backs up slowly and steers the caravan straight behind
@@ -2760,7 +2863,7 @@ function apDriveTo(car, ap, tx, ty, cruise, { avoid = true } = {}) {
   return dist;
 }
 
-// Pushing but not moving (wedged on a crate, a wall, the other car): back
+// Pushing but not moving (wedged on a campsite rig, a wall, the other car): back
 // out with opposite lock and try again on a different line.
 function apCheckStuck(car, ap, dt, pushing) {
   const speed = speedOf(car);
@@ -2849,10 +2952,26 @@ const AP_CARAVAN_STOP_SHORT = 10; // px left before the car ahead: room to pull 
 
 // The space to park the rig in, as bay bounds {x0, x1}: the caravan space, or
 // else the longest run of adjacent free bays.
-function apCaravanSpace() {
+function apCaravanSpace(car) {
   const b = street.bays;
-  const marked = b.filter((bay) => bay.caravanSpace);
-  if (marked.length) return { x0: marked[0].x0, x1: marked[marked.length - 1].x1 };
+  const spaces = [...new Set(b.map((bay) => bay.caravanSpace).filter(Boolean))].map((id) => {
+    const bays = b.filter((bay) => bay.caravanSpace === id);
+    return { id, x0: bays[0].x0, x1: bays[bays.length - 1].x1 };
+  });
+  if (spaces.length) {
+    // stick with the one it picked; else one the other autopilot isn't going for
+    const other = car === car1 ? car2 : car1;
+    const theirs = other.autopilot && other.ap.cpark ? other.ap.cpark.spaceId : 0;
+    const mine = car.ap.cpark && spaces.find((sp) => sp.id === car.ap.cpark.spaceId);
+    // Both picked the same one (only one was open yet): P2 moves over to
+    // another once there is one, unless it's already driving in. Before
+    // this, both stuck with space 1 and jammed each other for good.
+    const moveOver = mine && mine.id === theirs && car === car2 && car.ap.cpark.phase !== "in" && spaces.length > 1;
+    if (mine && !moveOver) return mine;
+    const pick = spaces.find((sp) => sp.id !== theirs) || spaces[0];
+    if (car.ap.cpark) car.ap.cpark.spaceId = pick.id;
+    return pick;
+  }
   let best = null;
   for (let i = 0; i < b.length; i++) {
     if (b[i].end || bayOccupied(b[i])) continue;
@@ -2864,14 +2983,16 @@ function apCaravanSpace() {
   return best;
 }
 
+const AP_CARAVAN_TURN_UP = 160; // px above the line: where a rig arriving the wrong way U-turns down onto it
+
 function apParkCaravan(car, ap, dt) {
-  const space = apCaravanSpace();
+  if (!ap.cpark) ap.cpark = { phase: "approach", t: 0, spaceId: 0 };
+  const space = apCaravanSpace(car);
   if (!space) {
     // nowhere to go yet: circle out on the road
     apDriveTo(car, ap, W / 2, street.npcLaneY - 60, 120);
     return;
   }
-  if (!ap.cpark) ap.cpark = { phase: "approach", t: 0 };
   const p = ap.cpark;
   const setPhase = (phase) => { p.phase = phase; p.t = 0; };
   p.t += dt;
@@ -2883,15 +3004,29 @@ function apParkCaravan(car, ap, dt) {
   const stopAt = space.x1 - AP_CARAVAN_STOP_SHORT;
 
   if (p.phase === "approach") {
-    const d = apDriveTo(car, ap, clamp(space.x0 - 260, 80, W - 80), lineY - 50, 150);
+    // Coming from the right, it will arrive pointing the wrong way. So it
+    // aims higher, AP_CARAVAN_TURN_UP above the line, and U-turns down onto
+    // it (see "line"). Arriving at the usual height and U-turning up, away
+    // from the curb, left it ~150 px above the line with too little room to
+    // come down before the space. It went round and did the same again,
+    // forever: both caravan spaces are often at the left end of the row.
+    const ax = clamp(space.x0 - 260, 80, W - 80);
+    if (p.t <= dt) p.fromRight = car.pos.x > ax + 40;
+    const d = apDriveTo(car, ap, ax, lineY - (p.fromRight ? AP_CARAVAN_TURN_UP : 50), 150);
     apCheckStuck(car, ap, dt, ap.drive.throttle !== 0);
     if (d < 90) setPhase("line");
   } else if (p.phase === "line") {
     // Pointing the wrong way (say, arriving from the right), it turns round
     // toward the road, never toward the curb: turning the other way wedged
-    // its nose against the parked car at the end of the row.
+    // its nose against the parked car at the end of the row. The way to
+    // turn is picked once and kept until it's round: picked afresh every
+    // step, a rig pointing straight up (cos ~ 0) flipped from full left to
+    // full right and back, drove straight on up and stuck at the top wall.
     const err = wrapAngle(Math.atan2(lineY - car.pos.y, 90) - car.angle);
-    const steer = Math.abs(err) > 1.6 ? (Math.cos(car.angle) >= 0 ? -1 : 1) : apSteerAt(car, car.pos.x + 90, lineY);
+    // Well above the line, it U-turns down onto it instead.
+    if (Math.abs(err) <= 1.6) p.turnDir = 0;
+    else if (!p.turnDir) p.turnDir = (Math.cos(car.angle) >= 0 ? -1 : 1) * (car.pos.y < lineY - AP_CARAVAN_TURN_UP + 30 ? -1 : 1);
+    const steer = p.turnDir ? p.turnDir : apSteerAt(car, car.pos.x + 90, lineY);
     ap.drive.steer = apCaravanForwardSteer(car, steer);
     ap.drive.throttle = apThrottleFor(car, 70);
     apCheckStuck(car, ap, dt, true);
@@ -2920,6 +3055,263 @@ function apParkCaravan(car, ap, dt) {
   }
 }
 
+// ---- Phase 4: reversing into a campsite pitch ------------------------------
+// Steering a real reverse into a slot is a control problem; this cheats,
+// deliberately (the user's idea: "let the caravan pull the car"). The
+// autopilot drives normally to line up -- along the aisle below the
+// campsite toward the pitch (from whichever side it's on), until the
+// caravan's axle is about a turning radius past it. Then the reverse itself
+// is scripted (car.towedBack):
+// - the caravan's axle is moved along a planned path: a quarter circle from
+//   the aisle round into the pitch, then straight back to where a parked
+//   caravan's axle sits (apCampTowPath)
+// - the car is dragged behind the caravan's hitch by the same follow-the-
+//   hitch rule a caravan normally uses to follow a car. A towed thing
+//   trailing behind is stable, so the car follows smoothly, and it reads as
+//   a real reverse-in; its front wheels are turned to match its actual
+//   curve (from its yaw rate and speed)
+// While towed back, the car skips stepCar and the caravan skips its own
+// update and collisions (update); other cars still collide with the car.
+// If anyone comes within AP_CAMP_CLEARANCE it waits; blocked for
+// AP_CAMP_WAIT_MAX, or lined up badly, it drives off and comes round again.
+const AP_CAMP_LINE_GAP = 36; // px below the pitches' opening: the line it lines up along
+const AP_CAMP_ARC_R = 70; // px: the quarter circle the caravan's axle backs round
+const AP_CAMP_TURN_DROP = 90; // px below the line: where it arrives to line up, with room to U-turn either way
+const AP_CAMP_ARC_MIN = 45, AP_CAMP_ARC_MAX = 110; // px: stopped outside these, it goes round again
+const AP_CAMP_REVERSE_SPEED = 30; // px/s along the path
+const AP_CAMP_CLEARANCE = 36; // px: anyone this close to the rig makes it wait
+const AP_CAMP_WAIT_MAX = 4; // s
+
+// Is another player (car or caravan) in this pitch?
+function pitchTaken(p, except) {
+  return [car1, car2].some((c) => {
+    if (c === except) return false;
+    const pts = [c.pos];
+    if (c.caravan) pts.push(caravanPoint(c, CARAVAN.tongue + CARAVAN.length / 2));
+    return pts.some((q) => q.x > p.x0 && q.x < p.x1 && q.y > p.y0 && q.y < p.y1 + 10);
+  });
+}
+
+// Where a parked caravan's axle sits in pitch p: car front just inside the
+// opening, as buildCampsite parks the rigs.
+function campAxleY(p) {
+  return p.y1 - 6 - CAR.length / 2 - CARAVAN.hitchBack - CARAVAN.axleBack;
+}
+
+// The caravan axle's path from (ax, ay) into pitch p, for a rig that lined
+// up heading dir (+1 right, -1 left): a quarter circle of radius
+// R = (ax - cx) * dir round to straight up, then straight back. at(s) gives
+// the point and the direction of travel s px along it.
+function apCampTowPath(ax, ay, p, dir) {
+  const cx = (p.x0 + p.x1) / 2, R = (ax - cx) * dir, arc = (R * Math.PI) / 2;
+  const straight = ay - R - campAxleY(p);
+  if (R < AP_CAMP_ARC_MIN || R > AP_CAMP_ARC_MAX || straight < 0) return null;
+  return {
+    length: arc + straight,
+    at(s) {
+      if (s <= arc) {
+        const phi = Math.PI / 2 + s / R;
+        return { x: ax + dir * R * Math.cos(phi), y: ay - R + R * Math.sin(phi), dx: -dir * Math.sin(phi), dy: Math.cos(phi) };
+      }
+      return { x: cx, y: ay - R - (s - arc), dx: 0, dy: -1 };
+    },
+  };
+}
+
+// One step of the scripted reverse: the caravan moves along the path, and
+// pulls the car. Returns true when it's there.
+function apCampTowStep(car, t, dt) {
+  const cv = car.caravan;
+  t.s = Math.min(t.path.length, t.s + AP_CAMP_REVERSE_SPEED * dt);
+  const p = t.path.at(t.s);
+  cv.angle = Math.atan2(-p.dy, -p.dx); // the caravan points back toward the car, against the way it's going
+  cv.axle = { x: p.x, y: p.y };
+  const hx = p.x + Math.cos(cv.angle) * CARAVAN.axleBack, hy = p.y + Math.sin(cv.angle) * CARAVAN.axleBack;
+  // the car follows its hitch, like a caravan follows a car
+  const dx = car.pos.x - hx, dy = car.pos.y - hy, d = Math.hypot(dx, dy) || 1;
+  const before = { x: car.pos.x, y: car.pos.y, a: car.angle };
+  car.angle = Math.atan2(dy, dx);
+  car.pos.x = hx + (dx / d) * CARAVAN.hitchBack;
+  car.pos.y = hy + (dy / d) * CARAVAN.hitchBack;
+  car.vel.x = (car.pos.x - before.x) / dt;
+  car.vel.y = (car.pos.y - before.y) / dt;
+  car.angularVel = wrapAngle(car.angle - before.a) / dt;
+  // front wheels to match the curve: reversing at speed v, yaw rate w means
+  // a steering angle of atan(w * wheelBase / -v)
+  const v = Math.max(1, Math.hypot(car.vel.x, car.vel.y));
+  car.steerCurrent = clamp(Math.atan((car.angularVel * CAR.wheelBase) / -v), -CAR.maxSteer * 1.15, CAR.maxSteer * 1.15);
+  return t.s >= t.path.length;
+}
+
+// Where a reverse into pitch works: the stretch of aisle it lines up in (the
+// caravan's axle stops AP_CAMP_ARC_R past the pitch, the car beyond that)
+// plus what it sweeps backing in.
+function campZone(pitch, dir) {
+  const cx = (pitch.x0 + pitch.x1) / 2, far = cx + dir * 210;
+  return { x0: Math.min(cx - 40, far), x1: Math.max(cx + 40, far), y0: pitch.y1 - 20, y1: pitch.y1 + AP_CAMP_LINE_GAP + 40 };
+}
+
+// Should it hold back? If the other player's rig is in its zone -- or, for
+// two autopilots whose zones overlap, if the other is already reversing in
+// (or lining up, and P1 goes first). Two autopilots lining up along the same
+// stretch of aisle blocked each other's reverse, gave up, went round and met
+// again, for minutes; a first, cruder rule (anyone within 260 px of the
+// pitch) made one of them wait out the other's every park, even at a
+// different pitch.
+function campAisleBusy(car, pitch, dir) {
+  const other = car === car1 ? car2 : car1;
+  const mine = campZone(pitch, dir);
+  const oc = other.autopilot && other.ap.camp;
+  if (oc && oc.pitch && (oc.phase === "line" || oc.phase === "tow")) {
+    const theirs = campZone(oc.pitch, oc.dir);
+    const overlap = mine.x0 < theirs.x1 && theirs.x0 < mine.x1;
+    if (overlap && (other.towedBack || (oc.phase === "line" && car === car2))) return true;
+  }
+  const pts = [other.pos];
+  if (other.caravan) for (const cs of CARAVAN.circles) pts.push(caravanPoint(other, cs));
+  return pts.some((q) => q.x > mine.x0 - 20 && q.x < mine.x1 + 20 && q.y > mine.y0 && q.y < mine.y1 + 20);
+}
+
+function apEndTow(car) {
+  car.towedBack = false;
+  car.vel.x = car.vel.y = 0;
+  car.angularVel = 0;
+}
+
+function apParkCamp(car, ap, dt) {
+  if (!ap.camp) ap.camp = { phase: "approach", t: 0, pitch: null, tow: null, wait: 0, dir: 1, side: 0 };
+  const p = ap.camp;
+  const setPhase = (phase) => {
+    p.phase = phase;
+    p.t = 0;
+    p.wait = 0;
+    if (phase === "approach") p.side = 0; // decided afresh on the way in, then kept
+  };
+  p.t += dt;
+  // A free pitch nobody else is in, the nearest one -- but not the one the
+  // other autopilot is going for, if there's a choice: both heading for the
+  // same pitch, they kept giving way to each other at the same spot.
+  const other = car === car1 ? car2 : car1;
+  const theirs = other.autopilot && other.ap.camp ? other.ap.camp.pitch : null;
+  if (!p.pitch || (p.phase !== "tow" && (pitchTaken(p.pitch, car) || (p.pitch === theirs && car === car2)))) {
+    let open = freePitches().filter((q) => !pitchTaken(q, car));
+    if (open.length > 1) open = open.filter((q) => q !== theirs);
+    p.pitch = open.sort((a, b) => Math.abs((a.x0 + a.x1) / 2 - car.pos.x) - Math.abs((b.x0 + b.x1) / 2 - car.pos.x))[0] || null;
+    if (!p.pitch) {
+      apDriveTo(car, ap, W / 2, campsite.area.y1 + 120, 120); // both taken: circle below and wait
+      return;
+    }
+    if (p.phase !== "approach") setPhase("approach");
+  }
+  const pitch = p.pitch, cx = (pitch.x0 + pitch.x1) / 2;
+  const lineY = pitch.y1 + AP_CAMP_LINE_GAP;
+  const hitch = wrapAngle(car.caravan.angle - car.angle);
+  const axle = car.caravan.axle;
+  const towardPitch = Math.cos(car.angle) * p.dir; // 1: heading straight along the line toward (and past) the pitch
+
+  if (p.phase === "approach") {
+    // to the line, on whichever side of the pitch it's on; it will line up
+    // heading toward the pitch (dir), and reverse round from past it
+    // Decided once per attempt: recomputing it every step flipped the target
+    // back and forth as it looped round past the pitch.
+    if (!p.side) p.side = car.pos.x < cx ? -1 : 1;
+    const side = p.side;
+    p.dir = -side;
+    // (well clear of the side walls: a rig that overshot into one wedged there for minutes)
+    const d = apDriveTo(car, ap, clamp(cx + side * 240, 170, W - 170), lineY + AP_CAMP_TURN_DROP, 130);
+    apCheckStuck(car, ap, dt, ap.drive.throttle !== 0);
+    if (d < 70) setPhase(campAisleBusy(car, pitch, p.dir) ? "hold" : Math.cos(car.angle) * p.dir > 0.3 ? "line" : "turn");
+  } else if (p.phase === "hold") {
+    // the aisle is busy: wait out of the way, below it
+    const d = apDriveTo(car, ap, clamp(cx - p.dir * 240, 170, W - 170), lineY + AP_CAMP_TURN_DROP + 60, 100);
+    if (d < 40) {
+      ap.drive.throttle = apStop(car);
+      ap.drive.steer = 0;
+    }
+    apCheckStuck(car, ap, dt, ap.drive.throttle !== 0);
+    p.wait = campAisleBusy(car, pitch, p.dir) ? 0 : p.wait + dt;
+    if (p.wait > 1) {
+      p.wait = 0;
+      setPhase("approach");
+    }
+  } else if (p.phase === "turn") {
+    // Facing away from the pitch: one wide U-turn in the open lot, the short
+    // way round -- unless that swings it up into the campsite, then the long
+    // way. (Always turning downward looped two thirds of a circle onto the
+    // road whenever it happened to be facing up.)
+    const err = wrapAngle((p.dir > 0 ? 0 : Math.PI) - car.angle);
+    const toUp = wrapAngle(-Math.PI / 2 - car.angle);
+    const shortPassesUp = Math.sign(toUp) === Math.sign(err) && Math.abs(toUp) < Math.abs(err);
+    const way = shortPassesUp && car.pos.y < campsite.area.y1 + 140 ? -Math.sign(err) : Math.sign(err);
+    ap.drive.steer = apCaravanForwardSteer(car, way || 1);
+    ap.drive.throttle = apThrottleFor(car, 45);
+    apCheckStuck(car, ap, dt, true);
+    if (towardPitch > 0.7) setPhase("line");
+    if (p.t > 12) setPhase("approach");
+  } else if (p.phase === "line") {
+    // Someone in the way: brake and wait a moment -- usually they're just
+    // passing. Going round again at once cost 10-20s every time.
+    if (campAisleBusy(car, pitch, p.dir)) {
+      ap.drive.throttle = apStop(car);
+      ap.drive.steer = 0;
+      p.wait += dt;
+      if (p.wait > AP_CAMP_WAIT_MAX + 2) setPhase("hold");
+      return;
+    }
+    p.wait = 0;
+    ap.drive.steer = apCaravanForwardSteer(car, apSteerAt(car, car.pos.x + p.dir * 90, lineY));
+    // stop once the caravan's axle is a turning radius past the pitch
+    const toStop = (cx + p.dir * AP_CAMP_ARC_R - axle.x) * p.dir;
+    ap.drive.throttle = toStop > 2 ? apThrottleFor(car, Math.min(60, 8 + toStop)) : apStop(car);
+    apCheckStuck(car, ap, dt, true);
+    if (toStop <= 2 && speedOf(car) < 2) {
+      const linedUp = towardPitch > 0.97 && Math.abs(hitch) < 0.25 && Math.abs(axle.y - lineY) < 12;
+      const path = linedUp ? apCampTowPath(axle.x, axle.y, pitch, p.dir) : null;
+      if (path) {
+        p.tow = { path, s: 0 };
+        car.towedBack = true;
+        setPhase("tow");
+      } else setPhase("leave");
+    }
+    if (towardPitch < 0 || p.t > 20 || toStop < -80) setPhase("leave");
+  } else if (p.phase === "tow") {
+    ap.drive.throttle = ap.drive.steer = 0;
+    // anyone in the way: wait for them (and give up if they don't move)
+    const rig = [car.pos, ...CARAVAN.circles.map((cs) => caravanPoint(car, cs))];
+    const others = [car1, car2, ...npcs].filter((o) => o !== car);
+    const blocked = others.some((o) => {
+      const pts = [o.pos];
+      if (o.caravan) for (const cs of CARAVAN.circles) pts.push(caravanPoint(o, cs));
+      return pts.some((q) => rig.some((r) => Math.hypot(q.x - r.x, q.y - r.y) < AP_CAMP_CLEARANCE));
+    });
+    if (blocked) {
+      car.vel.x = car.vel.y = 0;
+      p.wait += dt;
+      if (p.wait > AP_CAMP_WAIT_MAX) {
+        apEndTow(car);
+        setPhase("leave");
+      }
+      return;
+    }
+    p.wait = 0;
+    if (apCampTowStep(car, p.tow, dt)) {
+      apEndTow(car);
+      setPhase("check");
+    }
+  } else if (p.phase === "check") {
+    ap.drive.throttle = apStop(car);
+    ap.drive.steer = 0;
+    // parked now, the coin race moves it on; still here after a moment, retry
+    if (p.t > 1) setPhase("leave");
+  } else if (p.phase === "leave") {
+    // pull out forward, away from the campsite, and come round again
+    ap.drive.throttle = apThrottleFor(car, 70);
+    ap.drive.steer = apCaravanForwardSteer(car, apSteerAt(car, car.pos.x + Math.sign(Math.cos(car.angle) || 1) * 90, lineY + 90));
+    apCheckStuck(car, ap, dt, true);
+    if (p.t > 2.5) setPhase("approach");
+  }
+}
+
 function updateAutopilot(car, dt) {
   const ap = car.ap;
   ap.wobblePhase += dt * (1.3 + ap.sloppy);
@@ -2933,7 +3325,8 @@ function updateAutopilot(car, dt) {
   const goal = apPickGoal(car, ap, dt);
   if (goal !== ap.goal) {
     ap.goal = goal;
-    ap.park = ap.garage = ap.cpark = null;
+    ap.park = ap.garage = ap.cpark = ap.camp = null;
+    if (car.towedBack) apEndTow(car);
     if (goal !== "harass") ap.harass = null;
   }
 
@@ -2948,6 +3341,8 @@ function updateAutopilot(car, dt) {
     apHarass(car, ap, dt);
   } else if (goal === "garage") {
     apGarage(car, ap, dt);
+  } else if (car.gamePhase >= 4 && car.caravan) {
+    apParkCamp(car, ap, dt);
   } else if (car.caravan) {
     apParkCaravan(car, ap, dt);
   } else {
@@ -3659,7 +4054,7 @@ let rebuildTimer = null;
 window.addEventListener("resize", () => {
   clearTimeout(rebuildTimer);
   rebuildTimer = setTimeout(() => {
-    crates = buildCrates();
+    campsite = buildCampsite();
     const oldLaneY = street.npcLaneY, oldCurbY = street.curbY;
     street = buildStreet();
     resetParkers(); // a fresh parked row for the new layout (cars mid-maneuver just vanish)
@@ -3718,7 +4113,7 @@ function update(dt) {
     car.prevPos = { x: car.pos.x, y: car.pos.y };
     car.prevAngle = car.angle;
   }
-  for (const car of movers) stepCar(car, dt);
+  for (const car of movers) if (!car.towedBack) stepCar(car, dt); // towed back: see apParkCamp
 
   // Only the players are fenced in by the arena walls -- traffic enters and
   // leaves through the side edges (see updateTraffic).
@@ -3727,13 +4122,13 @@ function update(dt) {
 
   for (const car of movers) {
     resolveCurb(car);
-    for (const c of crates) resolveCarVsStaticCircle(car, { x: c.x, y: c.y }, c.r, c);
+    for (const c of campsite.circles) resolveCarVsStaticCircle(car, { x: c.x, y: c.y }, c.r, c.key);
   }
   for (let i = 0; i < movers.length; i++) {
     for (let j = i + 1; j < movers.length; j++) resolveCarVsCar(movers[i], movers[j]);
   }
-  for (const car of [car1, car2]) if (car.caravan) updateCaravan(car);
-  for (const car of [car1, car2]) if (car.caravan) resolveCaravanCollisions(car);
+  for (const car of [car1, car2]) if (car.caravan && !car.towedBack) updateCaravan(car);
+  for (const car of [car1, car2]) if (car.caravan && !car.towedBack) resolveCaravanCollisions(car);
 
   updateCoin(dt);
   updateCoinRace();
@@ -3753,9 +4148,9 @@ function update(dt) {
 // from frame to frame (no "line boil" shimmer while you drive).
 //
 // Everything that never moves -- ground, street, sidewalk, lawn, the garage
-// building, crates, parked cars -- is drawn once into `staticLayer` by
+// building, the campsite -- is drawn once into `staticLayer` by
 // buildStaticLayer() and blitted each frame. It MUST be rebuilt whenever
-// street/crates are rebuilt (setupWorld and the resize handler), or the
+// street/campsite are rebuilt (setupWorld and the resize handler), or the
 // picture drifts away from the collision geometry.
 
 const INK = "#231f2e";
@@ -3772,8 +4167,8 @@ const PAL = {
   garageWall: "#f29bc4",
   garageRoof: "#d377a6",
   garageDoor: "#aac6e2",
-  crate: "#dd9a4e",
-  crateDark: "#a4652b",
+  gravel: "#e9d6a8",
+  gravelDark: "#b89e6a",
   glass: "#b3e6ff",
   headlight: "#fff3a6",
   taillight: "#ff5a4f",
@@ -3901,7 +4296,7 @@ function buildStaticLayer() {
   drawGround(c);
   drawStreetArt(c);
   drawGarageBuilding(c);
-  for (const cr of crates) drawCrate(c, cr);
+  drawCampsite(c);
   drawPaperGrain(c);
 }
 
@@ -3962,11 +4357,14 @@ function drawStreetArt(c) {
   inkLine(c, -5, curbY - 3, W + 5, curbY - 3, 31, 2.5);
   inkLine(c, -5, curbY + 4, W + 5, curbY + 4, 37, 2);
 
-  // parking bays: a painted mark at each end of every bay (the "P" on free
-  // bays is drawn live, by drawParkingTargets, since they come and go)
+  // parking bays: a painted mark at each end of every bay, and a "P" painted
+  // in every bay but the end ones (which always stay parked in). The parked
+  // cars cover theirs, so the free bays show a "P". It used to be drawn live
+  // on free bays only, and sometimes didn't show.
   for (const x of [bays[0].x0, ...bays.map((b) => b.x1)]) {
     inkShape(c, roundRectPoints(x - 2, curbY - 15, 4, 13, 2, 4), "#ffffff", 1.5);
   }
+  for (const b of bays) if (!b.end) inkText(c, "P", (b.x0 + b.x1) / 2, street.carCenterY, 17, "#ffffff");
 }
 
 // A polygon's outline as points, edges subdivided every `step` px -- so
@@ -4019,15 +4417,42 @@ function drawGarageBuilding(c) {
   for (let y = by0 + 3; y < by0 + doorH - 3; y += 4.5) inkLine(c, g.doorX0 + 3, y, g.doorX1 - 3, y, y, 1, "rgba(35,31,46,0.45)", 0.3);
 }
 
-function drawCrate(c, cr) {
-  const s = cr.r, x0 = cr.x - s, y0 = cr.y - s, seed = cr.x * 0.37 + cr.y * 1.3;
-  tracePath(c, roundRectPoints(x0 + 3, y0 + 4, s * 2, s * 2, 3, 6));
+// The campsite (see buildCampsite): a grass strip with a round bush between
+// each pair of pitches at the back, a gravel pad per pitch, and the parked
+// rigs -- caravan first, so the car sits on top at the hitch, as on the road.
+function drawCampsite(c) {
+  const { area, pitches, rigs, bushes } = campsite;
+  tracePath(c, roundRectPoints(area.x0 + 3, area.y0 + 4, area.x1 - area.x0, area.y1 - area.y0, 14, 8));
   c.fillStyle = PAL.shadow;
   c.fill();
-  inkShape(c, wobble(roundRectPoints(x0, y0, s * 2, s * 2, 3, 5), seed, 0.8), PAL.crate, 2.5);
-  inkShape(c, wobble(roundRectPoints(x0 + 4, y0 + 4, s * 2 - 8, s * 2 - 8, 2, 5), seed + 1, 0.5), null, 1.5, PAL.crateDark);
-  inkLine(c, x0 + 5, y0 + s * 2 - 5, x0 + s * 2 - 5, y0 + 5, seed, 2.2, PAL.crateDark, 0.6);
-  inkLine(c, x0 + 4, y0 + 3, x0 + s, y0 + 3, seed + 2, 1.5, "rgba(255,255,255,0.55)", 0.3);
+  inkShape(c, wobble(roundRectPoints(area.x0, area.y0, area.x1 - area.x0, area.y1 - area.y0, 14, 8), 71, 1), PAL.lawn, 2.5);
+  for (const p of pitches) {
+    const seed = p.x0 * 0.7;
+    const pad = pitchPad(p);
+    inkShape(c, wobble(roundRectPoints(pad.x0, pad.y0, pad.x1 - pad.x0, pad.y1 - pad.y0, 5, 6), seed, 0.6), PAL.gravel, 1.5);
+    for (let k = 0; k < 7; k++) { // a few pebbles
+      const px = p.x0 + 8 + hash01(seed + k) * (p.x1 - p.x0 - 16), py = p.y0 + 8 + hash01(seed + k + 20) * (p.y1 - p.y0 - 12);
+      c.beginPath();
+      c.arc(px, py, 1.2, 0, Math.PI * 2);
+      c.fillStyle = PAL.gravelDark;
+      c.fill();
+    }
+  }
+  for (const b of bushes) {
+    tracePath(c, roundRectPoints(b.x - b.r + 3, b.y - b.r + 3, b.r * 2, b.r * 2, b.r, 5));
+    c.fillStyle = PAL.shadow;
+    c.fill();
+    inkShape(c, wobble(roundRectPoints(b.x - b.r, b.y - b.r, b.r * 2, b.r * 2, b.r, 5), b.x, 2), PAL.lawnDark, 2);
+    for (let k = 0; k < 3; k++) { // a few leafy tufts
+      const a = b.x + k * 2.1, tx = b.x + Math.cos(a) * b.r * 0.45, ty = b.y + Math.sin(a) * b.r * 0.45;
+      inkLine(c, tx - 3, ty + 2, tx, ty - 3, a, 1.3, INK, 0.4);
+      inkLine(c, tx, ty - 3, tx + 3, ty + 2, a + 0.5, 1.3, INK, 0.4);
+    }
+  }
+  for (const rig of rigs) {
+    drawCaravan(c, rig);
+    drawCar(c, rig);
+  }
 }
 
 // Scattered ink specks and a soft vignette over the whole static scene --
@@ -4167,14 +4592,18 @@ function drawDents(c, body, dents) {
 // and go, so this is drawn live rather than in the static layer. They used
 // to pulse in the color of any player who must park; that went, on request,
 // when the HUD started saying "Next: Park".
-function drawParkingTargets() {
-  for (const b of freeBays()) inkText(ctx, "P", (b.x0 + b.x1) / 2, street.carCenterY, 17, "#ffffff");
+// In game phase 4, the free campsite pitches pulse blue/orange for every
+// player who must park there.
+function drawCampTargets() {
+  const waiting = [car1, car2].filter((c) => c.gameState === "mustPark" && c.gamePhase >= 4);
+  drawTargetPulse(waiting, freePitches().map((p) => ({ x: p.x0 + 2, y: p.y0, w: p.x1 - p.x0 - 4, h: p.y1 - p.y0 + 4 })));
 }
 
 // The shared "go here" cue: each rect pulses (tinted fill + outline) in the
 // color of every car in `cars`. With two cars, their pulses run half a cycle
-// apart so the colors alternate. Used for the garage pad (the parking bays
-// used it too, until the HUD started saying "Next: Park").
+// apart so the colors alternate. Used for the garage pad and the campsite's
+// free pitches (the parking bays used it too, until the HUD started saying
+// "Next: Park").
 function drawTargetPulse(cars, rects) {
   if (!cars.length) return;
   const now = performance.now() / 1000;
@@ -4402,14 +4831,14 @@ function drawWrench(x, y, color) {
 // The HUD is deliberately minimal: each player's badge is just their label
 // and coin count. The key hint shows only until that player first drives,
 // and the bottom hint line fades out after HINT_SECONDS or the first coin
-// pickup. Game state is shown in the world instead (drawParkingTargets, the
+// pickup. Game state is shown in the world instead (the painted P's, the
 // garage pad flash) -- keep it that way rather than adding status text back.
 const titleEl1 = document.getElementById("p1-title");
 const titleEl2 = document.getElementById("p2-title");
 const scoreEl1 = document.getElementById("p1-score");
 const scoreEl2 = document.getElementById("p2-score");
-const painEl1 = document.getElementById("p1-pain");
-const painEl2 = document.getElementById("p2-pain");
+const phaseEl1 = document.getElementById("p1-phase");
+const phaseEl2 = document.getElementById("p2-phase");
 const nextEl1 = document.getElementById("p1-next");
 const nextEl2 = document.getElementById("p2-next");
 const autoBtn1 = document.getElementById("p1-auto");
@@ -4426,16 +4855,16 @@ for (const [btn, getCar] of [[autoBtn1, () => car1], [autoBtn2, () => car2]]) {
   });
 }
 
-function updateHud(car, titleEl, scoreEl, autoBtn, painEl, nextEl) {
+function updateHud(car, titleEl, scoreEl, autoBtn, phaseEl, nextEl) {
   const title = car.hasDriven ? car.label : `${car.label} — ${car.keyHint}`;
   if (titleEl.textContent !== title) titleEl.textContent = title;
   const score = String(car.score);
   if (scoreEl.textContent !== score) scoreEl.textContent = score;
-  // "<pain level>:<the coin about to be taken>", counting from 1: "2:1" is
-  // level 2, going for its first coin. At the top level it keeps counting.
-  const pain = `${car.level}:${car.levelCoins + 1}`;
-  if (painEl.textContent !== pain) painEl.textContent = pain;
-  const next = car.gameState === "mustPark" ? "Next: Park" : "Next: Coin";
+  // "<game phase>:<the coin about to be taken>", counting from 1: "2:1" is
+  // phase 2, going for its first coin. In the last phase it keeps counting.
+  const phase = `${car.gamePhase}:${car.phaseCoins + 1}`;
+  if (phaseEl.textContent !== phase) phaseEl.textContent = phase;
+  const next = car.gameState !== "mustPark" ? "Next: Coin" : car.gamePhase >= 4 ? "Next: Camp" : "Next: Park";
   if (nextEl.textContent !== next) nextEl.textContent = next;
   const on = !!car.autopilot;
   if (autoBtn.classList.contains("on") !== on) {
@@ -4547,8 +4976,8 @@ function render() {
     buildStaticLayer();
     staticDirty = false;
   }
-  ctx.drawImage(staticLayer, 0, 0); // ground, street, garage building, crates
-  drawParkingTargets();
+  ctx.drawImage(staticLayer, 0, 0); // ground, street, garage building, campsite
+  drawCampTargets();
   drawGaragePad();
   drawGarageDoor();
   drawPedestrians();
@@ -4561,8 +4990,8 @@ function render() {
   drawCar(ctx, car2);
   drawParticles();
 
-  updateHud(car1, titleEl1, scoreEl1, autoBtn1, painEl1, nextEl1);
-  updateHud(car2, titleEl2, scoreEl2, autoBtn2, painEl2, nextEl2);
+  updateHud(car1, titleEl1, scoreEl1, autoBtn1, phaseEl1, nextEl1);
+  updateHud(car2, titleEl2, scoreEl2, autoBtn2, phaseEl2, nextEl2);
   updateHint();
 }
 
