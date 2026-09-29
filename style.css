@@ -75,9 +75,9 @@ canvas {
   box-sizing: border-box;
 }
 
-/* Pain level and the coin about to be taken ("2:1"), then what's next
+/* Game phase and the coin about to be taken ("2:1"), then what's next
    ("Next: Park"). */
-.hud-pain {
+.hud-phase {
   font-size: 16px;
   font-weight: 900;
 }

@@ -14,7 +14,7 @@
       <div class="hud-row">
         <span id="p1-title" class="hud-title">P1 &mdash; WASD</span>
         <span class="hud-coins"><span class="coin-icon"></span><span id="p1-score">0</span></span>
-        <span id="p1-pain" class="hud-pain" title="Pain level : the coin you're about to take">1:1</span>
+        <span id="p1-phase" class="hud-phase" title="Game phase : the coin you're about to take">1:1</span>
         <button id="p1-auto" class="auto-btn" type="button" aria-pressed="false">Autopilot</button>
       </div>
       <span id="p1-next" class="hud-title hud-next">Next: Coin</span>
@@ -22,7 +22,7 @@
     <div class="hud-panel hud-p2">
       <div class="hud-row">
         <button id="p2-auto" class="auto-btn" type="button" aria-pressed="false">Autopilot</button>
-        <span id="p2-pain" class="hud-pain" title="Pain level : the coin you're about to take">1:1</span>
+        <span id="p2-phase" class="hud-phase" title="Game phase : the coin you're about to take">1:1</span>
         <span class="hud-coins"><span class="coin-icon"></span><span id="p2-score">0</span></span>
         <span id="p2-title" class="hud-title">P2 &mdash; IJKL / Arrows</span>
       </div>
@@ -30,7 +30,7 @@
     </div>
   </div>
 
-  <div id="hint" class="hint">Race for coins &middot; every 3 coins the pain goes up: parallel parking, then a caravan &middot; stop at the garage to repair for 1 coin</div>
+  <div id="hint" class="hint">Race for coins &middot; every 3 coins a new phase: parallel parking, then a caravan, then camping &middot; stop at the garage to repair for 1 coin</div>
 
   <script src="game.js"></script>
 </body>
