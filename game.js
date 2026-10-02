@@ -2828,19 +2828,103 @@ function apAvoid(car, ap, steer) {
   return steer;
 }
 
+// The campsite is a no-go zone for an autopilot that isn't camping: driving
+// straight at a coin beside the campsite took it in among the pitches, where
+// it nosed into a free one. The zone is the grass strip grown by
+// AP_CAMP_KEEP_OUT, and runs up to the top wall, closing the lane above the
+// bushes too. A path through it goes round the bottom corners instead.
+// (Coins never land in it: COIN_CAMP_GAP is wider.)
+const AP_CAMP_KEEP_OUT = 28; // px round the grass strip
+const AP_CAMP_CORNER = 30; // px further out: the waypoints round its corners
+
+function campNoGoZone() {
+  const a = campsite.area, m = AP_CAMP_KEEP_OUT;
+  return { x0: a.x0 - m, x1: a.x1 + m, y0: -1e4, y1: a.y1 + m };
+}
+
+function inRect(r, x, y) {
+  return x > r.x0 && x < r.x1 && y > r.y0 && y < r.y1;
+}
+
+// Does the segment (ax, ay)-(bx, by) pass through rectangle r? (Liang-Barsky)
+function segmentHitsRect(ax, ay, bx, by, r) {
+  const dx = bx - ax, dy = by - ay;
+  let t0 = 0, t1 = 1;
+  for (const [p, q] of [[-dx, ax - r.x0], [dx, r.x1 - ax], [-dy, ay - r.y0], [dy, r.y1 - ay]]) {
+    if (p === 0) {
+      if (q <= 0) return false;
+    } else {
+      const t = q / p;
+      if (p < 0) t0 = Math.max(t0, t);
+      else t1 = Math.min(t1, t);
+      if (t0 >= t1) return false;
+    }
+  }
+  return true;
+}
+
+// Where to drive instead of (tx, ty), keeping out of the campsite.
+function apKeepOut(car, tx, ty) {
+  const z = campNoGoZone(), x = car.pos.x, y = car.pos.y;
+  if (inRect(z, tx, ty)) return { x: tx, y: ty }; // it's meant to be in there
+  if (inRect(z, x, y)) {
+    // already in it: down out of the pitches, or off the end of the lane
+    // above the bushes (which reaches a little into the grass)
+    const a = campsite.area;
+    if (y > CAMP_TOP + CAMP_BUSH_Y && x > a.x0 && x < a.x1) return { x, y: z.y1 + AP_CAMP_CORNER };
+    return { x: x < (z.x0 + z.x1) / 2 ? z.x0 - AP_CAMP_CORNER : z.x1 + AP_CAMP_CORNER, y };
+  }
+  if (!segmentHitsRect(x, y, tx, ty, z)) return { x: tx, y: ty };
+  // round one bottom corner, or both, whichever is shorter and clear
+  const left = { x: z.x0 - AP_CAMP_CORNER, y: z.y1 + AP_CAMP_CORNER };
+  const right = { x: z.x1 + AP_CAMP_CORNER, y: z.y1 + AP_CAMP_CORNER };
+  let best = null, bestLen = Infinity;
+  for (const route of [[left], [right], [left, right], [right, left]]) {
+    const pts = [{ x, y }, ...route, { x: tx, y: ty }];
+    let len = 0, clear = true;
+    for (let i = 1; i < pts.length; i++) {
+      len += Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y);
+      if (segmentHitsRect(pts[i - 1].x, pts[i - 1].y, pts[i].x, pts[i].y, z)) clear = false;
+    }
+    if (clear && len < bestLen) {
+      bestLen = len;
+      best = route[0];
+    }
+  }
+  return best || { x: tx, y: ty };
+}
+
 // Drive toward (tx, ty) at up to `cruise`. Handles its own clumsy
-// three-point turns and backing out when wedged. Returns the distance left.
+// three-point turns and backing out when wedged, and keeps out of the
+// campsite unless it's camping. Returns the distance left to (tx, ty).
 function apDriveTo(car, ap, tx, ty, cruise, { avoid = true } = {}) {
-  const dx = tx - car.pos.x, dy = ty - car.pos.y, dist = Math.hypot(dx, dy);
+  const dist = Math.hypot(tx - car.pos.x, ty - car.pos.y);
+  const keepOut = !(ap.goal === "park" && car.gamePhase >= 4);
+  if (keepOut) ({ x: tx, y: ty } = apKeepOut(car, tx, ty));
+  const dx = tx - car.pos.x, dy = ty - car.pos.y;
   let err = wrapAngle(Math.atan2(dy, dx) - car.angle);
   const speed = speedOf(car);
   // Turning round on the curb side of the road: always turn toward the road.
   // Turning the other way points the car into the curb and the parked cars,
   // where it wedges itself in the corner.
-  if (Math.abs(err) > 2 && car.pos.y > street.centerlineY) err = Math.cos(car.angle) >= 0 ? -Math.PI : Math.PI;
   // Likewise below the campsite: turn round downward, into the open lot --
   // turning up took it round the end of the campsite into the top corner.
-  else if (Math.abs(err) > 2 && car.pos.y < campsite.area.y1 + 160) err = Math.cos(car.angle) >= 0 ? Math.PI : -Math.PI;
+  // The direction is picked once per turn (ap.turnRound): picked afresh
+  // every step, a car pointing straight up flipped between full left and
+  // full right lock and drove straight on, into a free pitch.
+  if (Math.abs(err) < 1.2) ap.turnRound = 0;
+  else if (!ap.turnRound && Math.abs(err) > 2) {
+    if (car.pos.y > street.centerlineY) ap.turnRound = Math.cos(car.angle) >= 0 ? -1 : 1;
+    else if (car.pos.y < campsite.area.y1 + 160) ap.turnRound = Math.cos(car.angle) >= 0 ? 1 : -1;
+  }
+  if (ap.turnRound) err = ap.turnRound * Math.PI;
+  // Nosed into the pitches anyway: back straight out.
+  const a = campsite.area;
+  if (keepOut && ap.reverseTime <= 0 && Math.abs(err) > 2 && inRect(campNoGoZone(), car.pos.x, car.pos.y) &&
+      car.pos.y > CAMP_TOP + CAMP_BUSH_Y && car.pos.x > a.x0 && car.pos.x < a.x1) {
+    ap.reverseTime = 0.8;
+    ap.reverseSteer = 0;
+  }
 
   if (ap.reverseTime > 0) {
     // towing, it backs up slowly and steers the caravan straight behind
@@ -2850,7 +2934,7 @@ function apDriveTo(car, ap, tx, ty, cruise, { avoid = true } = {}) {
   }
   // Target behind and close: back up with opposite lock to swing the nose
   // round. Not with a caravan: that folds it up; it loops round forward.
-  if (!car.caravan && Math.abs(err) > 2 && dist < 110 && speed < 60) {
+  if (!car.caravan && Math.abs(err) > 2 && Math.hypot(dx, dy) < 110 && speed < 60) {
     ap.reverseTime = 0.6 + Math.random() * 0.4;
     ap.reverseSteer = err > 0 ? -1 : 1;
   }
