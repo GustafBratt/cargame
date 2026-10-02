@@ -1361,6 +1361,119 @@ function freePitches() {
   return campsite.pitches.filter((p) => p.free);
 }
 
+// ---------------------------------------------------------------------------
+// Tractors (game phase 5)
+// ---------------------------------------------------------------------------
+// When the first player reaches game phase 5, two tractors drive in along the
+// aisle below the campsite and park across the front of the two free
+// pitches, one each, TRACTOR_GAP below the opening. That blocks backing
+// straight in from below: the rig has to come along the passage between
+// the tractor and the parked rigs, and reverse round a curve into the pitch.
+// TRACTOR_GAP was measured: a steered reverse round a 70 px quarter circle
+// (the caravan's axle) sweeps at most ~64 px below the opening within 30 px
+// of the pitch's middle, and the autopilot's scripted one ~55 px; out to the
+// side, where the car swings, ~77 px, but the tractor isn't there.
+// They collide as static circles in campsite.circles (key: the tractor), so
+// everything that already handles the campsite's rigs -- collisions,
+// sounds, dents, the autopilot's swerving -- handles them too. While driving
+// in, their circles move with them, and they wait (and honk) for anyone in
+// their way.
+const TRACTOR = { length: 52, width: 32 };
+const TRACTOR_CIRCLES = [{ at: -10, r: 16 }, { at: 14, r: 12 }]; // along its length, from its center: the cab over the big rear wheels, the hood
+const TRACTOR_GAP = 70; // px from a pitch's opening to the parked tractor's top edge
+const TRACTOR_SPEED = 80; // px/s
+const TRACTOR_STAGGER = 2.5; // s between the two setting off
+const TRACTOR_COLORS = ["#6cbf4a", "#e2574c"];
+let tractors = [];
+
+function tractorParkY(pitch) {
+  return pitch.y1 + TRACTOR_GAP + TRACTOR.width / 2;
+}
+
+// The lowest edge of the campsite, tractors included.
+function campBottom() {
+  return tractors.reduce((y, t) => Math.max(y, t.y + TRACTOR.width / 2), campsite.area.y1);
+}
+
+function setTractorCircles(t) {
+  for (const [i, tc] of TRACTOR_CIRCLES.entries()) {
+    t.circles[i].x = t.x + Math.cos(t.angle) * tc.at;
+    t.circles[i].y = t.y + Math.sin(t.angle) * tc.at;
+  }
+}
+
+function makeTractor(pitch, i, parked) {
+  // the left one comes from the left edge, the right one from the right, so
+  // neither drives past the other one's spot
+  const fromLeft = i === 0;
+  const targetX = (pitch.x0 + pitch.x1) / 2;
+  const t = {
+    pitch, targetX, y: tractorParkY(pitch),
+    x: parked ? targetX : fromLeft ? -TRACTOR.length : W + TRACTOR.length,
+    angle: fromLeft ? 0 : Math.PI,
+    delay: parked ? 0 : i * TRACTOR_STAGGER,
+    parked, blockedTime: 0, honkAt: 0.7,
+    color: TRACTOR_COLORS[i % TRACTOR_COLORS.length], seed: 300 + i * 17,
+    circles: TRACTOR_CIRCLES.map((tc) => ({ x: 0, y: 0, r: tc.r })),
+  };
+  for (const c of t.circles) c.key = t;
+  setTractorCircles(t);
+  campsite.circles.push(...t.circles);
+  return t;
+}
+
+// Phase 5 has begun: the tractors come (once).
+function callTractors() {
+  if (tractors.length) return;
+  tractors = freePitches().sort((a, b) => a.x0 - b.x0).map((p, i) => makeTractor(p, i, false));
+}
+
+// After a resize rebuilt the campsite: tractors that were called are simply
+// there, parked at the new free pitches.
+function replaceTractors() {
+  if (!tractors.length) return;
+  tractors = freePitches().sort((a, b) => a.x0 - b.x0).map((p, i) => makeTractor(p, i, true));
+}
+
+function updateTractors(dt) {
+  for (const t of tractors) {
+    if (t.parked) continue;
+    if (t.delay > 0) {
+      t.delay -= dt;
+      continue;
+    }
+    const dir = Math.sign(t.targetX - t.x), left = Math.abs(t.targetX - t.x);
+    // anyone just ahead: wait for them, honking now and then
+    const blocked = trafficPoints(null).some((p) => {
+      const ahead = (p.x - t.x) * dir, side = Math.abs(p.y - t.y);
+      return ahead > 0 && ahead < TRACTOR.length / 2 + 26 && side < TRACTOR.width / 2 + 14;
+    });
+    if (blocked) {
+      t.blockedTime += dt;
+      if (t.blockedTime > t.honkAt) {
+        playHornSound(t.x, 0.6);
+        t.honkAt = t.blockedTime + 2.5 + Math.random() * 2;
+      }
+    } else {
+      t.blockedTime = 0;
+      t.honkAt = 0.7;
+      t.x += dir * Math.min(left, Math.min(TRACTOR_SPEED, 15 + left * 1.5) * dt);
+      if (Math.random() < dt * 6) {
+        // a puff from the exhaust stack
+        const ex = t.x + Math.cos(t.angle) * 8, ey = t.y + Math.sin(t.angle) * 8 - 4;
+        particles.push({ type: "smoke", x: ex, y: ey, vx: (Math.random() - 0.5) * 10, vy: -12 - Math.random() * 8, size: 3, growSpeed: 9, color: "rgb(120,120,120)", alpha: 0.35, life: 0, maxLife: 1 });
+      }
+    }
+    setTractorCircles(t);
+    if (Math.abs(t.targetX - t.x) < 0.5) {
+      t.x = t.targetX;
+      t.parked = true;
+      setTractorCircles(t);
+      if (coin && Math.abs(coin.x - t.x) < TRACTOR.length && Math.abs(coin.y - t.y) < TRACTOR.width) spawnCoin(); // it parked on the coin
+    }
+  }
+}
+
 function setupWorld() {
   car1 = createCar(W * 0.35, H * 0.5, Math.PI / 2, "#4fc3ff", {
     up: ["w"], down: ["s"], left: ["a"], right: ["d"],
@@ -1370,6 +1483,7 @@ function setupWorld() {
   });
 
   campsite = buildCampsite();
+  tractors = [];
   street = buildStreet();
   resetParkers();
 
@@ -1417,10 +1531,10 @@ function randomCoinPos() {
   for (let attempt = 0; attempt < 40; attempt++) {
     const x = 60 + Math.random() * (W - 120);
     const y = 60 + Math.random() * Math.max(40, street.curbY - 150 - 60);
-    const inCamp = x > a.x0 - COIN_CAMP_GAP && x < a.x1 + COIN_CAMP_GAP && y < a.y1 + COIN_CAMP_GAP;
+    const inCamp = x > a.x0 - COIN_CAMP_GAP && x < a.x1 + COIN_CAMP_GAP && y < campBottom() + COIN_CAMP_GAP;
     if (!inCamp) return { x, y };
   }
-  return { x: W / 2, y: (campsite.area.y1 + street.curbY - 150) / 2 };
+  return { x: W / 2, y: (campBottom() + street.curbY - 150) / 2 };
 }
 
 let coin = null; // shared: only one coin exists at a time, so both cars race for it
@@ -1772,10 +1886,11 @@ function updateCoinRace() {
 // and that coin is parked with it). The counter is separate from car.score
 // (the coins in hand), so paying the garage doesn't set anyone back.
 // 4. the campsite: every coin needs the rig reversed into a free pitch
-// Planned: phase 5, reversing the caravan through a maze. LAST_PHASE is the
-// last one built.
+// 5. the same, but tractors park in front of the free pitches (callTractors),
+//    and the reverse has to curve in through the passage they leave
+// LAST_PHASE is the last one built.
 const COINS_PER_PHASE = 3;
-const LAST_PHASE = 4;
+const LAST_PHASE = 5;
 
 function coinCaught(car) {
   car.phaseCoins++;
@@ -1786,6 +1901,7 @@ function coinCaught(car) {
   for (const dx of [-40, 0, 40]) spawnFirework(car.pos.x + dx, car.pos.y - Math.abs(dx) * 0.5, car.color);
   playRepairSound(car.pos.x);
   if (car.gamePhase >= 3 && !car.caravan && !caravanAppears(car)) car.caravanDue = true;
+  if (car.gamePhase >= 5) callTractors();
 }
 
 // The caravan pops in behind the car, right where the coin was caught, with
@@ -2837,9 +2953,11 @@ function apAvoid(car, ap, steer) {
 const AP_CAMP_KEEP_OUT = 28; // px round the grass strip
 const AP_CAMP_CORNER = 30; // px further out: the waypoints round its corners
 
-function campNoGoZone() {
+// grassOnly: without the tractors, for a camping rig on its way to line up
+// beside them.
+function campNoGoZone(grassOnly = false) {
   const a = campsite.area, m = AP_CAMP_KEEP_OUT;
-  return { x0: a.x0 - m, x1: a.x1 + m, y0: -1e4, y1: a.y1 + m };
+  return { x0: a.x0 - m, x1: a.x1 + m, y0: -1e4, y1: (grassOnly ? a.y1 : campBottom()) + m };
 }
 
 function inRect(r, x, y) {
@@ -2864,14 +2982,23 @@ function segmentHitsRect(ax, ay, bx, by, r) {
 }
 
 // Where to drive instead of (tx, ty), keeping out of the campsite.
-function apKeepOut(car, tx, ty) {
-  const z = campNoGoZone(), x = car.pos.x, y = car.pos.y;
+function apKeepOut(car, tx, ty, grassOnly = false) {
+  const z = campNoGoZone(grassOnly), x = car.pos.x, y = car.pos.y;
   if (inRect(z, tx, ty)) return { x: tx, y: ty }; // it's meant to be in there
   if (inRect(z, x, y)) {
     // already in it: down out of the pitches, or off the end of the lane
     // above the bushes (which reaches a little into the grass)
     const a = campsite.area;
-    if (y > CAMP_TOP + CAMP_BUSH_Y && x > a.x0 && x < a.x1) return { x, y: z.y1 + AP_CAMP_CORNER };
+    if (y > CAMP_TOP + CAMP_BUSH_Y && x > a.x0 && x < a.x1) {
+      // a tractor below: along the passage past it first, the way it's
+      // facing (towing, it can't turn round in there)
+      const t = tractors.find((q) => Math.abs(q.x - x) < TRACTOR.length / 2 + 30 && y < q.y);
+      if (t) {
+        const way = Math.abs(Math.cos(car.angle)) > 0.3 ? Math.sign(Math.cos(car.angle)) : x < t.x ? -1 : 1;
+        return { x: t.x + way * (TRACTOR.length / 2 + 60), y: t.y - TRACTOR.width / 2 - 34 };
+      }
+      return { x, y: z.y1 + AP_CAMP_CORNER };
+    }
     return { x: x < (z.x0 + z.x1) / 2 ? z.x0 - AP_CAMP_CORNER : z.x1 + AP_CAMP_CORNER, y };
   }
   if (!segmentHitsRect(x, y, tx, ty, z)) return { x: tx, y: ty };
@@ -2896,11 +3023,13 @@ function apKeepOut(car, tx, ty) {
 
 // Drive toward (tx, ty) at up to `cruise`. Handles its own clumsy
 // three-point turns and backing out when wedged, and keeps out of the
-// campsite unless it's camping. Returns the distance left to (tx, ty).
-function apDriveTo(car, ap, tx, ty, cruise, { avoid = true } = {}) {
+// campsite unless it's camping (and on the way to camp, out of its grass:
+// keepOutGrass). Returns the distance left to (tx, ty).
+function apDriveTo(car, ap, tx, ty, cruise, { avoid = true, keepOutGrass = false } = {}) {
   const dist = Math.hypot(tx - car.pos.x, ty - car.pos.y);
-  const keepOut = !(ap.goal === "park" && car.gamePhase >= 4);
-  if (keepOut) ({ x: tx, y: ty } = apKeepOut(car, tx, ty));
+  const camping = ap.goal === "park" && car.gamePhase >= 4;
+  const keepOut = !camping || keepOutGrass;
+  if (keepOut) ({ x: tx, y: ty } = apKeepOut(car, tx, ty, camping));
   const dx = tx - car.pos.x, dy = ty - car.pos.y;
   let err = wrapAngle(Math.atan2(dy, dx) - car.angle);
   const speed = speedOf(car);
@@ -2912,7 +3041,9 @@ function apDriveTo(car, ap, tx, ty, cruise, { avoid = true } = {}) {
   // The direction is picked once per turn (ap.turnRound): picked afresh
   // every step, a car pointing straight up flipped between full left and
   // full right lock and drove straight on, into a free pitch.
-  if (Math.abs(err) < 1.2) ap.turnRound = 0;
+  // (Cleared once |err| is under 1.8: kept down to 1.2, it outlived the turn
+  // whenever the target moved, and turned one car into the campsite's end.)
+  if (Math.abs(err) < 1.8) ap.turnRound = 0;
   else if (!ap.turnRound && Math.abs(err) > 2) {
     if (car.pos.y > street.centerlineY) ap.turnRound = Math.cos(car.angle) >= 0 ? -1 : 1;
     else if (car.pos.y < campsite.area.y1 + 160) ap.turnRound = Math.cos(car.angle) >= 0 ? 1 : -1;
@@ -2920,8 +3051,8 @@ function apDriveTo(car, ap, tx, ty, cruise, { avoid = true } = {}) {
   if (ap.turnRound) err = ap.turnRound * Math.PI;
   // Nosed into the pitches anyway: back straight out.
   const a = campsite.area;
-  if (keepOut && ap.reverseTime <= 0 && Math.abs(err) > 2 && inRect(campNoGoZone(), car.pos.x, car.pos.y) &&
-      car.pos.y > CAMP_TOP + CAMP_BUSH_Y && car.pos.x > a.x0 && car.pos.x < a.x1) {
+  if (keepOut && ap.reverseTime <= 0 && Math.abs(err) > 2 &&
+      car.pos.y > CAMP_TOP + CAMP_BUSH_Y && car.pos.y < a.y1 && car.pos.x > a.x0 && car.pos.x < a.x1) {
     ap.reverseTime = 0.8;
     ap.reverseSteer = 0;
   }
@@ -2964,6 +3095,12 @@ function apCheckStuck(car, ap, dt, pushing) {
     ap.lastStuckAt = gameTime;
     ap.reverseTime = Math.min(2.5, 0.7 + Math.random() * 0.6 + ap.stuckStreak * 0.5);
     ap.reverseSteer = (ap.drive.steer >= 0 ? -1 : 1) * (ap.stuckStreak % 2 ? -1 : 1);
+    // Towing, it backs straight up much further (it steers the caravan
+    // straight behind, so the side doesn't matter), leaving room to turn
+    // round forward. Short back-ups left rigs nose-on to the curb or a wall,
+    // shuffling in the same spot for minutes. (Backing up on a curve instead
+    // backfired: swinging the caravan over first turns the car the wrong way.)
+    if (car.caravan) ap.reverseTime = Math.min(4.5, 2.5 + ap.stuckStreak * 0.7);
   }
 }
 
@@ -3298,16 +3435,23 @@ function apParkCamp(car, ap, dt) {
     // heading toward the pitch (dir), and reverse round from past it
     // Decided once per attempt: recomputing it every step flipped the target
     // back and forth as it looped round past the pitch.
-    if (!p.side) p.side = car.pos.x < cx ? -1 : 1;
+    // From the side away from the other tractor, if it's close: lining up
+    // past it, the rig hit it.
+    if (!p.side) {
+      p.side = car.pos.x < cx ? -1 : 1;
+      if (tractors.some((t) => t.pitch !== pitch && (t.x - cx) * p.side > 0 && Math.abs(t.x - cx) < 320)) p.side = -p.side;
+    }
     const side = p.side;
     p.dir = -side;
     // (well clear of the side walls: a rig that overshot into one wedged there for minutes)
-    const d = apDriveTo(car, ap, clamp(cx + side * 240, 170, W - 170), lineY + AP_CAMP_TURN_DROP, 130);
+    // (further out with a tractor in front: room to climb onto the line before it)
+    const out = tractors.length ? 320 : 240;
+    const d = apDriveTo(car, ap, clamp(cx + side * out, 170, W - 170), lineY + AP_CAMP_TURN_DROP, 130, { keepOutGrass: true });
     apCheckStuck(car, ap, dt, ap.drive.throttle !== 0);
     if (d < 70) setPhase(campAisleBusy(car, pitch, p.dir) ? "hold" : Math.cos(car.angle) * p.dir > 0.3 ? "line" : "turn");
   } else if (p.phase === "hold") {
     // the aisle is busy: wait out of the way, below it
-    const d = apDriveTo(car, ap, clamp(cx - p.dir * 240, 170, W - 170), lineY + AP_CAMP_TURN_DROP + 60, 100);
+    const d = apDriveTo(car, ap, clamp(cx - p.dir * 240, 170, W - 170), lineY + AP_CAMP_TURN_DROP + 60, 100, { keepOutGrass: true });
     if (d < 40) {
       ap.drive.throttle = apStop(car);
       ap.drive.steer = 0;
@@ -3343,7 +3487,12 @@ function apParkCamp(car, ap, dt) {
       return;
     }
     p.wait = 0;
-    ap.drive.steer = apCaravanForwardSteer(car, apSteerAt(car, car.pos.x + p.dir * 90, lineY));
+    // With a tractor in front of the pitch: up onto the line before it,
+    // or the rig catches its corner (cutting in from below, it did).
+    const t = tractors.find((q) => q.pitch === pitch);
+    const before = t ? t.x - p.dir * (TRACTOR.length / 2 + 80) : 0; // 80 px short of the tractor's near end
+    const low = t && Math.abs(car.pos.y - lineY) > 10 && (before - car.pos.x) * p.dir > 0;
+    ap.drive.steer = apCaravanForwardSteer(car, low ? apSteerAt(car, before, lineY) : apSteerAt(car, car.pos.x + p.dir * 90, lineY));
     // stop once the caravan's axle is a turning radius past the pitch
     const toStop = (cx + p.dir * AP_CAMP_ARC_R - axle.x) * p.dir;
     ap.drive.throttle = toStop > 2 ? apThrottleFor(car, Math.min(60, 8 + toStop)) : apStop(car);
@@ -3388,9 +3537,14 @@ function apParkCamp(car, ap, dt) {
     // parked now, the coin race moves it on; still here after a moment, retry
     if (p.t > 1) setPhase("leave");
   } else if (p.phase === "leave") {
-    // pull out forward, away from the campsite, and come round again
+    // pull out forward, away from the campsite, and come round again --
+    // along the passage first if a tractor's parked in front
     ap.drive.throttle = apThrottleFor(car, 70);
-    ap.drive.steer = apCaravanForwardSteer(car, apSteerAt(car, car.pos.x + Math.sign(Math.cos(car.angle) || 1) * 90, lineY + 90));
+    const t = tractors.find((q) => q.pitch === pitch);
+    const way = Math.abs(Math.cos(car.angle)) > 0.3 ? Math.sign(Math.cos(car.angle)) : t ? Math.sign(car.pos.x - t.x) || 1 : 1;
+    ap.drive.steer = apCaravanForwardSteer(car, t && Math.abs(car.pos.x - t.x) < TRACTOR.length / 2 + 50
+      ? apSteerAt(car, car.pos.x + way * 150, lineY)
+      : apSteerAt(car, car.pos.x + way * 90, lineY + 90));
     apCheckStuck(car, ap, dt, true);
     if (p.t > 2.5) setPhase("approach");
   }
@@ -4139,6 +4293,7 @@ window.addEventListener("resize", () => {
   clearTimeout(rebuildTimer);
   rebuildTimer = setTimeout(() => {
     campsite = buildCampsite();
+    replaceTractors();
     const oldLaneY = street.npcLaneY, oldCurbY = street.curbY;
     street = buildStreet();
     resetParkers(); // a fresh parked row for the new layout (cars mid-maneuver just vanish)
@@ -4189,6 +4344,7 @@ function update(dt) {
   gameTime += dt;
   updateTraffic(dt);
   updateParkers(dt);
+  updateTractors(dt);
   for (const car of [car1, car2]) if (car.autopilot) updateAutopilot(car, dt);
 
   const movers = [car1, car2, ...npcs, ...parkers];
@@ -4567,6 +4723,66 @@ function carArt(car) {
     rearWindow: wobble(roundRectPoints(-L * 0.26, -Wd / 2 + 5, L * 0.1, Wd - 10, 2, 4), s + 3, 0.3),
   };
   return car.art;
+}
+
+// A tractor from above: big rear wheels under the cab, small front ones
+// either side of a long hood, an exhaust stack and a white cab roof.
+function tractorArt(t) {
+  if (t.art) return t.art;
+  const s = t.seed;
+  t.art = {
+    fender: wobble(roundRectPoints(-23, -12, 24, 24, 5, 5), s, 0.6),
+    hood: wobble(roundRectPoints(-2, -7.5, 28, 15, 4, 5), s + 1, 0.5),
+    roof: wobble(roundRectPoints(-21, -9.5, 16, 19, 3, 4), s + 2, 0.4),
+  };
+  return t.art;
+}
+
+function drawTractor(c, t) {
+  const art = tractorArt(t);
+  c.save();
+  c.translate(t.x + 3, t.y + 4);
+  c.rotate(t.angle);
+  c.fillStyle = PAL.shadow;
+  c.beginPath();
+  c.roundRect(-23, -16, 49, 32, 6);
+  c.fill();
+  c.restore();
+
+  c.save();
+  c.translate(t.x, t.y);
+  c.rotate(t.angle);
+  for (const [x, y, len, wid] of [[-10, -11.5, 22, 9], [-10, 11.5, 22, 9], [15, -8.5, 11, 5], [15, 8.5, 11, 5]]) {
+    c.beginPath();
+    c.roundRect(x - len / 2, y - wid / 2, len, wid, 3);
+    c.fillStyle = PAL.tire;
+    c.fill();
+    c.strokeStyle = INK;
+    c.lineWidth = 1.5;
+    c.stroke();
+    if (len > 15) for (let k = -2; k <= 2; k++) inkLine(c, x + k * 4, y - wid / 2 + 1.5, x + k * 4 - 1.5, y + wid / 2 - 1.5, t.seed + k, 1.2, PAL.hub, 0); // tread
+  }
+  inkShape(c, art.hood, t.color, 2.2);
+  inkShape(c, art.fender, t.color, 2.5);
+  inkShape(c, art.roof, "#f4f1e8", 1.6);
+  inkLine(c, 25, -5, 25, 5, t.seed + 9, 1.4, INK, 0); // grille
+  for (const y of [-5, 5]) {
+    c.beginPath();
+    c.arc(23, y, 1.8, 0, Math.PI * 2);
+    c.fillStyle = "#fff6b0";
+    c.fill();
+    c.lineWidth = 1;
+    c.strokeStyle = INK;
+    c.stroke();
+  }
+  c.beginPath(); // exhaust stack
+  c.arc(8, -4, 2.6, 0, Math.PI * 2);
+  c.fillStyle = "#4a4652";
+  c.fill();
+  c.lineWidth = 1.2;
+  c.strokeStyle = INK;
+  c.stroke();
+  c.restore();
 }
 
 function drawWheel(c, x, y, angle) {
@@ -5068,6 +5284,7 @@ function render() {
   drawMechanic();
   for (const pc of parkers) drawCar(ctx, pc);
   for (const n of npcs) drawCar(ctx, n);
+  for (const t of tractors) drawTractor(ctx, t);
   if (coin) drawCoin(coin);
   for (const car of [car1, car2]) if (car.caravan) drawCaravan(ctx, car);
   drawCar(ctx, car1);
