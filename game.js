@@ -1495,8 +1495,6 @@ function setupWorld() {
     car.caravanDue = false; // see caravanAppears
     car.hasDriven = false;
   }
-  car1.label = "P1"; car1.keyHint = "WASD";
-  car2.label = "P2"; car2.keyHint = "IJKL / Arrows";
   particles.length = 0;
   coin = null; // the first coin waits until both players have moved, see updateCoin
   resetTraffic();
@@ -1869,6 +1867,7 @@ function updateCoinRace() {
       car.gameState = "seekCoin";
       spawnFirework(car.pos.x, car.pos.y, car.color);
       playParkedSound(car.pos.x);
+      campDone(car);
     }
   }
 }
@@ -1888,13 +1887,27 @@ function updateCoinRace() {
 // 4. the campsite: every coin needs the rig reversed into a free pitch
 // 5. the same, but tractors park in front of the free pitches (callTractors),
 //    and the reverse has to curve in through the passage they leave
+// Except: phase 4 ends on its 3rd successful camp, not on a coin (asked for:
+// "not when I take the coin but when I successfully park at the camp the
+// third time"). Its camps follow the 3rd phase-3 coin and phase-4 coins 1
+// and 2, so phase 4 takes just two coins, and phase 5 begins as the third
+// camp lands (campDone).
 // LAST_PHASE is the last one built.
 const COINS_PER_PHASE = 3;
 const LAST_PHASE = 5;
 
 function coinCaught(car) {
   car.phaseCoins++;
-  if (car.phaseCoins < COINS_PER_PHASE || car.gamePhase >= LAST_PHASE) return;
+  if (car.phaseCoins < COINS_PER_PHASE || car.gamePhase >= LAST_PHASE || car.gamePhase === 4) return;
+  nextPhase(car);
+}
+
+// A park counted. In phase 4, the third camp moves the player on.
+function campDone(car) {
+  if (car.gamePhase === 4 && car.phaseCoins >= COINS_PER_PHASE - 1) nextPhase(car);
+}
+
+function nextPhase(car) {
   car.gamePhase++;
   car.phaseCoins = 0;
   // a bigger celebration than a park: a burst on the car and one each side
@@ -5133,8 +5146,8 @@ function drawWrench(x, y, color) {
 // and the bottom hint line fades out after HINT_SECONDS or the first coin
 // pickup. Game state is shown in the world instead (the painted P's, the
 // garage pad flash) -- keep it that way rather than adding status text back.
-const titleEl1 = document.getElementById("p1-title");
-const titleEl2 = document.getElementById("p2-title");
+const keysEl1 = document.getElementById("p1-keys");
+const keysEl2 = document.getElementById("p2-keys");
 const scoreEl1 = document.getElementById("p1-score");
 const scoreEl2 = document.getElementById("p2-score");
 const phaseEl1 = document.getElementById("p1-phase");
@@ -5155,9 +5168,9 @@ for (const [btn, getCar] of [[autoBtn1, () => car1], [autoBtn2, () => car2]]) {
   });
 }
 
-function updateHud(car, titleEl, scoreEl, autoBtn, phaseEl, nextEl) {
-  const title = car.hasDriven ? car.label : `${car.label} — ${car.keyHint}`;
-  if (titleEl.textContent !== title) titleEl.textContent = title;
+function updateHud(car, keysEl, scoreEl, autoBtn, phaseEl, nextEl) {
+  // the player's keys, until they first drive
+  if (keysEl.hidden !== car.hasDriven) keysEl.hidden = car.hasDriven;
   const score = String(car.score);
   if (scoreEl.textContent !== score) scoreEl.textContent = score;
   // "<game phase>:<the coin about to be taken>", counting from 1: "2:1" is
@@ -5291,8 +5304,8 @@ function render() {
   drawCar(ctx, car2);
   drawParticles();
 
-  updateHud(car1, titleEl1, scoreEl1, autoBtn1, phaseEl1, nextEl1);
-  updateHud(car2, titleEl2, scoreEl2, autoBtn2, phaseEl2, nextEl2);
+  updateHud(car1, keysEl1, scoreEl1, autoBtn1, phaseEl1, nextEl1);
+  updateHud(car2, keysEl2, scoreEl2, autoBtn2, phaseEl2, nextEl2);
   updateHint();
 }
 
