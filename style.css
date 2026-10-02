@@ -31,11 +31,12 @@ canvas {
   font-variant-numeric: tabular-nums;
 }
 
-/* Each player's HUD is a small badge: "P1" (plus key hint until they first
-   drive) and a coin count, in the player's color. */
-/* Two rows: the badge proper, then "Next: ..." under it. The badge is as
-   wide as its longer row -- a wrapping single row was sized as if it were
-   all on one line, which left a blank patch at the end of the top row. */
+/* Each player's HUD is a small badge in the player's color, on their side
+   of the screen (so no "P1"/"P2" label). Two rows: the coin count and the
+   Autopilot button (plus the player's keys until they first drive), then
+   the game phase and what's next ("1:3  Next: Coin"). The badge is as wide
+   as its longer row -- a wrapping single row was sized as if it were all on
+   one line, which left a blank patch at the end of the top row. */
 .hud-panel {
   display: flex;
   flex-direction: column;
@@ -47,7 +48,8 @@ canvas {
   padding: 4px 11px;
 }
 
-.hud-title {
+/* All the badge's text but the coin count: one size and weight. */
+.hud-text {
   font-size: 13px;
   font-weight: 900;
   letter-spacing: 0.03em;
@@ -75,21 +77,15 @@ canvas {
   box-sizing: border-box;
 }
 
-/* Game phase and the coin about to be taken ("2:1"), then what's next
-   ("Next: Park"). */
-.hud-phase {
-  font-size: 16px;
-  font-weight: 900;
-}
-
 .hud-row {
   display: flex;
   align-items: center;
   gap: 10px;
 }
 
-/* "Next: ..." is set in the same type as the player label (.hud-title) */
-.hud-p2 .hud-next { text-align: right; }
+/* the second row hugs the badge's outer edge, like the first */
+.hud-p2 .hud-row { justify-content: flex-end; }
+.hud-text[hidden] { display: none; }
 
 /* Autopilot toggle: a little cartoon push button in the badge, filled with
    the player's color while the AI is driving. The HUD ignores the mouse,
