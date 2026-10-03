@@ -134,6 +134,12 @@ canvas {
   transition: opacity 1.5s ease;
 }
 
+/* the game's name, leading the opening hint */
+.hint-title {
+  font-weight: 900;
+  letter-spacing: 0.03em;
+}
+
 .hint.faded {
   opacity: 0;
 }
