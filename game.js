@@ -1755,16 +1755,21 @@ function updateGarage() {
 }
 
 // ---- The mechanic ---------------------------------------------------------
-// States: "opening" (door rolls up) -> "walkOut" (jog to the car) ->
-// "working" (wrench; the fix lands MECH_FIX_AT in) -> "walkBack" ->
+// States: "opening" (door rolls up) -> "walkOut" (jog round to the front of
+// the car) -> "hoodUp" (lifts the hood) -> "working" (wrench over the
+// engine; the fix lands MECH_FIX_AT in) -> "hoodDown" -> "walkBack" ->
 // "closing" (door rolls down) -> gone (mechanic = null). The repair and the
 // coin charge happen only at the fix: if the car leaves the pad before
-// that, the mechanic gives up and walks back in, and nothing is charged.
-// Drawn with the pedestrian renderer (overalls, red cap, a wrench in hand).
+// that, the mechanic gives up and walks back in, and nothing is charged (the
+// hood drops shut on its own: car.hoodOpen follows the mechanic, see
+// updateMechanic). Drawn with the pedestrian renderer (overalls, red cap, a
+// wrench in hand). They used to work from the driveway, beside the car; going
+// to the front and opening the hood first was asked for.
 
 const MECH_SPEED = 90; // px/s, a brisk jog
 const MECH_DOOR_TIME = 0.35; // s for the door to roll up / down
-const MECH_WORK_TIME = 0.9; // s at the car
+const MECH_HOOD_TIME = 0.4; // s to lift the hood (shutting it is quicker)
+const MECH_WORK_TIME = 1.0; // s at the engine
 const MECH_FIX_AT = 0.5; // s into the work when the car is fixed (after the ratchet + clank)
 
 let mechanic = null; // the mechanic while out (or opening/closing the door); null when idle inside
@@ -1775,18 +1780,29 @@ function mechanicHome() {
   return { x: (g.doorX0 + g.doorX1) / 2, y: g.buildingY0 + g.doorH / 2 };
 }
 
-// Where the mechanic stands to work: on the driveway just below the curb,
-// beside the car (cars can't cross the curb, so this never overlaps one).
-function mechanicWorkSpot(car) {
+// The way from the driveway to the front of the car, where the mechanic
+// works: along the sidewalk below the curb to the nose, then up beside it.
+// A car parked on end (rare on the pad) is walked round by its side. The
+// mechanic is drawn under the cars, so walking through one would look like
+// vanishing beneath it.
+function mechanicPathOut(car) {
   const g = street.garage;
-  return { x: clamp(car.pos.x, g.doorX0, g.doorX1), y: g.curbY + 10 };
+  const fx = Math.cos(car.angle), fy = Math.sin(car.angle);
+  const front = {
+    x: clamp(car.pos.x + fx * (CAR.length / 2 + 12), 8, W - 8),
+    y: car.pos.y + fy * (CAR.length / 2 + 12),
+  };
+  const low = g.curbY + 10;
+  if (Math.abs(fx) > 0.5) return [{ x: front.x, y: low }, front];
+  const sx = clamp(car.pos.x + CAR.length / 2 + 14, 8, W - 8);
+  return [{ x: sx, y: low }, { x: sx, y: front.y }, front];
 }
 
 function makeMechanic(car) {
   const home = mechanicHome();
   const up = -Math.PI / 2;
   return {
-    state: "opening", t: 0, car, fixed: false, nextSpark: 0,
+    state: "opening", t: 0, car, fixed: false, nextSpark: 0, path: [],
     x: home.x, y: home.y,
     // pedestrian-renderer fields: overalls, red cap, a random face
     stride: { speed: MECH_SPEED, cadence: 3, swing: 1.2, bounce: 0.2 }, speedMul: 1, size: 1.05,
@@ -1815,33 +1831,68 @@ function mechanicWalkTo(m, target, dt) {
   return false;
 }
 
+// Walk the waypoints in m.path; returns true once at the last one.
+function mechanicFollow(m, dt) {
+  while (m.path.length && mechanicWalkTo(m, m.path[0], dt)) m.path.shift();
+  return !m.path.length;
+}
+
 function updateMechanic(dt) {
   // the door opens while the mechanic is out and rolls down once they're back
   const wantOpen = mechanic !== null && mechanic.state !== "closing";
   garageDoorOpen = clamp(garageDoorOpen + ((wantOpen ? 1 : -1) * dt) / MECH_DOOR_TIME, 0, 1);
+  // a car's hood is up while the mechanic is under it, and drops shut otherwise
+  for (const c of [car1, car2]) {
+    const up = mechanic && mechanic.car === c && (mechanic.state === "hoodUp" || mechanic.state === "working");
+    c.hoodOpen = clamp((c.hoodOpen || 0) + (up ? dt / MECH_HOOD_TIME : -dt / 0.25), 0, 1);
+  }
   if (!mechanic) return;
 
   const m = mechanic, car = m.car;
   m.t += dt;
   const carStillThere = onGaragePad(car) && speedOf(car) <= GARAGE_SPEED_LIMIT * 2;
+  const giveUp = () => {
+    m.state = "walkBack";
+    m.path = [{ x: m.x, y: street.garage.curbY + 10 }, mechanicHome()];
+  };
+  const faceCar = () => {
+    const toCar = Math.atan2(car.pos.y - m.y, car.pos.x - m.x);
+    m.bodyAngle = m.headAngle = m.facing = toCar;
+    return toCar;
+  };
 
   if (m.state === "opening") {
-    if (garageDoorOpen >= 1) m.state = "walkOut";
+    if (garageDoorOpen >= 1) {
+      m.state = "walkOut";
+      m.path = mechanicPathOut(car);
+    }
   } else if (m.state === "walkOut") {
-    if (!carStillThere) m.state = "walkBack"; // they drove off: never mind
-    else if (mechanicWalkTo(m, mechanicWorkSpot(car), dt)) {
+    if (!carStillThere) giveUp(); // they drove off: never mind
+    else if (mechanicFollow(m, dt)) {
+      m.state = "hoodUp";
+      m.t = 0;
+    }
+  } else if (m.state === "hoodUp") {
+    faceCar();
+    if (!carStillThere) giveUp();
+    else if (car.hoodOpen >= 1) {
       m.state = "working";
       m.t = 0;
       playWrenchSound(m.x);
     }
+  } else if (m.state === "hoodDown") {
+    faceCar();
+    if (car.hoodOpen <= 0 || !carStillThere) giveUp();
   } else if (m.state === "working") {
-    const toCar = Math.atan2(car.pos.y - m.y, car.pos.x - m.x);
-    m.bodyAngle = m.headAngle = m.facing = toCar;
+    faceCar();
     if (!m.fixed && !carStillThere) {
-      m.state = "walkBack";
+      giveUp();
     } else {
       if (!m.fixed && m.t >= m.nextSpark) {
-        spawnWrenchSparks(m.x + Math.cos(toCar) * 11, m.y + Math.sin(toCar) * 11);
+        // over the engine: just past the hood's hinge, inside the car's nose
+        const ex = car.pos.x + Math.cos(car.angle) * CAR.length * 0.33 + (Math.random() - 0.5) * 8;
+        const ey = car.pos.y + Math.sin(car.angle) * CAR.length * 0.33 + (Math.random() - 0.5) * 8;
+        spawnWrenchSparks(ex, ey);
         m.nextSpark = m.t + 0.12 + Math.random() * 0.1;
       }
       if (!m.fixed && m.t >= MECH_FIX_AT) {
@@ -1853,10 +1904,10 @@ function updateMechanic(dt) {
           spawnFirework(car.pos.x, car.pos.y, "#7dffa0");
         }
       }
-      if (m.t >= MECH_WORK_TIME) m.state = "walkBack";
+      if (m.t >= MECH_WORK_TIME) m.state = "hoodDown";
     }
   } else if (m.state === "walkBack") {
-    if (mechanicWalkTo(m, mechanicHome(), dt)) m.state = "closing";
+    if (mechanicFollow(m, dt)) m.state = "closing";
   } else if (m.state === "closing") {
     if (garageDoorOpen <= 0) mechanic = null;
   }
@@ -4929,8 +4980,47 @@ function drawCar(c, car) {
     c.stroke();
   }
 
+  if (car.hoodOpen > 0) drawOpenHood(c, car);
   drawDents(c, art.body, car.dents);
   c.restore();
+}
+
+// The hood, lifted by the mechanic (car.hoodOpen 0..1), in the car's own
+// frame. Hinged at the windshield, it swings up front edge first, so from
+// above it shrinks back toward the hinge and uncovers the engine bay.
+function drawOpenHood(c, car) {
+  const L = CAR.length, Wd = CAR.width, hinge = L * 0.24, len = L / 2 - 2 - hinge;
+  // the engine bay: dark, with the engine block, a filler cap and a hose
+  c.beginPath();
+  c.roundRect(hinge, -Wd / 2 + 3, len, Wd - 6, 2);
+  c.fillStyle = "#3b3745";
+  c.fill();
+  c.beginPath();
+  c.roundRect(hinge + 2.5, -5, len - 5, 10, 2);
+  c.fillStyle = "#8e8a99";
+  c.fill();
+  c.strokeStyle = INK;
+  c.lineWidth = 1.1;
+  c.stroke();
+  c.beginPath();
+  c.arc(hinge + len - 4, 6.5, 1.6, 0, Math.PI * 2);
+  c.fillStyle = "#ffd23f";
+  c.fill();
+  c.stroke();
+  inkLine(c, hinge + 3, -7, hinge + len - 3, -6.5, car.seed + 5, 1.4, "#1b1922", 0.4);
+  // the hood panel itself, foreshortened as it swings up toward vertical
+  const shown = len * Math.cos(car.hoodOpen * 1.25);
+  c.fillStyle = PAL.shadow; // its shadow falls forward on the engine
+  c.fillRect(hinge + shown, -Wd / 2 + 3, Math.min(4 * car.hoodOpen, len - shown), Wd - 6);
+  c.beginPath();
+  c.roundRect(hinge - 0.5, -Wd / 2 + 1.5, shown + 1.5, Wd - 3, 2);
+  c.fillStyle = car.color;
+  c.fill();
+  c.strokeStyle = INK;
+  c.lineWidth = 1.6;
+  c.stroke();
+  // the underside's light edge, catching the sun as it rises
+  if (car.hoodOpen > 0.3) inkLine(c, hinge + shown - 0.5, -Wd / 2 + 3, hinge + shown - 0.5, Wd / 2 - 3, car.seed + 6, 1.2, "rgba(255,255,255,0.7)", 0);
 }
 
 // Collision dents: a dark bruise with ink crack lines, clipped to the body
@@ -5160,7 +5250,7 @@ function drawGarageDoor() {
 // swings while they work.
 function drawMechanic() {
   const m = mechanic;
-  if (!m || (m.state !== "walkOut" && m.state !== "working" && m.state !== "walkBack")) return;
+  if (!m || m.state === "opening" || m.state === "closing") return;
   const working = m.state === "working" && !m.fixed;
   const hx = working ? 7 : 0, hy = 9.2; // right hand, body-local (reaching toward the car while working)
   m.rightHandX = hx;
