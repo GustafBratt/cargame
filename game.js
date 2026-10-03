@@ -598,6 +598,13 @@ function playCoinSpawnSound(x) {
   });
 }
 
+// Countdown beeps: a short blip per number, a higher, longer one for "go".
+function playCountdownBeep(go) {
+  liveSfx(W / 2, 0.5, (c, o, t) => {
+    sfxTone(c, o, t, { freq: go ? 1320 : 660, dur: go ? 0.32 : 0.12, type: "square", gain: 0.35 });
+  });
+}
+
 // Classic two-note "ka-ching".
 function playCoinPickupSound(x) {
   liveSfx(x, 1.0, (c, o, t) => {
@@ -772,6 +779,7 @@ function speedOf(car) {
 
 function readInput(car) {
   if (car.drive) return car.drive; // AI-controlled traffic, see npcDrive
+  if (countdown > 0) return { throttle: 0, steer: 0 }; // the players wait out the countdown
   if (car.autopilot) return car.ap.drive; // a player on autopilot, see updateAutopilot
   const held = (names) => (names.some((k) => keys.has(k)) ? 1 : 0);
   const throttle = held(car.input.up) - held(car.input.down);
@@ -1498,7 +1506,9 @@ function setupWorld() {
     car.hasDriven = false;
   }
   particles.length = 0;
-  coin = null; // the first coin waits until both players have moved, see updateCoin
+  coin = null; // the first coin comes when the countdown ends, see updateCountdown
+  countdown = COUNTDOWN_FROM;
+  countdownShown = 0;
   resetTraffic();
   resetPedestrians();
   mechanic = null;
@@ -1539,6 +1549,32 @@ function randomCoinPos() {
 
 let coin = null; // shared: only one coin exists at a time, so both cars race for it
 
+// The game opens with a countdown in the middle of the lot: "3", "2", "1",
+// then "Now find a coin!" as the first coin spawns. The players can't move
+// until it's over (readInput); the rest of the world is already going.
+// (Before, the first coin waited until both players had driven or switched
+// on their autopilot.)
+const COUNTDOWN_FROM = 3; // s, one per number
+let countdown = 0; // s left
+let countdownShown = 0; // the number on screen
+
+function updateCountdown(dt) {
+  if (countdown <= 0) return;
+  countdown -= dt;
+  if (countdown <= 0) {
+    spawnCoin();
+    callout(null, "Now find a coin!", { size: CALLOUT_SIZE * 1.3, time: 1.5 });
+    playCountdownBeep(true);
+    return;
+  }
+  const n = Math.ceil(countdown);
+  if (n !== countdownShown) {
+    countdownShown = n;
+    callout(null, String(n), { size: CALLOUT_SIZE * 2.2, time: 0.9 });
+    playCountdownBeep(false);
+  }
+}
+
 // A new coin doesn't just appear: sparks implode onto its spot over
 // COIN_IMPLODE_TIME (a reverse explosion), then it pops in with a flash.
 // It can't be collected until it has popped -- no grabbing an invisible coin.
@@ -1552,13 +1588,9 @@ function spawnCoin() {
 }
 
 // coin.age drives both the draw (drawCoin) and collectability (updateCoinRace).
-// There's no coin at the start: the race only begins once both players are
-// ready -- they've driven (car.hasDriven) or switched on their autopilot.
+// There's no coin during the opening countdown (updateCountdown).
 function updateCoin(dt) {
-  if (!coin) {
-    if ([car1, car2].every((c) => c.hasDriven || c.autopilot)) spawnCoin();
-    return;
-  }
+  if (!coin) return;
   coin.age += dt;
   if (!coin.popped && coin.age >= COIN_IMPLODE_TIME) {
     coin.popped = true;
@@ -1859,7 +1891,10 @@ function updateCoinRace() {
       spawnCoin();
       coinCaught(car);
       // phase 1 just collects; from phase 2 on, every coin needs a park
-      if (car.gamePhase >= 2) car.gameState = "mustPark";
+      if (car.gamePhase >= 2) {
+        car.gameState = "mustPark";
+        callout(car, car.gamePhase >= 4 ? "Now camp!" : "Now park!");
+      }
       break;
     }
   }
@@ -1870,6 +1905,7 @@ function updateCoinRace() {
       spawnFirework(car.pos.x, car.pos.y, car.color);
       playParkedSound(car.pos.x);
       campDone(car);
+      callout(car, "Now find a coin!");
     }
   }
 }
@@ -2023,6 +2059,26 @@ function parkedForPhase(car) {
 // faster streaking ones, two shockwave rings at different speeds, and a
 // delayed secondary "pop" (via the invisible "delayedBurst" marker below)
 // for the classic multi-stage firework read rather than one flat burst.
+// "Now park!": what to do next, popped up over the player's car the moment
+// it changes, fighting-game style -- big, in the player's color with an ink
+// outline, a bit see-through; it pops in with an overshoot, keeps growing
+// as it drifts up, and fades out quickly. Asked for because new players
+// didn't know what to do next; the HUD still says it too ("Next: Park").
+// (Making the parking bays flash in the player's colors was tried before,
+// and "just didn't have the correct vibe".) A new one replaces any still
+// showing for the same car. Drawn by drawParticles, on top of everything.
+const CALLOUT_TIME = 1.1; // s
+const CALLOUT_SIZE = 44; // px, the font size once popped in
+
+// With no car (the countdown), it's gold and centered on the open lot.
+function callout(car, text, { size = CALLOUT_SIZE, time = CALLOUT_TIME } = {}) {
+  for (const p of particles) if (p.type === "callout" && p.car === car) p.life = p.maxLife; // gone next update
+  particles.push({
+    type: "callout", text, car, size, color: car ? car.color : "#ffd23f",
+    x: car ? car.pos.x : 0, y: car ? car.pos.y : 0, life: 0, maxLife: time,
+  });
+}
+
 function spawnFirework(x, y, color) {
   const sparkColors = [color, "#ffd54f", "#ffffff", "#ff9d5c"];
   const count = 42;
@@ -4385,6 +4441,7 @@ function update(dt) {
   for (const car of [car1, car2]) if (car.caravan && !car.towedBack) updateCaravan(car);
   for (const car of [car1, car2]) if (car.caravan && !car.towedBack) resolveCaravanCollisions(car);
 
+  updateCountdown(dt);
   updateCoin(dt);
   updateCoinRace();
   updateCaravanDue();
@@ -5265,6 +5322,27 @@ function drawParticles() {
       ctx.strokeStyle = INK;
       ctx.lineWidth = 1.3;
       ctx.stroke();
+    } else if (p.type === "callout") {
+      // pop in to 1.2x with an overshoot over the first 0.2 s, then keep
+      // growing slowly; hold, then fade out over the last half
+      const pop = Math.min(1, t / 0.18);
+      const scale = pop < 1 ? 0.4 + 0.8 * (1 - (1 - pop) * (1 - pop)) * (1 + 0.25 * Math.sin(pop * Math.PI)) : 1.2 + (t - 0.18) * 0.25;
+      ctx.globalAlpha = 0.88 * Math.min(1, (1 - t) / 0.5);
+      ctx.font = `900 ${p.size}px "Trebuchet MS", "Segoe UI", sans-serif`;
+      const half = (ctx.measureText(p.text).width * scale) / 2 + 12;
+      // above the car, drifting up -- below it near the top edge -- and
+      // kept on screen; with no car, in the middle of the open lot
+      let x = W / 2, y = (campBottom() + street.curbY) / 2 - t * 16;
+      if (p.car) {
+        const above = p.y - 70 > p.size;
+        x = clamp(p.x, Math.min(half, W / 2), Math.max(W - half, W / 2));
+        y = above ? p.y - 62 - t * 22 : p.y + 62 + t * 22;
+      }
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.scale(scale, scale);
+      inkText(ctx, p.text, 0, 0, p.size, p.color);
+      ctx.restore();
     } else if (p.type === "flash") {
       // warm yellow rather than white, so it reads on the light ground
       ctx.globalAlpha = (1 - t) * 0.95;
